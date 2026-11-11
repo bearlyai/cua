@@ -4,7 +4,7 @@ $Output = [IO.Path]::GetFullPath($Output)
 New-Item -ItemType Directory -Force $Output | Out-Null
 $sessionId = (Get-Process -Id $PID).SessionId
 Write-Host "Proof launcher session: $sessionId"
-if ($sessionId -eq 0 -and !$InteractiveBootstrap) {
+if (!$InteractiveBootstrap) {
     $bootstrap = Join-Path $Output 'interactive-bootstrap.ps1'
     $result = Join-Path $Output 'bootstrap-exit.txt'
     $log = Join-Path $Output 'bootstrap.log'
@@ -67,10 +67,34 @@ public static class BearlyMediumProof {
     [DllImport("advapi32.dll",SetLastError=true)] static extern bool SetTokenInformation(IntPtr token,int kind,ref SidAttributes value,uint size);
     [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessAsUser(IntPtr token,string application,StringBuilder command,IntPtr processSecurity,IntPtr threadSecurity,bool inherit,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo result);
     [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessWithTokenW(IntPtr token,uint logonFlags,string application,StringBuilder command,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo result);
-    public static uint Run(string command,string directory) {
+    [DllImport("user32.dll")] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetUserObjectSecurity(IntPtr handle,ref uint info,[Out] byte[] data,uint size,out uint needed);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool SetUserObjectSecurity(IntPtr handle,ref uint info,byte[] data);
+    static byte[] GrantDesktopAccess(IntPtr handle,string userSid,int mask) {
+        uint info=4,needed;
+        GetUserObjectSecurity(handle,ref info,null,0,out needed);
+        var original=new byte[needed];
+        if (!GetUserObjectSecurity(handle,ref info,original,needed,out needed)) throw new Win32Exception();
+        var descriptor=new System.Security.AccessControl.RawSecurityDescriptor(original,0);
+        descriptor.DiscretionaryAcl.InsertAce(descriptor.DiscretionaryAcl.Count,
+            new System.Security.AccessControl.CommonAce(System.Security.AccessControl.AceFlags.None,
+                System.Security.AccessControl.AceQualifier.AccessAllowed,mask,
+                new System.Security.Principal.SecurityIdentifier(userSid),false,null));
+        var updated=new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(updated,0);
+        if (!SetUserObjectSecurity(handle,ref info,updated)) throw new Win32Exception();
+        return original;
+    }
+    public static uint Run(string command,string directory,string userSid) {
         IntPtr original=IntPtr.Zero,medium=IntPtr.Zero,admin=IntPtr.Zero,label=IntPtr.Zero;
         ProcessInfo child = new ProcessInfo();
+        IntPtr container=GetProcessWindowStation(),desktop=GetThreadDesktop(GetCurrentThreadId());
+        byte[] originalContainer=null,originalDesktop=null;
         try {
+            originalContainer=GrantDesktopAccess(container,userSid,0xF037F);
+            originalDesktop=GrantDesktopAccess(desktop,userSid,0xF01FF);
             if (!OpenProcessToken(GetCurrentProcess(),0xF01FF,out original)) throw new Win32Exception();
             if (!ConvertStringSidToSid("S-1-5-32-544",out admin)) throw new Win32Exception();
             var disabled = new SidAttributes { Sid=admin,Attributes=0 };
@@ -90,6 +114,9 @@ public static class BearlyMediumProof {
             if (!GetExitCodeProcess(child.process,out code)) throw new Win32Exception();
             return code;
         } finally {
+            uint info=4;
+            if (originalDesktop!=null) SetUserObjectSecurity(desktop,ref info,originalDesktop);
+            if (originalContainer!=null) SetUserObjectSecurity(container,ref info,originalContainer);
             if (child.thread!=IntPtr.Zero) CloseHandle(child.thread);
             if (child.process!=IntPtr.Zero) CloseHandle(child.process);
             if (original!=IntPtr.Zero) CloseHandle(original);
@@ -101,7 +128,7 @@ public static class BearlyMediumProof {
 }
 '@
 $command = '"' + $Python + '" "' + $proof + '" --driver "' + $Driver + '" --output "' + $Output + '"'
-$code = [BearlyMediumProof]::Run($command, (Get-Location).Path)
+$code = [BearlyMediumProof]::Run($command, (Get-Location).Path, $userSid)
 if (Test-Path $stdout) { Get-Content $stdout }
 if (Test-Path $stderr) { Get-Content $stderr }
 if ($code -ne 0) { throw "Medium integrity proof failed with exit $code; see evidence logs" }
