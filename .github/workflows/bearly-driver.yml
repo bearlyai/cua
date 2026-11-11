@@ -1,0 +1,144 @@
+name: Build Bearly computer use driver
+on:
+  push:
+    tags: ['cua-driver-rs-v*-bearly.*']
+permissions:
+  contents: read
+concurrency:
+  group: driver-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CUA_TELEMETRY: '0'
+  DO_NOT_TRACK: '1'
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: libs/cua-driver/rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: cargo test --locked --workspace --lib --bins
+      - run: |
+          cargo build --locked --release -p cua-driver -p cursor-theme-cli --target aarch64-apple-darwin
+          cargo build --locked --release -p cua-driver -p cursor-theme-cli --target x86_64-apple-darwin
+          version="${GITHUB_REF_NAME#cua-driver-rs-v}"
+          stage="cua-driver-rs-${version}-darwin-universal"
+          mkdir -p "release/$stage/CuaDriver.app/Contents/MacOS"
+          cp -R scripts/CuaDriverBundle/Contents/ "release/$stage/CuaDriver.app/Contents/"
+          for binary in cua-driver cua-cursor-theme; do
+            lipo -create "target/aarch64-apple-darwin/release/$binary" "target/x86_64-apple-darwin/release/$binary" -output "release/$stage/$binary"
+            codesign --force --sign - "release/$stage/$binary"
+            cp "release/$stage/$binary" "release/$stage/CuaDriver.app/Contents/MacOS/"
+          done
+          rm -f "release/$stage/CuaDriver.app/Contents/MacOS/.gitkeep"
+          plutil -replace CFBundleShortVersionString -string "${version%%-*}" "release/$stage/CuaDriver.app/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "${version%%-*}" "release/$stage/CuaDriver.app/Contents/Info.plist"
+          codesign --force --deep --sign - "release/$stage/CuaDriver.app"
+          "release/$stage/cua-driver" --version | grep -F "$version"
+          cp ../../../LICENSE.md "release/$stage/LICENSE"
+          tar czf "release/$stage.tar.gz" -C release "$stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: libs/cua-driver/rust/release/*.tar.gz
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container: debian:11
+    steps:
+      - name: Install build dependencies
+        run: |
+          cat > /etc/apt/sources.list <<'SOURCES'
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye-updates main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/20260901T000000Z/ bullseye-security main
+          SOURCES
+          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 update
+          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 install -y --no-install-recommends git ca-certificates curl build-essential pkg-config libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev libxkbcommon-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Build and package
+        working-directory: libs/cua-driver/rust
+        run: |
+          cargo build --locked --release -p cua-driver --features cua-driver/portal-input --target ${{ matrix.target }}
+          version="${GITHUB_REF_NAME#cua-driver-rs-v}"
+          stage="cua-driver-rs-${version}-linux-${{ matrix.arch }}"
+          mkdir -p "release/$stage"
+          cp "target/${{ matrix.target }}/release/cua-driver" "release/$stage/"
+          "release/$stage/cua-driver" --version | grep -F "$version"
+          cp ../../../LICENSE.md "release/$stage/LICENSE"
+          tar czf "release/$stage-binary.tar.gz" -C release "$stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: libs/cua-driver/rust/release/*.tar.gz
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - name: Build pair
+        working-directory: libs/cua-driver/rust
+        run: cargo build --locked --release -p cua-driver -p cua-driver-uia --target ${{ matrix.target }}
+      - name: Package
+        working-directory: libs/cua-driver/rust
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^cua-driver-rs-v',''
+          $stage = "cua-driver-rs-$version-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force "release/$stage"
+          Copy-Item "target/${{ matrix.target }}/release/cua-driver.exe","target/${{ matrix.target }}/release/cua-driver-uia.exe" "release/$stage/"
+          Copy-Item ../../../LICENSE.md "release/$stage/LICENSE"
+          Compress-Archive -Path "release/$stage" -DestinationPath "release/$stage.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: libs/cua-driver/rust/release/*.zip
+  release:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish archives and checksums
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum *.tar.gz *.zip > checksums.txt
+          gh release create "$GITHUB_REF_NAME" *.tar.gz *.zip checksums.txt --latest=false --title "Bearly computer use driver ${GITHUB_REF_NAME#cua-driver-rs-v}" --notes 'Bearly build of the MIT-licensed CUA driver. Background clicks preserve the active app; foreground input checks its target and stops typing when the field rejects keystrokes. macOS archives are ad-hoc signed for downstream Bearly signing and notarization. Windows executables require downstream Bearly signing before distribution.'

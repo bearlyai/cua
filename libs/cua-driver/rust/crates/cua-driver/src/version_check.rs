@@ -473,14 +473,18 @@ fn format_banner(
 /// 2. Persisted config `update_check_enabled` (false → off)
 /// 3. Built `CARGO_PKG_VERSION` is a pre-release (`-dev`, `-rc.1`, …) → off
 fn is_enabled() -> bool {
+    is_enabled_for_version(env!("CARGO_PKG_VERSION"))
+}
+
+fn is_enabled_for_version(version: &str) -> bool {
     if let Some(false) = parse_env_bool(ENV_UPDATE_CHECK) {
         return false;
     }
     if let Some(false) = read_config_flag() {
         return false;
     }
-    if is_prerelease(env!("CARGO_PKG_VERSION"))
-        && crate::release_channel::ReleaseChannel::from_version(env!("CARGO_PKG_VERSION"))
+    if is_prerelease(version)
+        && crate::release_channel::ReleaseChannel::from_version(version)
             != Some(crate::release_channel::ReleaseChannel::Nightly)
     {
         return false;
@@ -1263,11 +1267,13 @@ mod tests {
 
         with_isolated_home(|home| {
             // Case A: no config file at all → enabled.
-            // CARGO_PKG_VERSION is "0.1.3" (stable), env unset, no config file.
+            // Use an explicit stable version even when the test binary is a vendor build.
             assert!(
-                is_enabled(),
+                is_enabled_for_version("0.34.1"),
                 "no config file + stable version + no env opt-out → enabled"
             );
+
+            assert!(!is_enabled_for_version("0.34.1-bearly.1"));
 
             // Case B: config file present but flag = true → still enabled.
             let cfg_dir = home.join(".cua-driver");
@@ -1278,7 +1284,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                is_enabled(),
+                is_enabled_for_version("0.34.1"),
                 "explicit update_check_enabled=true must leave check on"
             );
         });
