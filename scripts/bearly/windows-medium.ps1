@@ -1,7 +1,36 @@
-param([Parameter(Mandatory)][string]$Driver, [Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Output)
+param([Parameter(Mandatory)][string]$Driver, [Parameter(Mandatory)][string]$Python, [Parameter(Mandatory)][string]$Output, [switch]$InteractiveBootstrap)
 $ErrorActionPreference = 'Stop'
 $Output = [IO.Path]::GetFullPath($Output)
 New-Item -ItemType Directory -Force $Output | Out-Null
+$sessionId = (Get-Process -Id $PID).SessionId
+Write-Host "Proof launcher session: $sessionId"
+if ($sessionId -eq 0 -and !$InteractiveBootstrap) {
+    $bootstrap = Join-Path $Output 'interactive-bootstrap.ps1'
+    $result = Join-Path $Output 'bootstrap-exit.txt'
+    $log = Join-Path $Output 'bootstrap.log'
+    function Q([string]$Value) { return "'" + $Value.Replace("'", "''") + "'" }
+    $invoke = '& ' + (Q $PSCommandPath) + ' -Driver ' + (Q $Driver) + ' -Python ' + (Q $Python) + ' -Output ' + (Q $Output) + ' -InteractiveBootstrap *> ' + (Q $log)
+    $body = 'try { ' + $invoke + '; $code=0 } catch { $_ | Out-File -Append ' + (Q $log) + '; $code=1 }' + "`n"
+    $body += '$code | Set-Content ' + (Q $result)
+    Set-Content -Encoding UTF8 $bootstrap $body
+    $name = 'BearlyDriverProof-' + [guid]::NewGuid().ToString('N')
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $bootstrap + '"') -WorkingDirectory (Get-Location).Path
+    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    try {
+        Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $name
+        $deadline = [datetime]::UtcNow.AddMinutes(6)
+        while (!(Test-Path $result) -and [datetime]::UtcNow -lt $deadline) { Start-Sleep -Seconds 2 }
+        if (Test-Path $log) { Get-Content $log }
+        if (!(Test-Path $result) -or [int](Get-Content $result -Raw) -ne 0) { throw 'Interactive proof bootstrap failed' }
+    } finally {
+        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    return
+}
+if ($sessionId -eq 0) { throw 'Background input proof requires an interactive session' }
 $proof = Join-Path $PSScriptRoot 'windows-background.py'
 $stdout = Join-Path $Output 'proof.log'
 $stderr = Join-Path $Output 'proof-error.log'
