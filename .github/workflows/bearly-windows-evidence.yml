@@ -2,6 +2,10 @@ name: Verify ordinary Windows background input
 on:
   workflow_dispatch:
     inputs:
+      run_unit_tests:
+        description: 'Run native workspace tests as well as background proof'
+        type: boolean
+        default: true
       build_run:
         description: 'Exact Bearly driver build run supplying Windows x64 archive'
         required: true
@@ -11,6 +15,7 @@ permissions:
   actions: read
 jobs:
   native-unit:
+    if: inputs.run_unit_tests
     runs-on: windows-latest
     timeout-minutes: 35
     env:
