@@ -10,7 +10,7 @@ permissions:
   contents: read
   actions: read
 jobs:
-  windows:
+  native-unit:
     runs-on: windows-latest
     timeout-minutes: 35
     env:
@@ -25,12 +25,30 @@ jobs:
         with:
           workspaces: libs/cua-driver/rust -> target
           key: bearly-windows-evidence
+          cache-on-failure: true
+      - name: Test native Windows workspace
+        working-directory: libs/cua-driver/rust
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ../../../evidence | Out-Null
+          cargo test --locked --workspace --lib --bins --no-fail-fast 2>&1 | Tee-Object ../../../evidence/native-tests.log
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-native-unit-results
+          path: evidence
+  background:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      CUA_TELEMETRY: '0'
+      DO_NOT_TRACK: '1'
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Test native Windows workspace
-        working-directory: libs/cua-driver/rust
-        run: cargo test --locked --workspace --lib --bins
       - uses: actions/download-artifact@v4
         with:
           name: windows-x86_64
@@ -42,15 +60,13 @@ jobs:
         run: |
           $zips = @(Get-ChildItem evidence/archive/*.zip)
           if ($zips.Count -ne 1) { throw "Expected one Windows archive" }
-          $zip = $zips[0]
-          Expand-Archive $zip.FullName -DestinationPath evidence/driver
+          Expand-Archive $zips[0].FullName -DestinationPath evidence/driver
           $drivers = @(Get-ChildItem evidence/driver -Recurse -Filter cua-driver.exe)
           if ($drivers.Count -ne 1) { throw "Expected one regular driver" }
-          $driver = $drivers[0]
           $python = (Get-Command python).Source
-          ./scripts/bearly/windows-medium.ps1 -Driver $driver.FullName -Python $python -Output evidence/background
+          ./scripts/bearly/windows-medium.ps1 -Driver $drivers[0].FullName -Python $python -Output evidence/background
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: windows-ordinary-integrity-evidence
-          path: evidence
+          path: evidence/background
