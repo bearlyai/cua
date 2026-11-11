@@ -5,6 +5,7 @@ from ctypes import wintypes
 import json
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +16,8 @@ parser.add_argument('--output', required=True)
 args = parser.parse_args()
 out = Path(args.output).resolve()
 out.mkdir(parents=True, exist_ok=True)
+sys.stdout = (out / 'proof.log').open('w', encoding='utf-8', buffering=1)
+sys.stderr = (out / 'proof-error.log').open('w', encoding='utf-8', buffering=1)
 user = ctypes.WinDLL('user32', use_last_error=True)
 kernel = ctypes.WinDLL('kernel32', use_last_error=True)
 advapi = ctypes.WinDLL('advapi32', use_last_error=True)

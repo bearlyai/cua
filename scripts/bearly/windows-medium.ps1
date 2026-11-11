@@ -3,14 +3,13 @@ $ErrorActionPreference = 'Stop'
 $Output = [IO.Path]::GetFullPath($Output)
 New-Item -ItemType Directory -Force $Output | Out-Null
 $proof = Join-Path $PSScriptRoot 'windows-background.py'
-$job = Join-Path $Output 'run-proof.ps1'
-$exitFile = Join-Path $Output 'exit.txt'
 $stdout = Join-Path $Output 'proof.log'
 $stderr = Join-Path $Output 'proof-error.log'
-function Quote-Literal([string]$Value) { return "'" + $Value.Replace("'", "''") + "'" }
-$body = '& ' + (Quote-Literal $Python) + ' ' + (Quote-Literal $proof) + ' --driver ' + (Quote-Literal $Driver) + ' --output ' + (Quote-Literal $Output) + ' > ' + (Quote-Literal $stdout) + ' 2> ' + (Quote-Literal $stderr) + "`n"
-$body += '$LASTEXITCODE | Set-Content ' + (Quote-Literal $exitFile)
-Set-Content -Encoding UTF8 $job $body
+$userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls $Output /grant ('*' + $userSid + ':(OI)(CI)M') /T | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Grant proof directory access failed' }
+icacls $Output /setintegritylevel '(OI)(CI)M' /T | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Set proof directory integrity failed' }
 # Hosted Windows runners can have UAC disabled, making even a Limited task high
 # integrity. Create an actual medium token with administrator membership denied.
 Add-Type -TypeDefinition @'
@@ -72,7 +71,8 @@ public static class BearlyMediumProof {
     }
 }
 '@
-$code = [BearlyMediumProof]::Run(('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $job + '"'), (Get-Location).Path)
+$command = '"' + $Python + '" "' + $proof + '" --driver "' + $Driver + '" --output "' + $Output + '"'
+$code = [BearlyMediumProof]::Run($command, (Get-Location).Path)
 if (Test-Path $stdout) { Get-Content $stdout }
 if (Test-Path $stderr) { Get-Content $stderr }
-if ($code -ne 0 -or !(Test-Path $exitFile) -or [int](Get-Content $exitFile -Raw) -ne 0) { throw 'Medium integrity proof failed; see evidence logs' }
+if ($code -ne 0) { throw "Medium integrity proof failed with exit $code; see evidence logs" }
