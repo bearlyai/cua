@@ -21,9 +21,9 @@ pub(super) trait TextControl {
     fn value_settable(&self) -> bool {
         false
     }
-    /// Set the whole `AXValue`; true when the write was accepted.
-    fn set_value(&self, _text: &str) -> bool {
-        false
+    /// Set the whole `AXValue`; how the write itself answered.
+    fn set_value(&self, _text: &str) -> Write {
+        Write::Rejected
     }
     fn range(&self) -> Option<TextRange>;
     fn set_range(&self, range: TextRange) -> bool;
@@ -559,8 +559,8 @@ impl TextControl for AxTextControl {
     fn value_settable(&self) -> bool {
         unsafe { is_attribute_settable(self.0, "AXValue") }
     }
-    fn set_value(&self, text: &str) -> bool {
-        unsafe { set_string_attr(self.0, "AXValue", text) == kAXErrorSuccess }
+    fn set_value(&self, text: &str) -> Write {
+        write_outcome(unsafe { set_string_attr(self.0, "AXValue", text) })
     }
     fn focused(&self) -> Option<bool> {
         unsafe { copy_bool_attr(self.0, "AXFocused") }
@@ -658,6 +658,9 @@ mod tests {
         /// The focus request errors without a clear rejection (a busy app).
         focus_uncertain: Cell<bool>,
         range_sets: Cell<usize>,
+        /// How a whole-`AXValue` write answers, and how many were sent.
+        set_value_result: Cell<Write>,
+        value_writes: Cell<usize>,
     }
     impl Control {
         fn select_all(&self) {
@@ -767,9 +770,12 @@ mod tests {
         fn value_settable(&self) -> bool {
             self.value_settable.get()
         }
-        fn set_value(&self, text: &str) -> bool {
-            *self.value.borrow_mut() = Some(text.into());
-            true
+        fn set_value(&self, text: &str) -> Write {
+            self.value_writes.set(self.value_writes.get() + 1);
+            if self.set_value_result.get() == Write::Accepted && !self.echo_lags.get() {
+                *self.value.borrow_mut() = Some(text.into());
+            }
+            self.set_value_result.get()
         }
         fn insert(&self, t: &str) -> Write {
             self.writes.set(self.writes.get() + 1);
@@ -821,6 +827,8 @@ mod tests {
             select_all_at: Cell::new(None),
             focus_uncertain: Cell::new(false),
             range_sets: Cell::new(0),
+            set_value_result: Cell::new(Write::Accepted),
+            value_writes: Cell::new(0),
         }
     }
     /// An element addressed by token.
@@ -1576,6 +1584,79 @@ mod tests {
             );
             assert_eq!(c.value().as_deref(), Some(value), "a second write ran");
         }
+    }
+    #[test]
+    fn an_accepted_long_text_write_that_shows_no_change_is_never_followed_by_another() {
+        // A toolkit can acknowledge a write and apply it after the 2 s read-back
+        // ends. Neither the whole-value write nor keystrokes (or the keystroke
+        // budget's retryable refusal) may follow it, on either foreground route:
+        // the desktop route's default focus and the focus step's own result.
+        let caret_at = |at| TextRange {
+            location: at,
+            length: 0,
+        };
+        let cases = [
+            ("empty field", "", caret_at(0)),
+            (
+                "whole value already selected",
+                "Original",
+                TextRange {
+                    location: 0,
+                    length: 8,
+                },
+            ),
+            ("caret at the end", "Original", caret_at(8)),
+        ];
+        for focus_selected_all in [false, true] {
+            for (name, value, range) in cases {
+                let c = control(true, false);
+                *c.value.borrow_mut() = Some(value.into());
+                c.range.set(Some(range));
+                c.echo_lags.set(true);
+                let focus = ForegroundFocus { focus_selected_all };
+                let delivery = focus.atomic_insert(&c, "long text", Some(value));
+                assert_eq!(
+                    delivery,
+                    (false, None),
+                    "{name}, focus_selected_all={focus_selected_all}: an accepted write must end as indeterminate"
+                );
+                assert_eq!(c.writes.get(), 1, "{name}: the write was sent again");
+                assert_eq!(
+                    c.value_writes.get(),
+                    0,
+                    "{name}: a whole-value write followed"
+                );
+            }
+        }
+        // The first write was clearly rejected and the whole-value write was
+        // accepted but shows no change, or errored unclearly: either may land.
+        for set_value_result in [Write::Accepted, Write::Uncertain] {
+            let c = control(true, false);
+            *c.value.borrow_mut() = Some(String::new());
+            c.write_result.set(Write::Rejected);
+            c.set_value_result.set(set_value_result);
+            c.echo_lags.set(true);
+            let delivery = ForegroundFocus::default().atomic_insert(&c, "long text", Some(""));
+            assert_eq!(
+                delivery,
+                (false, None),
+                "a {set_value_result:?} whole-value write must end as indeterminate"
+            );
+            assert_eq!(c.value_writes.get(), 1);
+        }
+        // Only clear rejections leave nothing landed, so keystrokes may follow.
+        let c = control(true, false);
+        *c.value.borrow_mut() = Some(String::new());
+        c.write_result.set(Write::Rejected);
+        c.set_value_result.set(Write::Rejected);
+        let delivery = ForegroundFocus::default().atomic_insert(&c, "long text", Some(""));
+        assert_eq!(delivery, (false, Some(0)));
+        let c = control(true, false);
+        c.range.set(Some(caret_at(8)));
+        c.write_result.set(Write::Rejected);
+        let delivery = ForegroundFocus::default().atomic_insert(&c, "long text", Some("Original"));
+        assert_eq!(delivery, (false, Some(0)));
+        assert_eq!(c.value_writes.get(), 0);
     }
     #[test]
     fn a_focus_request_that_errors_unclearly_is_treated_as_sent() {

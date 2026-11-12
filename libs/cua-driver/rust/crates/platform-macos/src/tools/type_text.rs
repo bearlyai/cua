@@ -1469,45 +1469,50 @@ fn verify_keystrokes(
 
 /// Long foreground text: one accessibility write into the verified field,
 /// then read back. Inserts at the cursor (replacing any selection) through
-/// `AXSelectedText`; when that doesn't land and the field is empty or wholly
-/// selected, sets its whole `AXValue`, which is the same edit. Returns whether
-/// the whole text landed and how many characters were verified. Callers reach
-/// it through [`super::background_text::ForegroundFocus::atomic_insert`], which
-/// carries whether the driver's own focus step selected everything.
+/// `AXSelectedText`; when that is clearly rejected and the field is empty or
+/// wholly selected, sets its whole `AXValue`, which is the same edit. Returns
+/// whether the whole text landed and how many characters were verified;
+/// `Some(0)`, the only answer that lets the caller type the text instead, means
+/// every write was clearly rejected. Callers reach it through
+/// [`super::background_text::ForegroundFocus::atomic_insert`], which carries
+/// whether the driver's own focus step selected everything.
 pub(super) fn atomic_insert(
     field: &impl super::background_text::TextControl,
     text: &str,
     before: Option<&str>,
     focus_selected_all: bool,
 ) -> (bool, Option<usize>) {
+    use super::background_text::Write;
     let read = || field.reported_value();
+    // A write that was not clearly rejected can still land after the read-back
+    // ends (a busy app's timeout, or a toolkit that acknowledges and applies
+    // later): any further write or keystroke could type the text twice, so an
+    // unchanged read-back is reported as unknown.
+    let after_write = |write: Write, before: Option<&str>| match write {
+        Write::Rejected => None,
+        Write::Uncertain => Some((false, None)),
+        Write::Accepted => Some(
+            match await_typed_delivery(
+                before,
+                text,
+                std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
+                read,
+            ) {
+                (false, Some(0)) => (false, None),
+                delivery => delivery,
+            },
+        ),
+    };
     let selected = field.selected_text();
-    let write = field.insert(text);
-    // A busy app's timeout can still apply the write later: any further write
-    // or keystroke could type the text twice.
-    if write == super::background_text::Write::Uncertain {
-        return (false, None);
-    }
-    if write == super::background_text::Write::Accepted {
-        let delivery = await_typed_delivery(
-            before,
-            text,
-            std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
-            read,
-        );
-        if delivery.0 || delivery.1 != Some(0) {
-            return delivery;
-        }
+    if let Some(delivery) = after_write(field.insert(text), before) {
+        return delivery;
     }
     let replaces_whole_value =
         whole_value_write_allowed(before, selected.as_deref(), focus_selected_all);
-    if replaces_whole_value && field.value_settable() && field.set_value(text) {
-        return await_typed_delivery(
-            Some(""),
-            text,
-            std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
-            read,
-        );
+    if replaces_whole_value && field.value_settable() {
+        if let Some(delivery) = after_write(field.set_value(text), Some("")) {
+            return delivery;
+        }
     }
     (false, before.map(|_| 0))
 }
@@ -1629,7 +1634,7 @@ fn type_text_foreground_guarded(
                                 delivered_chars: verified,
                             })
                         }
-                        // Verifiably nothing landed: type it instead.
+                        // Every write was clearly rejected: type it instead.
                         (false, Some(0)) => ax_attempt = AxAttempt::Unchanged,
                         (false, verified) => {
                             break 'typed TypeTextDelivery::Reported(
@@ -1756,7 +1761,7 @@ fn type_text_desktop_guarded(
                         "verified": true,
                         "effect": "confirmed",
                     })),
-                    // Verifiably nothing landed: type it instead.
+                    // Every write was clearly rejected: type it instead.
                     (false, Some(0)) => {}
                     (false, verified) => {
                         break 'typed foreground_typing::atomic_indeterminate_result(

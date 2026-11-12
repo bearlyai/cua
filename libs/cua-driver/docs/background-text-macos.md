@@ -216,11 +216,16 @@ did not cover it before, the driver restores the range before the call (see
 focused) before any keystroke or accessibility write, and refuses with
 `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` when the restore does not hold. The
 long-text accessibility fallback no longer sets the whole `AXValue` for a
-selection the driver's focus step created. When the long-text `AXSelectedText`
-write returns an error that is not a clear rejection (a busy app's timeout),
-the call ends as `type_text_indeterminate` (`effect: "indeterminate"`,
-`retryable: false`) with no second write and no keystrokes (**changed**:
-it used to fall through to the whole-value write or to keystrokes).
+selection the driver's focus step created. The whole-value write and
+keystrokes follow the long-text `AXSelectedText` write only when it was
+clearly rejected. When that write, or the whole-value write, returns an error
+that is not a clear rejection (a busy app's timeout), or (**changed**) is
+accepted but the value still reads unchanged after 2 s, the call ends as
+`type_text_indeterminate` (`effect: "indeterminate"`, `retryable: false`) with
+no further write and no keystrokes, on both `ax_fg` routes (an addressed
+field and desktop scope). An accepted write that shows no change used to fall
+through to a second write, to keystrokes, or over the keystroke budget to a
+retryable `type_text_synthesis_budget_exceeded`.
 
 Guarantee on this route: the driver's own focus step never causes the field's
 existing text to be replaced. A selection the field already had before the
