@@ -6,9 +6,8 @@
 //! inputs in Safari, etc.) and is significantly faster than per-keystroke
 //! CGEvent synthesis.
 //!
-//! For Chromium / Electron inputs that don't implement `kAXSelectedText`,
-//! the tool falls back to character-by-character CGEvent keystrokes so the
-//! caller doesn't need to detect the app type themselves.
+//! Background native AX targets never fall back to keystrokes after a write.
+//! Foreground and key-driven routes retain their explicit event delivery.
 //!
 //! When the target pid belongs to a terminal emulator (Ghostty,
 //! Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Hyper, Warp — see
@@ -69,7 +68,11 @@ fn def() -> &'static ToolDef {
              within the daemon transport budget. Longer synthesized routes are \
              refused before character events and return a safe chunk size; \
              one-call AX insertion remains uncapped.\n\n\
-             Background accessibility writes first set and read back the exact selected range. \
+             Background native fields may first receive AXFocused inside their window, \
+             without app activation. The result reports focused_first:true when this happens. \
+             If focus creates a selection, default typing refuses; explicit end appends, \
+             while selection may replace only a selection that existed before focus. \
+             Background accessibility writes then set and read back the exact selected range. \
              `insert_at` defaults to caret (a collapsed known range); end appends and selection \
              explicitly replaces a selected range. A field that ignores range writes refuses \
              before any text write, with no keystroke fallback. Confirmation requires the exact \
@@ -1717,7 +1720,9 @@ fn type_text_blocking(
         && !delivery_mode.is_foreground()
         && insert_at != crate::ax::text_range::InsertAt::Caret
     {
-        return Ok(TypeTextDelivery::Reported(ToolResult::error("insert_at requires a native accessibility text field").with_structured(serde_json::json!({"effect":"refused","code":"BACKGROUND_TEXT_TARGET_UNSUPPORTED"}))));
+        return Ok(TypeTextDelivery::Reported(super::background_text::refusal(
+            "BACKGROUND_TEXT_TARGET_UNSUPPORTED",
+        )));
     }
     if is_terminal_target && !delivery_mode.is_foreground() {
         if let BackgroundKeyboardPolicy::SemanticOnly(refusal) = &keyboard_policy {
@@ -1901,7 +1906,9 @@ fn type_text_blocking(
         return Ok(TypeTextDelivery::Reported(result));
     } else {
         if insert_at != crate::ax::text_range::InsertAt::Caret {
-            return Ok(TypeTextDelivery::Reported(ToolResult::error("No accessibility field for insert_at").with_structured(serde_json::json!({"effect":"refused","code":"BACKGROUND_TEXT_TARGET_UNSUPPORTED"}))));
+            return Ok(TypeTextDelivery::Reported(super::background_text::refusal(
+                "BACKGROUND_TEXT_TARGET_UNSUPPORTED",
+            )));
         }
         tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
     }

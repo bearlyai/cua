@@ -449,6 +449,10 @@ export type ActionResult = {
      */
     summary?: string,
     /**
+     * True when the action first moved keyboard focus inside its background window.
+     */
+    focusedFirst?: boolean,
+    /**
      * Present only with `effect: refused`.
      */
     error?: ActionError
@@ -481,6 +485,7 @@ const FfiConverterTypeActionResult = (() => {
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
+                focusedFirst: FfiConverterOptionalBoolean.read(from),
                 error: FfiConverterOptionalTypeActionError.read(from)
             };
         }
@@ -491,6 +496,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, into);
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
             FfiConverterOptionalString.write(value.summary, into);
+            FfiConverterOptionalBoolean.write(value.focusedFirst, into);
             FfiConverterOptionalTypeActionError.write(value.error, into);
         }
         allocationSize(value: TypeName): number {
@@ -500,6 +506,7 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
+             FfiConverterOptionalBoolean.allocationSize(value.focusedFirst) +
              FfiConverterOptionalTypeActionError.allocationSize(value.error);
 
         }
@@ -6442,6 +6449,9 @@ const FfiConverterOptionalSequenceTypeActionEvidence = new FfiConverterOptional(
 // FfiConverter for ActionEscalation | undefined
 const FfiConverterOptionalTypeActionEscalation = new FfiConverterOptional(FfiConverterTypeActionEscalation);
 
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
+
 // FfiConverter for ActionError | undefined
 const FfiConverterOptionalTypeActionError = new FfiConverterOptional(FfiConverterTypeActionError);
 
@@ -6453,9 +6463,6 @@ const FfiConverterOptionalTypeClickButton = new FfiConverterOptional(FfiConverte
 
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
-
-// FfiConverter for boolean | undefined
-const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
 // FfiConverter for CursorMotionStyle | undefined
 const FfiConverterOptionalTypeCursorMotionStyle = new FfiConverterOptional(FfiConverterTypeCursorMotionStyle);

@@ -322,6 +322,7 @@ the Lume gate runs after its repo-local matrix.
 | Shared app matrix         | `cross_platform_behavior_test.rs`      | Electron and Tauri                      |
 | Native web matrix         | `cross_platform_behavior_test.rs`      | Repo-local WKWebView host               |
 | Native controls           | `harness_appkit_test.rs`               | Repo-local AppKit app                   |
+| Background text insertion | `background_text_insert.rs`           | Compiled AppKit and SwiftUI controls    |
 | Native controls           | `harness_swiftui_test.rs`              | Repo-local SwiftUI app                  |
 | Installed app launch      | `installed_app_launch_macos_test.rs`   | Calculator and TextEdit                 |
 | Installed app AX delivery | `installed_app_textedit_macos_test.rs` | TextEdit                                |

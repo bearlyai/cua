@@ -1,4 +1,4 @@
-//! Exact range-based insertion, without focus changes or synthesized input.
+//! Exact range-based insertion, with in-window AX focus and no app activation.
 
 use crate::ax::{
     bindings::*,
@@ -12,9 +12,15 @@ trait TextControl {
     fn range(&self) -> Option<TextRange>;
     fn set_range(&self, range: TextRange) -> bool;
     fn insert(&self, text: &str) -> bool;
+    fn focused(&self) -> Option<bool> {
+        None
+    }
+    fn focus(&self) -> bool {
+        false
+    }
 }
 
-fn refusal(code: &str) -> ToolResult {
+pub(super) fn refusal(code: &str) -> ToolResult {
     ToolResult::error(format!(
         "Background insertion refused before writing text: {code}."
     ))
@@ -23,14 +29,49 @@ fn refusal(code: &str) -> ToolResult {
     )
 }
 
+fn focused_refusal(code: &str) -> ToolResult {
+    ToolResult::error(format!("Field focused first inside its background window; text insertion refused before writing: {code}."))
+        .with_structured(serde_json::json!({"code":code,"effect":"refused","path":"ax","verified":false,"focused_first":true}))
+}
+
 fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> ToolResult {
     let Some(before) = control.value() else {
         return refusal("BACKGROUND_TEXT_VALUE_UNREADABLE");
     };
+    let prior_range = control.range();
+    let focused_first = control.focused() == Some(false);
+    if focused_first {
+        if !trusted {
+            return refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
+        }
+        if !control.focus() || control.focused() != Some(true) {
+            return refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+        }
+        if control.value().as_deref() != Some(before.as_str()) {
+            return focused_refusal("BACKGROUND_TEXT_VALUE_CHANGED");
+        }
+        // Focusing a single-line Cocoa field commonly selects its entire
+        // value. That new selection is not a remembered caret or a selection
+        // the caller observed. Only an explicit append may collapse it.
+        if !before.is_empty()
+            && mode != InsertAt::End
+            && control.range().is_some_and(|r| r.length > 0)
+            && !(mode == InsertAt::Selection && control.range() == prior_range)
+        {
+            return focused_refusal("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+        }
+    }
+    let refuse = |code| {
+        if focused_first {
+            focused_refusal(code)
+        } else {
+            refusal(code)
+        }
+    };
     let original_range = control.range();
     let range = match mode.range(&before, original_range) {
         Ok(r) => r,
-        Err(code) => return refusal(code),
+        Err(code) => return refuse(code),
     };
     let expected = text_range::splice(&before, range, text).expect("range was validated");
     // A never-focused field may echo {0,0} even when it ignores all range sets.
@@ -53,11 +94,11 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         if let Some(r) = original_range {
             control.set_range(r);
         }
-        return refusal("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
+        return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
     }
     // Setting a range must not edit the value; also catch concurrent edits.
     if control.value().as_deref() != Some(before.as_str()) {
-        return refusal("BACKGROUND_TEXT_VALUE_CHANGED");
+        return refuse("BACKGROUND_TEXT_VALUE_CHANGED");
     }
     let accepted = control.insert(text);
     // Native apps may update AXValue on their next main-loop turn. Poll only
@@ -92,8 +133,15 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     } else {
         "BACKGROUND_TEXT_UNCHANGED"
     };
+    let focus_note = if focused_first {
+        " Field focused first inside its background window."
+    } else {
+        ""
+    };
     let mut result = if exact || after.is_none() {
-        ToolResult::text(format!("Background insertion: {effect} ({code})."))
+        ToolResult::text(format!(
+            "Background insertion: {effect} ({code}).{focus_note}"
+        ))
     } else {
         ToolResult::error(format!(
             "Background insertion: {effect} ({code}); inspect the field before retrying."
@@ -103,13 +151,28 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         "path":"ax", "effect":effect, "code":code, "verified":exact && trusted,
         "requested_chars":text.chars().count(), "posted_keystrokes":0,
         "insertion_range":range, "ax_accepted":accepted,
-        "readback_available":after.is_some(), "value_changed":changed,
+        "readback_available":after.is_some(), "value_changed":changed, "focused_first":focused_first,
     }));
     result
 }
 
 struct AxTextControl(AXUIElementRef);
 impl TextControl for AxTextControl {
+    fn focused(&self) -> Option<bool> {
+        unsafe { copy_bool_attr(self.0, "AXFocused") }
+    }
+    fn focus(&self) -> bool {
+        unsafe {
+            if set_bool_attr_true(self.0, "AXFocused") != kAXErrorSuccess {
+                return false;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while self.focused() != Some(true) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.focused() == Some(true)
+        }
+    }
     fn value(&self) -> Option<String> {
         unsafe {
             let value = copy_string_attr(self.0, "AXValue")?;
@@ -161,9 +224,27 @@ mod tests {
         holds: bool,
         writes: Cell<usize>,
         wrong: bool,
+        focused: Cell<Option<bool>>,
+        focus_range: Cell<Option<TextRange>>,
+        focus_supported: Cell<bool>,
+        hide_after_write: Cell<bool>,
     }
     impl TextControl for Control {
+        fn focused(&self) -> Option<bool> {
+            self.focused.get()
+        }
+        fn focus(&self) -> bool {
+            if !self.focus_supported.get() {
+                return false;
+            }
+            self.focused.set(Some(true));
+            self.range.set(self.focus_range.get());
+            true
+        }
         fn value(&self) -> Option<String> {
+            if self.hide_after_write.get() && self.writes.get() > 0 {
+                return None;
+            }
             self.value.borrow().clone()
         }
         fn range(&self) -> Option<TextRange> {
@@ -198,11 +279,69 @@ mod tests {
             holds,
             writes: Cell::new(0),
             wrong,
+            focused: Cell::new(None),
+            focus_range: Cell::new(None),
+            focus_supported: Cell::new(true),
+            hide_after_write: Cell::new(false),
         }
     }
     fn state(r: ToolResult) -> serde_json::Value {
         serde_json::to_value(r).unwrap()["structuredContent"].clone()
     }
+    #[test]
+    fn background_focus_allows_append_and_empty_but_not_a_new_selection() {
+        for mode in [InsertAt::Caret, InsertAt::Selection, InsertAt::End] {
+            let c = control(true, false);
+            c.focused.set(Some(false));
+            c.focus_range.set(Some(TextRange {
+                location: 0,
+                length: 8,
+            }));
+            let result = transact(&c, mode, "!", true);
+            let s = state(result);
+            if mode == InsertAt::End {
+                assert_eq!(s["effect"], "confirmed");
+                assert_eq!(c.value().as_deref(), Some("Original!"));
+                assert_eq!(s["focused_first"], true);
+            } else {
+                assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+                assert_eq!(c.writes.get(), 0);
+            }
+        }
+        let c = control(true, false);
+        c.range.set(Some(TextRange {
+            location: 3,
+            length: 2,
+        }));
+        c.focused.set(Some(false));
+        c.focus_range.set(c.range.get());
+        assert_eq!(
+            state(transact(&c, InsertAt::Selection, "!", true))["effect"],
+            "confirmed"
+        );
+        assert_eq!(c.value().as_deref(), Some("Ori!nal"));
+        let c = control(true, false);
+        *c.value.borrow_mut() = Some("".into());
+        c.focused.set(Some(false));
+        c.focus_range.set(Some(TextRange {
+            location: 0,
+            length: 0,
+        }));
+        assert_eq!(
+            state(transact(&c, InsertAt::Caret, "!", true))["effect"],
+            "confirmed"
+        );
+        assert_eq!(c.value().as_deref(), Some("!"));
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_supported.set(false);
+        assert_eq!(
+            state(transact(&c, InsertAt::End, "!", true))["code"],
+            "BACKGROUND_TEXT_FOCUS_NOT_RETAINED"
+        );
+        assert_eq!(c.writes.get(), 0);
+    }
+
     #[test]
     fn ignored_range_set_refuses_before_text_write_even_at_zero() {
         for mode in [InsertAt::Caret, InsertAt::End] {
@@ -229,6 +368,14 @@ mod tests {
     }
     #[test]
     fn unreadable_values_and_untrusted_echo_never_confirm() {
+        let c = control(true, false);
+        c.hide_after_write.set(true);
+        let s = state(transact(&c, InsertAt::End, "!", true));
+        assert_eq!(s["effect"], "unverifiable");
+        assert_eq!(s["code"], "BACKGROUND_TEXT_READBACK_UNAVAILABLE");
+        assert_eq!(s["readback_available"], false);
+        assert_eq!(c.writes.get(), 1);
+
         let c = control(true, false);
         *c.value.borrow_mut() = None;
         let s = state(transact(&c, InsertAt::End, "!", true));
