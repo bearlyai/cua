@@ -693,6 +693,9 @@ pub struct ActionResult {
     /// text content says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// True when the action first moved keyboard focus inside its background window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_first: Option<bool>,
     /// Present only with `effect: refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ActionError>,
@@ -847,6 +850,7 @@ mod tests {
             }]),
             escalation: None,
             summary: None,
+            focused_first: None,
             error: None,
         }
     }
@@ -908,6 +912,7 @@ mod tests {
                 "error",
                 "escalation",
                 "evidence",
+                "focused_first",
                 "route",
                 "summary"
             ]

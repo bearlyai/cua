@@ -1867,6 +1867,9 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            focused: None,
+            selected_text_range: None,
+            text_value: None,
         }
     }
 

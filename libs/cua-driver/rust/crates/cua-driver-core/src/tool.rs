@@ -3012,6 +3012,12 @@ fn publish_action_result(result: &mut ToolResult) -> Result<(), String> {
     // producer's text is the only place the resolved points, the element hit,
     // popups, focus outcome and follow-up calls are spelled out, so the
     // closed contract carries it as `summary`.
+    public.focused_first = result
+        .structured_content
+        .as_ref()
+        .and_then(|s| s.get("focused_first"))
+        .and_then(Value::as_bool)
+        .filter(|focused| *focused);
     public.summary = result.content.iter().find_map(|content| match content {
         Content::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
         _ => None,
@@ -5302,6 +5308,31 @@ resources:
         cua_driver_contract::validate_success_output("click", structured)
             .expect("the projected action must satisfy the public contract");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn action_projection_preserves_reported_in_window_focus_only_when_true() {
+        for flag in [None, Some(false), Some(true)] {
+            let mut legacy = serde_json::json!({"path":"ax","effect":"confirmed","verified":true});
+            if let Some(flag) = flag {
+                legacy["focused_first"] = serde_json::json!(flag);
+            }
+            let mut result =
+                crate::protocol::ToolResult::text("inserted").with_structured(legacy.clone());
+            result.action_record = crate::action_record::ActionExecutionRecord::from_legacy(
+                "type_text",
+                &serde_json::json!({}),
+                &legacy,
+            );
+            publish_action_result(&mut result).unwrap();
+            let output = result.structured_content.unwrap();
+            if flag == Some(true) {
+                assert_eq!(output["focused_first"], true);
+            } else {
+                assert!(output.get("focused_first").is_none());
+            }
+            cua_driver_contract::validate_success_output("type_text", output).unwrap();
+        }
     }
 
     #[test]

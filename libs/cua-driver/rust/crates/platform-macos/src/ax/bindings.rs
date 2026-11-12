@@ -126,6 +126,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 // ── AXValue functions ────────────────────────────────────────────────────────
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueCreate(the_type: AXValueType, value_ptr: *const c_void) -> AXValueRef;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
     pub fn AXValueGetValue(
@@ -1084,4 +1085,58 @@ mod tests {
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
     }
+}
+
+/// Copy an accessibility range without guessing when the attribute is absent.
+/// # Safety
+/// `element` must be a live accessibility object.
+pub unsafe fn copy_text_range(element: AXUIElementRef) -> Option<super::text_range::TextRange> {
+    let name = CFStr::new("AXSelectedTextRange");
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, name.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let mut range = core_foundation::base::CFRange {
+        location: 0,
+        length: 0,
+    };
+    let valid = core_foundation::base::CFGetTypeID(value) == AXValueGetTypeID()
+        && AXValueGetType(value as AXValueRef) == kAXValueCFRangeType
+        && AXValueGetValue(
+            value as AXValueRef,
+            kAXValueCFRangeType,
+            &mut range as *mut _ as *mut c_void,
+        )
+        && range.location >= 0
+        && range.length >= 0;
+    CFRelease(value);
+    valid.then_some(super::text_range::TextRange {
+        location: range.location as usize,
+        length: range.length as usize,
+    })
+}
+
+/// Set the range only; callers must read it back before writing selected text.
+/// # Safety
+/// `element` must be a live accessibility object.
+pub unsafe fn set_text_range(
+    element: AXUIElementRef,
+    range: super::text_range::TextRange,
+) -> AXError {
+    let (Ok(location), Ok(length)) = (
+        isize::try_from(range.location),
+        isize::try_from(range.length),
+    ) else {
+        return kAXErrorFailure;
+    };
+    let raw = core_foundation::base::CFRange { location, length };
+    let value = AXValueCreate(kAXValueCFRangeType, &raw as *const _ as *const c_void);
+    if value.is_null() {
+        return kAXErrorFailure;
+    }
+    let name = CFStr::new("AXSelectedTextRange");
+    let err = AXUIElementSetAttributeValue(element, name.as_concrete_TypeRef(), value as _);
+    CFRelease(value as _);
+    err
 }

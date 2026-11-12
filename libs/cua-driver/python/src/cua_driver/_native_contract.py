@@ -1446,6 +1446,52 @@ class _UniffiFfiConverterOptionalTypeActionEscalation(_UniffiConverterRustBuffer
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterBoolean:
+    @classmethod
+    def check_lower(cls, value):
+        return not not value
+
+    @classmethod
+    def lower(cls, value):
+        return 1 if value else 0
+
+    @staticmethod
+    def lift(value):
+        return value != 0
+
+    @classmethod
+    def read(cls, buf):
+        return cls.lift(buf.read_u8())
+
+    @classmethod
+    def write(cls, value, buf):
+        buf.write_u8(value)
+
+class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterBoolean.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterBoolean.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterBoolean.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeActionError(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -1473,20 +1519,21 @@ class _UniffiFfiConverterOptionalTypeActionError(_UniffiConverterRustBuffer):
 
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], focused_first:typing.Optional[bool], error:typing.Optional[ActionError]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
         self.evidence = evidence
         self.escalation = escalation
         self.summary = summary
+        self.focused_first = focused_first
         self.error = error
 
 
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, error={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.error)
+        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, focused_first={}, error={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.focused_first, self.error)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
@@ -1499,6 +1546,8 @@ class ActionResult:
         if self.escalation != other.escalation:
             return False
         if self.summary != other.summary:
+            return False
+        if self.focused_first != other.focused_first:
             return False
         if self.error != other.error:
             return False
@@ -1514,6 +1563,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             evidence=_UniffiFfiConverterOptionalSequenceTypeActionEvidence.read(buf),
             escalation=_UniffiFfiConverterOptionalTypeActionEscalation.read(buf),
             summary=_UniffiFfiConverterOptionalString.read(buf),
+            focused_first=_UniffiFfiConverterOptionalBoolean.read(buf),
             error=_UniffiFfiConverterOptionalTypeActionError.read(buf),
         )
 
@@ -1525,6 +1575,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.check_lower(value.evidence)
         _UniffiFfiConverterOptionalTypeActionEscalation.check_lower(value.escalation)
         _UniffiFfiConverterOptionalString.check_lower(value.summary)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.focused_first)
         _UniffiFfiConverterOptionalTypeActionError.check_lower(value.error)
 
     @staticmethod
@@ -1535,28 +1586,8 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalSequenceTypeActionEvidence.write(value.evidence, buf)
         _UniffiFfiConverterOptionalTypeActionEscalation.write(value.escalation, buf)
         _UniffiFfiConverterOptionalString.write(value.summary, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.focused_first, buf)
         _UniffiFfiConverterOptionalTypeActionError.write(value.error, buf)
-
-class _UniffiFfiConverterBoolean:
-    @classmethod
-    def check_lower(cls, value):
-        return not not value
-
-    @classmethod
-    def lower(cls, value):
-        return 1 if value else 0
-
-    @staticmethod
-    def lift(value):
-        return value != 0
-
-    @classmethod
-    def read(cls, buf):
-        return cls.lift(buf.read_u8())
-
-    @classmethod
-    def write(cls, value, buf):
-        buf.write_u8(value)
 
 @dataclass
 class AppInfo:
@@ -2428,31 +2459,6 @@ class _UniffiFfiConverterTypeClipboardWriteOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceString.write(value.types, buf)
         _UniffiFfiConverterBoolean.write(value.privacy_sensitive, buf)
         _UniffiFfiConverterBoolean.write(value.content_redacted_from_telemetry, buf)
-
-class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterBoolean.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterBoolean.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterBoolean.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 @dataclass
 class CursorMotionEffects:

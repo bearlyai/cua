@@ -290,6 +290,12 @@
               "null"
             ]
           },
+          "focused_first": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -721,6 +727,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focused_first": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -2214,6 +2226,12 @@
               "null"
             ]
           },
+          "focused_first": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -2417,6 +2435,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focused_first": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -3043,6 +3067,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focused_first": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -3789,6 +3819,12 @@
               "null"
             ]
           },
+          "focused_first": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -4054,6 +4090,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focused_first": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -4688,6 +4730,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focused_first": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -5332,6 +5380,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "focused_first": {
+            "type": [
+              "boolean",
               "null"
             ]
           },

@@ -440,6 +440,7 @@ impl ActionExecutionRecord {
             // the record itself never carries prose that could echo request
             // data.
             summary: None,
+            focused_first: None,
             error: match projection.effect {
                 ActionEffect::Refused => {
                     self.refusal

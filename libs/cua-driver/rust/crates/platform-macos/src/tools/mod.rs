@@ -1,5 +1,6 @@
 //! MCP tool implementations for macOS.
 
+mod background_text;
 mod bring_to_front;
 mod capture_binding;
 mod click;

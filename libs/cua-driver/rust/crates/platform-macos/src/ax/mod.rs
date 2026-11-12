@@ -29,3 +29,5 @@ pub use tree::{
     walk_tree, walk_tree_bounded, AXNode, TreeWalkResult, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ELEMENTS,
 };
 pub use window_scope::WindowScope;
+
+pub mod text_range;

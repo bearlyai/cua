@@ -324,6 +324,7 @@ if [[ "${SUITE}" == shared || "${SUITE}" == all ]]; then
     --test permission_prompt_authorization_test -- --test-threads=1
   run_test protected-host-self-launch cargo test -p platform-macos \
     launch_app::tests -- --test-threads=1
+  run_test background-text-insert cargo test -p cua-driver-e2e --test background_text_insert -- --run-gui --installed-driver
   run_test sdk-runtime-contract cargo test -p cua-driver-sdk --lib -- --test-threads=1
   run_test sdk-runtime-configuration cargo test -p cua-driver-sdk \
     --test runtime_configuration -- --test-threads=1

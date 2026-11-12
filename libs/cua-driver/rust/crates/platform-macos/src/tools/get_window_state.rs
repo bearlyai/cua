@@ -39,7 +39,9 @@ fn def() -> &'static ToolDef {
             indexed row with `element_index`, `role`, `label`, `value` (the \
             element's text/AXValue when present — use it to verify what a field \
             holds), `actions` (names of AX actions exposed by the element, \
-            omitted when empty), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            omitted when empty), `frame: {x,y,w,h}`, `parent_index`, `depth`). Native non-secure \
+            text entries also expose optional `focused` (AXFocused) and `selected_text_range: \
+            {location,length}` (AXSelectedTextRange in UTF-16 units), omitted when unreadable. The markdown \
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
@@ -990,12 +992,13 @@ fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> se
     // "1"/"0") — controls whose state was previously invisible here.
     // Falls back to `value` so the field never regresses for
     // string-valued elements.
-    if let Some(value) = node
-        .value_state
-        .clone()
-        .or_else(|| node.value.clone())
-        .filter(|v| !v.is_empty())
-    {
+    let structured_value = node.text_value.clone().unwrap_or_else(|| {
+        node.value_state
+            .clone()
+            .or_else(|| node.value.clone())
+            .filter(|v| !v.is_empty())
+    });
+    if let Some(value) = structured_value {
         entry["value"] = serde_json::Value::String(value);
     }
     if let Some(desc) = node.value_description.clone() {
@@ -1025,6 +1028,12 @@ fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> se
             None
         }
     });
+    if let Some(focused) = node.focused {
+        entry["focused"] = serde_json::json!(focused);
+    }
+    if let Some(range) = node.selected_text_range {
+        entry["selected_text_range"] = serde_json::json!(range);
+    }
     if let Some(selected) = selected {
         entry["selected"] = serde_json::Value::Bool(selected);
     }
@@ -1288,6 +1297,9 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            focused: None,
+            selected_text_range: None,
+            text_value: None,
         }
     }
 
@@ -1483,6 +1495,35 @@ mod tests {
     }
 
     #[test]
+    fn text_selection_fields_preserve_zero_and_false_without_inventing_defaults() {
+        let mut nodes = vec![node(
+            Some(0),
+            "AXTextField",
+            Some("field"),
+            0,
+            None,
+            None,
+            vec![],
+        )];
+        nodes[0].focused = Some(false);
+        nodes[0].selected_text_range = Some(crate::ax::text_range::TextRange {
+            location: 0,
+            length: 0,
+        });
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
+        assert_eq!(entry["focused"], false);
+        assert_eq!(
+            entry["selected_text_range"],
+            serde_json::json!({"location":0,"length":0})
+        );
+        nodes[0].focused = None;
+        nodes[0].selected_text_range = None;
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
+        assert!(entry.get("focused").is_none());
+        assert!(entry.get("selected_text_range").is_none());
+    }
+
+    #[test]
     fn elements_control_state_fields_omitted_when_absent() {
         // Stock behaviour is unchanged for elements without control state.
         let nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None, vec![])];
@@ -1519,6 +1560,26 @@ mod tests {
         nodes[0].value = Some("Search".into());
         let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["value"], "Search");
+    }
+
+    #[test]
+    fn readable_empty_text_is_distinct_from_unreadable_or_protected_text() {
+        let mut nodes = vec![node(Some(0), "AXTextField", None, 0, None, None, vec![])];
+        nodes[0].value = Some("placeholder".into());
+        nodes[0].text_value = Some(Some("".into()));
+        assert_eq!(
+            build_elements_array_with_token(&nodes, None)[0]["value"],
+            ""
+        );
+        nodes[0].text_value = Some(None);
+        assert!(build_elements_array_with_token(&nodes, None)[0]
+            .get("value")
+            .is_none());
+        nodes[0].text_value = Some(Some("  text  ".into()));
+        assert_eq!(
+            build_elements_array_with_token(&nodes, None)[0]["value"],
+            "  text  "
+        );
     }
 
     #[test]

@@ -1,14 +1,13 @@
 //! type_text tool — matches the Swift reference TypeTextTool.swift.
 //!
-//! Inserts text via `AXSelectedText` attribute write — an atomic single-call
-//! insertion at the current cursor position. This is the preferred path for
+//! Inserts text through a verified accessibility range and `AXSelectedText`
+//! write on the background route. This is the preferred path for
 //! all standard Cocoa text views (NSTextField, NSTextView, WKWebView text
 //! inputs in Safari, etc.) and is significantly faster than per-keystroke
 //! CGEvent synthesis.
 //!
-//! For Chromium / Electron inputs that don't implement `kAXSelectedText`,
-//! the tool falls back to character-by-character CGEvent keystrokes so the
-//! caller doesn't need to detect the app type themselves.
+//! Background native AX targets never fall back to keystrokes after a write.
+//! Foreground and key-driven routes retain their explicit event delivery.
 //!
 //! When the target pid belongs to a terminal emulator (Ghostty,
 //! Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Hyper, Warp — see
@@ -69,6 +68,15 @@ fn def() -> &'static ToolDef {
              within the daemon transport budget. Longer synthesized routes are \
              refused before character events and return a safe chunk size; \
              one-call AX insertion remains uncapped.\n\n\
+             Background native fields may first receive AXFocused inside their window, \
+             without app activation. The result reports focused_first:true when this happens. \
+             If focus creates a selection, default typing refuses; explicit end appends, \
+             while selection may replace only a selection that existed before focus. \
+             Background accessibility writes then set and read back the exact selected range. \
+             `insert_at` defaults to caret (a collapsed known range); end appends and selection \
+             explicitly replaces a selected range. A field that ignores range writes refuses \
+             before any text write, with no keystroke fallback. Confirmation requires the exact \
+             old value with that edit, rather than a substring match.\n\n\
              Optional `element_token` (from the last \
              `get_window_state` snapshot) directs the write to a specific field. \
              Without `element_token`, the write goes to the pid's currently \
@@ -98,6 +106,7 @@ fn def() -> &'static ToolDef {
             "properties": {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
                 "pid":  { "type": "integer", "description": "Target process ID." },
+                "insert_at": {"type":"string", "enum":["caret","end","selection"], "default":"caret", "description":"macOS background AX insertion only. caret requires a collapsed readable caret on nonempty fields; end appends; selection explicitly permits replacing the selected range. Unsupported range setters refuse before writing text."},
                 "text": { "type": "string",  "description": "Text to insert at the target's cursor." },
                 "window_id": {
                     "type": "integer",
@@ -162,6 +171,20 @@ impl Tool for TypeTextTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let insert_at = match crate::ax::text_range::InsertAt::parse(args.get("insert_at")) {
+            Ok(mode) => mode,
+            Err(message) => return ToolResult::error(message),
+        };
+        if args.get("insert_at").is_some()
+            && (args.get("scope").and_then(Value::as_str) == Some("desktop")
+                || args.get("delivery_mode").and_then(Value::as_str) == Some("foreground")
+                || args.get("x").is_some()
+                || args.get("y").is_some())
+        {
+            return ToolResult::error(
+                "insert_at requires the macOS background accessibility text route",
+            );
+        }
         super::note_foreground_request("type_text", &args);
         use cua_driver_core::tool_args::ArgsExt;
         // Held until this call returns: a dropped call (its client went away)
@@ -454,6 +477,7 @@ impl Tool for TypeTextTool {
                             window_id,
                             keyboard_policy: blocking_policy,
                             cancel,
+                            insert_at,
                         },
                     )
                 })
@@ -1656,12 +1680,13 @@ struct KeyboardRoute {
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
     cancel: Cancellation,
+    insert_at: crate::ax::text_range::InsertAt,
 }
 
 /// Best-effort-background ladder for `type_text`.
 ///
-/// - `delivery_mode == Background` (default): AX insert → read-back; on a
-///   silent/unreadable accept, CGEvent keystrokes → read-back. Never fronts.
+/// - `delivery_mode == Background` (default): range-based AX insert → exact
+///   read-back. An AX target never falls through to keystrokes. Never fronts.
 /// - `delivery_mode == Foreground`: the agent's explicit last resort — briefly
 ///   front `window_id`, insert at the current cursor, restore, then read-back.
 ///
@@ -1681,6 +1706,7 @@ fn type_text_blocking(
         window_id,
         keyboard_policy,
         cancel,
+        insert_at,
     } = route;
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1690,6 +1716,14 @@ fn type_text_blocking(
     // exact-target decision restricted this request to semantic-only, there is
     // nothing safe to run, and an over-budget synthesis cannot start. Both
     // refusals need no read of the target, so they come before any AX call.
+    if is_terminal_target
+        && !delivery_mode.is_foreground()
+        && insert_at != crate::ax::text_range::InsertAt::Caret
+    {
+        return Ok(TypeTextDelivery::Reported(super::background_text::refusal(
+            "BACKGROUND_TEXT_TARGET_UNSUPPORTED",
+        )));
+    }
     if is_terminal_target && !delivery_mode.is_foreground() {
         if let BackgroundKeyboardPolicy::SemanticOnly(refusal) = &keyboard_policy {
             return Ok(TypeTextDelivery::Refused(refusal.clone()));
@@ -1860,62 +1894,22 @@ fn type_text_blocking(
             }
         },
     };
-    let mut ax_attempt = AxAttempt::NotAttempted;
+    let ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
-        let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-        let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
-        // Classify the atomic write before considering synthesis. Complete AX
-        // delivery returns immediately. Partial delivery is surfaced as such
-        // instead of appending the full payload again. When synthesis would
-        // exceed its transport-safe budget, rejected/unchanged AX writes fail
-        // safely and unreadable AX state is reported as indeterminate.
-        let after = unsafe { copy_string_attr(element, "AXValue") };
-        let ax_progress = if err == kAXErrorSuccess {
-            Some(typed_progress(before.as_deref(), after.as_deref(), text))
-        } else {
-            None
-        };
-        // AXValue is not renderer evidence in web content. An unchanged echo
-        // there cannot prove that zero characters landed, so blind retry is
-        // unsafe even though no synthesis has run yet.
-        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
-            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let trusted = !target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let result = unsafe { super::background_text::insert(element, insert_at, text, trusted) };
         if owns {
             unsafe {
                 CFRelease(element as _);
             }
         }
-        if ax_progress == Some(TypedProgress::Complete) {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                detail: format!(" into{idx_str} {role} \"{title}\""),
-                path: PATH_AX,
-                verified: true,
-                delivered_chars: Some(text.chars().count()),
-            }));
-        }
-        if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                detail: format!(" via partial AX write into{idx_str} {role} \"{title}\""),
-                path: PATH_AX,
-                verified: false,
-                delivered_chars: Some(delivered_chars),
-            }));
-        }
-        ax_attempt = match ax_progress {
-            Some(TypedProgress::Unchanged) if unchanged_web_readback => AxAttempt::Unverifiable,
-            Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
-            Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
-            None => AxAttempt::Rejected,
-            Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
-        };
-        tracing::debug!(
-            "AX write did not land for {role} \"{title}\" (err={err}); \
-             falling back to CGEvent keystrokes"
-        );
+        return Ok(TypeTextDelivery::Reported(result));
     } else {
+        if insert_at != crate::ax::text_range::InsertAt::Caret {
+            return Ok(TypeTextDelivery::Reported(super::background_text::refusal(
+                "BACKGROUND_TEXT_TARGET_UNSUPPORTED",
+            )));
+        }
         tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
     }
 
@@ -1984,6 +1978,7 @@ mod tests {
                 window_id: Some(7),
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 cancel: Cancellation::default(),
+                insert_at: Default::default(),
             },
         );
         match r {
@@ -2006,6 +2001,7 @@ mod tests {
                 window_id: None,
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 cancel: Cancellation::default(),
+                insert_at: Default::default(),
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");

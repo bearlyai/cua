@@ -95,6 +95,13 @@ pub struct AXNode {
     /// This trust marker is independent of actionable ancestry because
     /// AXWebArea is commonly non-actionable and therefore has no element index.
     pub in_web_content: bool,
+    /// None for non-text nodes; Some(None) for unreadable/protected text.
+    /// Kept separate from the markdown's placeholder/trimmed value.
+    pub text_value: Option<Option<String>>,
+    /// AXFocused as reported, not inferred from the frontmost application.
+    pub focused: Option<bool>,
+    /// AXSelectedTextRange in UTF-16 code units; absent when unreadable.
+    pub selected_text_range: Option<super::text_range::TextRange>,
 }
 
 #[derive(Default)]
@@ -518,6 +525,25 @@ unsafe fn walk_element(
         return;
     }
 
+    let text_entry = super::text_range::is_text_entry(&role, None, None)
+        && super::text_range::is_text_entry(
+            &role,
+            copy_string_attr(element, "AXSubrole").as_deref(),
+            copy_bool_attr(element, "AXProtectedContent"),
+        );
+    let text_value = (super::text_range::is_text_entry(&role, None, None)
+        || role == "AXSecureTextField")
+        .then(|| {
+            if text_entry {
+                copied_value.as_ref().and_then(|v| v.string_value.clone())
+            } else {
+                None
+            }
+        });
+    let focused = text_entry
+        .then(|| copy_bool_attr(element, "AXFocused"))
+        .flatten();
+    let selected_text_range = text_entry.then(|| copy_text_range(element)).flatten();
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
     // Structured `elements` only contains actionable nodes. Keep all new AX
@@ -575,6 +601,9 @@ unsafe fn walk_element(
             enabled: control_state.enabled,
             selected: control_state.selected,
             in_web_content,
+            focused,
+            selected_text_range,
+            text_value: text_value.clone(),
         }
     } else {
         AXNode {
@@ -609,6 +638,9 @@ unsafe fn walk_element(
             enabled: control_state.enabled,
             selected: control_state.selected,
             in_web_content,
+            focused,
+            selected_text_range,
+            text_value: text_value.clone(),
         }
     };
 
