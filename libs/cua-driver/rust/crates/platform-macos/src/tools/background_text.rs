@@ -1741,6 +1741,35 @@ mod tests {
         assert_eq!(c.range_sets.get(), 1, "the restore must be sent: {s}");
         assert_eq!(s["range_restored"], true, "{s}");
         assert_eq!(c.writes.get(), 0);
+        // Focus did not select anything: the reported caret is put back.
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 0,
+                length: 0
+            }),
+            "{s}"
+        );
+        // The request took effect behind the error and selected everything:
+        // the caret goes to the end, not over the selection.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        c.focus_uncertain.set(true);
+        c.focus_lands_after.set(Some(std::time::Duration::ZERO));
+        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["range_restored"], true, "{s}");
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 8,
+                length: 0
+            }),
+            "{s}"
+        );
         // A clear rejection moved nothing: the plain refusal, nothing sent.
         let c = control(true, false);
         c.focused.set(Some(false));
