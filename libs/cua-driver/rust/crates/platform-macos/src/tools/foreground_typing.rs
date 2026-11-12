@@ -398,8 +398,8 @@ fn in_field(verified: Option<usize>, requested: usize) -> String {
 
 /// Shape the tool result for guarded foreground keystrokes. `posted` keystrokes
 /// and `verified` characters (read back in the field; `None` when it can't be
-/// read) are reported separately, and a retry is suggested only for a suffix
-/// after characters that were actually verified.
+/// read) are reported separately. No stop names a suffix to retry: keystrokes
+/// already posted may still land, so retrying could type them twice.
 pub(crate) fn keystroke_result(
     path: &'static str,
     requested: usize,
@@ -449,10 +449,6 @@ pub(crate) fn keystroke_result(
     }
 
     let landed = in_field(verified, requested);
-    let retry_from = verified.filter(|n| *n > 0 && *n < requested);
-    // Only a stop on lost focus names a suffix to retry. When every
-    // keystroke went out, the unshown tail may still arrive.
-    let retryable = retry_from.is_some() && report.stop == KeystrokeStop::FocusLost;
     let (code, message, escalation) = match report.stop {
         KeystrokeStop::FieldUnchanged => (
             "foreground_field_not_accepting",
@@ -466,8 +462,11 @@ pub(crate) fn keystroke_result(
         ),
         KeystrokeStop::FocusLost => (
             "foreground_focus_lost",
-            format!("Foreground typing stopped: the field lost keyboard focus after {posted} keystroke(s); {landed}."),
-            Some(("bring_to_front", "Refocus the field before typing again.")),
+            format!("Foreground typing stopped: the field lost keyboard focus after {posted} keystroke(s); {landed}. Keystrokes already sent may still arrive if the field regains focus; read the field before typing more."),
+            Some((
+                "verify_state",
+                "Keystrokes already sent may still arrive if the field regains focus; read the field before typing more.",
+            )),
         ),
         KeystrokeStop::Cancelled => (
             "cancelled",
@@ -495,12 +494,6 @@ pub(crate) fn keystroke_result(
             )),
         ),
     };
-    let message = if retryable {
-        let n = retry_from.unwrap_or_default();
-        format!("{message} Retry only the remaining suffix, from character {n}.")
-    } else {
-        message
-    };
     // "refused" only when nothing was sent: posted keystrokes that do not
     // show up yet may still land.
     let effect = match verified {
@@ -515,11 +508,8 @@ pub(crate) fn keystroke_result(
         "requested_chars": requested,
         "posted_keystrokes": posted,
         "verified_chars": verified,
-        "retryable": retryable,
+        "retryable": false,
     });
-    if retryable {
-        structured["retry_from_character"] = serde_json::json!(retry_from);
-    }
     if let Some((recommended, reason)) = escalation {
         structured["escalation"] = serde_json::json!({
             "recommended": recommended,
@@ -1092,7 +1082,10 @@ mod tests {
     }
 
     #[test]
-    fn a_verified_prefix_names_the_exact_suffix_to_retry() {
+    fn a_stop_on_lost_focus_names_no_suffix_to_retry() {
+        // Keystrokes after the verified prefix were already posted and can
+        // land when the field regains focus: retrying a suffix could type it
+        // twice.
         let result = keystroke_result(
             "key_events_fg",
             40,
@@ -1104,13 +1097,17 @@ mod tests {
             "",
             false,
         );
+        let text = format!("{:?}", result.content);
         let s = result.structured_content.unwrap();
         assert_eq!(s["code"], "foreground_focus_lost");
         assert_eq!(s["effect"], "partial");
         assert_eq!(s["posted_keystrokes"], 14);
         assert_eq!(s["verified_chars"], 12);
-        assert_eq!(s["retryable"], true);
-        assert_eq!(s["retry_from_character"], 12);
+        assert_eq!(s["retryable"], false, "{s}");
+        assert!(s.get("retry_from_character").is_none(), "{s}");
+        assert_eq!(s["escalation"]["recommended"], "verify_state", "{s}");
+        assert!(!text.contains("Retry only the remaining suffix"), "{text}");
+        assert!(text.contains("may still arrive"), "{text}");
     }
 
     #[test]

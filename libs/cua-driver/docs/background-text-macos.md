@@ -367,7 +367,12 @@ Keystrokes that were posted but do not show up in the field
 `effect: "unverifiable"`, because they may still land. **Changed:**
 `type_text_incomplete` (`effect: "partial"`), where every keystroke was posted
 but only some show, is `retryable: false` with no `retry_from_character`: the
-rest may still arrive, so read the field before typing more. Only
-`foreground_focus_lost` with a verified prefix still names a suffix to retry.
+rest may still arrive, so read the field before typing more. **Changed:**
+`foreground_focus_lost` with a verified prefix (`effect: "partial"`) no
+longer names a suffix to retry either: it is `retryable: false` with no
+`retry_from_character` and `escalation.recommended: "verify_state"` (it was
+`bring_to_front`), because keystrokes already sent after the verified part may
+still arrive if the field regains focus. No result after foreground
+keystrokes were posted is `retryable: true`.
 Exact shapes remain
 owned by `foreground_typing.rs`, `type_text.rs`, and their existing tests.

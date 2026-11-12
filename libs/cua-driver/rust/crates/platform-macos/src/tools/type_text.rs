@@ -1355,9 +1355,8 @@ pub(super) fn await_typed_delivery(
     }
 }
 
-/// An observed incomplete delivery. A retry is suggested only for the suffix
-/// after characters that were verified in the field; when none were, the
-/// caller must look before typing again.
+/// An observed incomplete delivery. No suffix is suggested for a retry: the
+/// rest may still arrive, so the caller must look before typing again.
 fn incomplete_result(outcome: &TypeTextOutcome, requested: usize) -> ToolResult {
     let delivered = outcome.delivered_chars.unwrap_or_default();
     if delivered == 0 {
