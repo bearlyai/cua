@@ -237,6 +237,71 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     result
 }
 
+/// After the driver's own focus step: when focusing turned the range into one
+/// covering the whole non-empty value and it did not cover it before, put the
+/// pre-focus range back (or a caret at the end when it was unreadable) and read
+/// it back. `Ok(true)`: focus had selected everything and the range is
+/// restored; `Ok(false)`: focus selected nothing new; `Err(())`: the restore
+/// did not hold.
+fn undo_focus_select_all(
+    control: &impl TextControl,
+    before_focus: Option<TextRange>,
+) -> Result<bool, ()> {
+    let Some(value) = control.value().filter(|v| !v.is_empty()) else {
+        return Ok(false);
+    };
+    let end = value.encode_utf16().count();
+    let whole = TextRange {
+        location: 0,
+        length: end,
+    };
+    if control.range() != Some(whole) || before_focus == Some(whole) {
+        return Ok(false);
+    }
+    let target = before_focus.unwrap_or(TextRange {
+        location: end,
+        length: 0,
+    });
+    if control.set_range(target) && control.range() == Some(target) {
+        Ok(true)
+    } else {
+        Err(())
+    }
+}
+
+/// The selected range of an accessibility element, when readable.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+pub(super) unsafe fn range_of(element: AXUIElementRef) -> Option<TextRange> {
+    copy_text_range(element)
+}
+
+/// [`undo_focus_select_all`] for an accessibility element.
+///
+/// # Safety
+/// `element` must be a live `AXUIElementRef`.
+pub(super) unsafe fn undo_focus_select_all_of(
+    element: AXUIElementRef,
+    before_focus: Option<TextRange>,
+) -> Result<bool, ()> {
+    undo_focus_select_all(&AxTextControl(element), before_focus)
+}
+
+/// The foreground step refuses before any keystroke: focusing the field
+/// selected its whole value and the caret could not be put back.
+pub(super) fn foreground_focus_refusal(path: &str, requested: usize) -> ToolResult {
+    let code = "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE";
+    ToolResult::error(format!(
+        "Focusing the field selected its whole value and the caret could not be restored; nothing was typed: {code}."
+    ))
+    .with_structured(serde_json::json!({
+        "code": code, "effect": "refused", "path": path, "verified": false,
+        "focused_first": true, "range_restored": false,
+        "requested_chars": requested, "posted_keystrokes": 0,
+    }))
+}
+
 /// The selected range once two consecutive reads agree (unreadable counts as
 /// a reading), polled for at most 150 ms; `None` when it never settles.
 fn settled_range(control: &impl TextControl) -> Option<Option<TextRange>> {
@@ -713,5 +778,43 @@ mod tests {
             }
         }
         transact(&Editing(c, Cell::new(false)), mode, text, true)
+    }
+    #[test]
+    fn a_whole_value_selection_from_focus_is_undone() {
+        let all = TextRange {
+            location: 0,
+            length: 8,
+        };
+        let caret = TextRange {
+            location: 3,
+            length: 0,
+        };
+        let c = control(true, false);
+        c.range.set(Some(all));
+        assert_eq!(undo_focus_select_all(&c, Some(caret)), Ok(true));
+        assert_eq!(c.range.get(), Some(caret), "the pre-focus caret comes back");
+        let c = control(true, false);
+        c.range.set(Some(all));
+        assert_eq!(undo_focus_select_all(&c, None), Ok(true));
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 8,
+                length: 0
+            }),
+            "an unreadable pre-focus range becomes a caret at the end"
+        );
+        let c = control(false, false);
+        c.range.set(Some(all));
+        assert_eq!(undo_focus_select_all(&c, Some(caret)), Err(()));
+        // A selection the field already had, or a partial one, is left alone.
+        let c = control(true, false);
+        c.range.set(Some(all));
+        assert_eq!(undo_focus_select_all(&c, Some(all)), Ok(false));
+        c.range.set(Some(TextRange {
+            location: 0,
+            length: 3,
+        }));
+        assert_eq!(undo_focus_select_all(&c, Some(caret)), Ok(false));
     }
 }

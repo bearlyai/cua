@@ -1438,6 +1438,7 @@ unsafe fn atomic_insert(
     field: AXUIElementRef,
     text: &str,
     before: Option<&str>,
+    focus_selected_all: bool,
 ) -> (bool, Option<usize>) {
     let read = || unsafe { copy_string_attr(field, "AXValue") };
     let selected = copy_string_attr(field, "AXSelectedText");
@@ -1453,7 +1454,7 @@ unsafe fn atomic_insert(
         }
     }
     let replaces_whole_value =
-        before == Some("") || (before.is_some() && selected.as_deref() == before);
+        whole_value_write_allowed(before, selected.as_deref(), focus_selected_all);
     if replaces_whole_value
         && is_attribute_settable(field, "AXValue")
         && set_string_attr(field, "AXValue", text) == kAXErrorSuccess
@@ -1466,6 +1467,17 @@ unsafe fn atomic_insert(
         );
     }
     (false, before.map(|_| 0))
+}
+
+/// Whether the long-text fallback may set the whole `AXValue`: the field is
+/// empty, or its whole value is selected and that selection is not one the
+/// driver's own focus step created.
+fn whole_value_write_allowed(
+    before: Option<&str>,
+    selected: Option<&str>,
+    focus_selected_all: bool,
+) -> bool {
+    before == Some("") || (!focus_selected_all && before.is_some() && selected == before)
 }
 
 /// The guarded foreground rung for a pid (and window, when given).
@@ -1501,6 +1513,9 @@ fn type_text_foreground_guarded(
         // Focus the requested element after activation so it lands after the
         // window's remembered first responder, re-applying once if it didn't
         // stick (see cgevent_type_verified).
+        let before_focus = element_ptr_and_idx.and_then(|(ptr, _)| unsafe {
+            super::background_text::range_of(ptr as AXUIElementRef)
+        });
         if let Some((ptr, _)) = element_ptr_and_idx {
             let _ = crate::input::ax_actions::focus_element(ptr);
             if !crate::input::ax_actions::is_element_focused(pid, ptr) {
@@ -1510,6 +1525,26 @@ fn type_text_foreground_guarded(
         }
         // First-keystroke settle — see the "i love u" -> "love u" note.
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        // Focusing a Cocoa field commonly selects its whole value; keystrokes
+        // or the long-text write would then replace it. Put the caret back
+        // before anything is typed, or type nothing.
+        let mut focus_selected_all = false;
+        if let Some((ptr, _)) = element_ptr_and_idx {
+            match unsafe {
+                super::background_text::undo_focus_select_all_of(
+                    ptr as AXUIElementRef,
+                    before_focus,
+                )
+            } {
+                Ok(created) => focus_selected_all = created,
+                Err(()) => {
+                    delivery = Some(TypeTextDelivery::Reported(
+                        super::background_text::foreground_focus_refusal(path, requested),
+                    ));
+                    return Ok(());
+                }
+            }
+        }
 
         let (field, owned, is_requested) = match element_ptr_and_idx {
             Some((ptr, _)) => (
@@ -1545,7 +1580,9 @@ fn type_text_foreground_guarded(
                 if foreground_typing::foreground_route(requested, ax_confirmable)
                     == ForegroundRoute::AtomicAxFirst
                 {
-                    match unsafe { atomic_insert(field, text, before.as_deref()) } {
+                    match unsafe {
+                        atomic_insert(field, text, before.as_deref(), focus_selected_all)
+                    } {
                         (true, verified) => {
                             break 'typed TypeTextDelivery::Typed(TypeTextOutcome {
                                 detail: " via one accessibility write".into(),
@@ -1665,7 +1702,7 @@ fn type_text_desktop_guarded(
             if foreground_typing::foreground_route(requested, ax_confirmable)
                 == ForegroundRoute::AtomicAxFirst
             {
-                match unsafe { atomic_insert(field, text, before.as_deref()) } {
+                match unsafe { atomic_insert(field, text, before.as_deref(), false) } {
                     (true, _) => break 'typed ToolResult::text(format!(
                         "✅ Inserted {requested} char(s) into the frontmost app via one accessibility write."
                     ))
@@ -2334,6 +2371,26 @@ mod tests {
         let native = chain(&["AXTextField", "AXGroup", "AXWindow"]);
         assert_eq!(native, WebAreaClassification::NonWebContent);
         assert!(background_text_trusted(native));
+    }
+
+    #[test]
+    fn the_long_text_fallback_never_replaces_a_focus_created_selection() {
+        assert!(whole_value_write_allowed(Some(""), Some(""), false));
+        assert!(whole_value_write_allowed(
+            Some("Original"),
+            Some("Original"),
+            false
+        ));
+        assert!(
+            !whole_value_write_allowed(Some("Original"), Some("Original"), true),
+            "a whole-value selection from the driver's focus step must not be replaced"
+        );
+        assert!(!whole_value_write_allowed(
+            Some("Original"),
+            Some("Orig"),
+            false
+        ));
+        assert!(!whole_value_write_allowed(None, None, false));
     }
 
     #[test]
