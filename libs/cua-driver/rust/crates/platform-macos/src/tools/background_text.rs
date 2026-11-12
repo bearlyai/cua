@@ -55,14 +55,17 @@ pub(super) enum Plan {
 
 fn plan(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
     let (role, subrole, protected) = control.role_facts();
+    // An unfocused AppKit field reports AXSelectedText as settable only once
+    // it is focused, so a native unfocused field goes through the focus step
+    // and its settability is checked again there.
     if text_range::is_text_entry(&role, subrole.as_deref(), protected)
-        && control.selected_text_settable()
+        && (control.selected_text_settable() || (trusted && control.focused() == Some(false)))
     {
-        return Plan::Reported(transact(control, mode, text, trusted));
+        return transact(control, mode, text, trusted);
     }
     match keystroke_gate(control, mode) {
         Ok(()) => Plan::Keystrokes,
-        Err(result) => Plan::Reported(result),
+        Err(code) => Plan::Reported(refusal(code)),
     }
 }
 
@@ -70,12 +73,10 @@ fn plan(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -
 /// `AXSelectedText` write. Keystrokes replace a selection and type at the
 /// caret, so a readable selection is replaced only on request, and `end`
 /// types only once the caret provably sits at the end.
-fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), ToolResult> {
+fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), &'static str> {
     let range = control.range();
     if mode != InsertAt::Selection && range.is_some_and(|r| r.length > 0) {
-        return Err(refusal(
-            "BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT",
-        ));
+        return Err("BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT");
     }
     match mode {
         InsertAt::End => {
@@ -84,11 +85,11 @@ fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), Tool
                 length: 0,
             });
             if !end.is_some_and(|end| control.set_range(end) && control.range() == Some(end)) {
-                return Err(refusal("BACKGROUND_TEXT_CARET_UNAVAILABLE"));
+                return Err("BACKGROUND_TEXT_CARET_UNAVAILABLE");
             }
         }
         InsertAt::Selection if range.is_none() => {
-            return Err(refusal("BACKGROUND_TEXT_SELECTION_UNAVAILABLE"));
+            return Err("BACKGROUND_TEXT_SELECTION_UNAVAILABLE");
         }
         // An unreadable caret keeps the keystroke step it always had.
         _ => {}
@@ -110,9 +111,9 @@ fn focused_refusal(code: &str) -> ToolResult {
         .with_structured(serde_json::json!({"code":code,"effect":"refused","path":"ax","verified":false,"focused_first":true}))
 }
 
-fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> ToolResult {
+fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
     let Some(before) = control.value() else {
-        return refusal("BACKGROUND_TEXT_VALUE_UNREADABLE");
+        return Plan::Reported(refusal("BACKGROUND_TEXT_VALUE_UNREADABLE"));
     };
     let prior_range = control.range();
     let focused_first = control.focused() == Some(false);
@@ -141,24 +142,24 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     };
     if focused_first {
         if !trusted {
-            return refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
+            return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
         }
         if !control.focus() {
-            return refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+            return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
         }
         // The request was accepted, so focus may have moved even when it
         // does not read back in time.
         if !focus_retained(control) {
-            return refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+            return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
         }
         if control.value().as_deref() != Some(before.as_str()) {
-            return refuse("BACKGROUND_TEXT_VALUE_CHANGED");
+            return Plan::Reported(refuse("BACKGROUND_TEXT_VALUE_CHANGED"));
         }
     }
     // A toolkit may apply its select-on-focus a moment after AXFocused reads
     // true. One settled range read drives both the focus guard and the write.
     let Some(original_range) = settled_range(control) else {
-        return refuse("BACKGROUND_TEXT_RANGE_UNSTABLE");
+        return Plan::Reported(refuse("BACKGROUND_TEXT_RANGE_UNSTABLE"));
     };
     // Focusing a single-line Cocoa field commonly selects its entire
     // value. That new selection is not a remembered caret or a selection
@@ -169,11 +170,20 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         && original_range.is_some_and(|r| r.length > 0)
         && !(mode == InsertAt::Selection && original_range == prior_range)
     {
-        return refuse("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+        return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE"));
+    }
+    // A field that still takes no AXSelectedText write once focused gets the
+    // keystroke step, under the same caret rules.
+    if !control.selected_text_settable() {
+        range_moved.set(mode == InsertAt::End);
+        return match keystroke_gate(control, mode) {
+            Ok(()) => Plan::Keystrokes,
+            Err(code) => Plan::Reported(refuse(code)),
+        };
     }
     let range = match mode.range(&before, original_range) {
         Ok(r) => r,
-        Err(code) => return refuse(code),
+        Err(code) => return Plan::Reported(refuse(code)),
     };
     let expected = text_range::splice(&before, range, text).expect("range was validated");
     // A never-focused field may echo {0,0} even when it ignores all range sets.
@@ -196,16 +206,16 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         control.set_range(r) && control.range() == Some(r)
     };
     if probe.is_some_and(|r| !holds(r)) || !holds(range) {
-        return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
+        return Plan::Reported(refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED"));
     }
     // Setting a range must not edit the value; also catch concurrent edits.
     // Re-read value, then range, immediately before the write: the decision
     // holds only for exactly this value and range.
     if control.value().as_deref() != Some(before.as_str()) {
-        return refuse("BACKGROUND_TEXT_VALUE_CHANGED");
+        return Plan::Reported(refuse("BACKGROUND_TEXT_VALUE_CHANGED"));
     }
     if control.range() != Some(range) {
-        return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
+        return Plan::Reported(refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED"));
     }
     let write = control.insert(text);
     let accepted = write == Write::Accepted;
@@ -264,7 +274,7 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         "insertion_range":range, "ax_accepted":accepted,
         "readback_available":after.is_some(), "value_changed":changed, "focused_first":focused_first,
     }));
-    result
+    Plan::Reported(result)
 }
 
 /// After the driver's own focus step: when focusing turned the range into one
@@ -430,6 +440,7 @@ mod tests {
         late_armed: Cell<Option<usize>>,
         focus_sticks: Cell<bool>,
         write_result: Cell<Write>,
+        settable_once_focused: Cell<bool>,
     }
     impl Control {
         fn tick(&self) {
@@ -457,6 +468,7 @@ mod tests {
         }
         fn selected_text_settable(&self) -> bool {
             self.selected_text_settable.get()
+                || (self.settable_once_focused.get() && self.focused.get() == Some(true))
         }
         fn focused(&self) -> Option<bool> {
             self.focused.get()
@@ -530,6 +542,18 @@ mod tests {
             late_armed: Cell::new(None),
             focus_sticks: Cell::new(true),
             write_result: Cell::new(Write::Accepted),
+            settable_once_focused: Cell::new(false),
+        }
+    }
+    fn transact_result(
+        control: &impl TextControl,
+        mode: InsertAt,
+        text: &str,
+        trusted: bool,
+    ) -> ToolResult {
+        match transact(control, mode, text, trusted) {
+            Plan::Reported(result) => result,
+            Plan::Keystrokes => panic!("expected the accessibility route"),
         }
     }
     fn state(r: ToolResult) -> serde_json::Value {
@@ -544,7 +568,7 @@ mod tests {
                 location: 0,
                 length: 8,
             }));
-            let result = transact(&c, mode, "!", true);
+            let result = transact_result(&c, mode, "!", true);
             let s = state(result);
             if mode == InsertAt::End {
                 assert_eq!(s["effect"], "confirmed");
@@ -563,7 +587,7 @@ mod tests {
         c.focused.set(Some(false));
         c.focus_range.set(c.range.get());
         assert_eq!(
-            state(transact(&c, InsertAt::Selection, "!", true))["effect"],
+            state(transact_result(&c, InsertAt::Selection, "!", true))["effect"],
             "confirmed"
         );
         assert_eq!(c.value().as_deref(), Some("Ori!nal"));
@@ -575,7 +599,7 @@ mod tests {
             length: 0,
         }));
         assert_eq!(
-            state(transact(&c, InsertAt::Caret, "!", true))["effect"],
+            state(transact_result(&c, InsertAt::Caret, "!", true))["effect"],
             "confirmed"
         );
         assert_eq!(c.value().as_deref(), Some("!"));
@@ -583,7 +607,7 @@ mod tests {
         c.focused.set(Some(false));
         c.focus_supported.set(false);
         assert_eq!(
-            state(transact(&c, InsertAt::End, "!", true))["code"],
+            state(transact_result(&c, InsertAt::End, "!", true))["code"],
             "BACKGROUND_TEXT_FOCUS_NOT_RETAINED"
         );
         assert_eq!(c.writes.get(), 0);
@@ -593,7 +617,7 @@ mod tests {
     fn ignored_range_set_refuses_before_text_write_even_at_zero() {
         for mode in [InsertAt::Caret, InsertAt::End] {
             let c = control(false, false);
-            let s = state(transact(&c, mode, "!", true));
+            let s = state(transact_result(&c, mode, "!", true));
             assert_eq!(s["code"], "BACKGROUND_TEXT_RANGE_NOT_RETAINED");
             assert_eq!(s["effect"], "refused");
             assert_eq!(c.writes.get(), 0);
@@ -603,13 +627,13 @@ mod tests {
     #[test]
     fn exact_expected_value_is_required_and_write_is_never_retried() {
         let c = control(true, true);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["effect"], "unverifiable");
         assert_eq!(s["code"], "BACKGROUND_TEXT_UNEXPECTED_VALUE");
         assert_eq!(s["verified"], false);
         assert_eq!(c.writes.get(), 1);
         let c = control(true, false);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["effect"], "confirmed");
         assert_eq!(c.value().as_deref(), Some("Original!"));
     }
@@ -617,7 +641,7 @@ mod tests {
     fn unreadable_values_and_untrusted_echo_never_confirm() {
         let c = control(true, false);
         c.hide_after_write.set(true);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["effect"], "unverifiable");
         assert_eq!(s["code"], "BACKGROUND_TEXT_READBACK_UNAVAILABLE");
         assert_eq!(s["readback_available"], false);
@@ -625,11 +649,11 @@ mod tests {
 
         let c = control(true, false);
         *c.value.borrow_mut() = None;
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["code"], "BACKGROUND_TEXT_VALUE_UNREADABLE");
         assert_eq!(c.writes.get(), 0);
         let c = control(true, false);
-        let s = state(transact(&c, InsertAt::End, "!", false));
+        let s = state(transact_result(&c, InsertAt::End, "!", false));
         assert_eq!(s["effect"], "unverifiable");
         assert_eq!(s["verified"], false);
     }
@@ -730,7 +754,7 @@ mod tests {
                     length: 0,
                 }));
                 c.late_select_after.set(Some(late));
-                let s = state(transact(&c, mode, "!", true));
+                let s = state(transact_result(&c, mode, "!", true));
                 let value = c.value.borrow().clone().unwrap();
                 assert!(
                     value.contains("Original"),
@@ -747,9 +771,9 @@ mod tests {
             location: 0,
             length: 8,
         }));
-        let first = state(transact(&c, InsertAt::Caret, "!", true));
-        let _second = state(transact(&c, InsertAt::Caret, "!", true));
-        let third = state(transact(&c, InsertAt::Selection, "!", true));
+        let first = state(transact_result(&c, InsertAt::Caret, "!", true));
+        let _second = state(transact_result(&c, InsertAt::Caret, "!", true));
+        let third = state(transact_result(&c, InsertAt::Selection, "!", true));
         let value = c.value.borrow().clone().unwrap();
         assert!(
             value.contains("Original"),
@@ -814,7 +838,7 @@ mod tests {
                 true
             }
         }
-        transact(&Editing(c, Cell::new(false)), mode, text, true)
+        transact_result(&Editing(c, Cell::new(false)), mode, text, true)
     }
     #[test]
     fn a_whole_value_selection_from_focus_is_undone() {
@@ -858,7 +882,7 @@ mod tests {
     fn a_write_error_that_is_not_a_rejection_is_unverifiable() {
         let c = control(true, false);
         c.write_result.set(Write::Uncertain);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(
             s["effect"], "unverifiable",
             "a timed-out write may still land, so it must not invite a retry: {s}"
@@ -867,7 +891,7 @@ mod tests {
         assert_eq!(c.writes.get(), 1);
         let c = control(true, false);
         c.write_result.set(Write::Rejected);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["effect"], "suspected_noop");
         assert_eq!(s["code"], "BACKGROUND_TEXT_UNCHANGED");
     }
@@ -876,7 +900,7 @@ mod tests {
         let c = control(true, false);
         c.focused.set(Some(false));
         c.focus_sticks.set(false);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
         assert_eq!(
             s["focused_first"], true,
@@ -885,9 +909,40 @@ mod tests {
         let c = control(true, false);
         c.focused.set(Some(false));
         c.focus_supported.set(false);
-        let s = state(transact(&c, InsertAt::End, "!", true));
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
         assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
         assert!(s.get("focused_first").is_none(), "{s}");
         assert_eq!(c.writes.get(), 0);
+    }
+    #[test]
+    fn an_unfocused_native_field_is_judged_settable_after_its_focus_step() {
+        // AppKit reports AXSelectedText settable only once the field is focused.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        c.settable_once_focused.set(true);
+        let s = reported(plan(&c, InsertAt::End, "!", true));
+        assert_eq!(s["effect"], "confirmed", "{s}");
+        assert_eq!(c.value().as_deref(), Some("Original!"));
+        // Still not settable once focused: keystrokes, caret proven at the end.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        assert!(keystrokes(plan(&c, InsertAt::End, "!", true)));
+        assert_eq!(c.writes.get(), 0);
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 8,
+                length: 0
+            })
+        );
+        // Untrusted targets are never focused by this route.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        c.settable_once_focused.set(true);
+        assert!(keystrokes(plan(&c, InsertAt::Caret, "!", false)));
+        assert_eq!(c.focused.get(), Some(false));
     }
 }
