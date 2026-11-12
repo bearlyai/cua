@@ -96,8 +96,8 @@ blind retry except as the table says.
 | `unverifiable` | `BACKGROUND_TEXT_EXACT_READBACK` | no | Exact readback, but the target is web content or not provably native (changed: an incomplete ancestor walk is now in this row). |
 | `unverifiable` | `BACKGROUND_TEXT_READBACK_UNAVAILABLE` | no | The value cannot be read back, or is known truncated. |
 | `unverifiable` | `BACKGROUND_TEXT_UNEXPECTED_VALUE` | yes | The value changed, but not into the expected value. |
-| `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The write returned an error that is not a clear rejection (for example a busy app's messaging timeout) and the value has not changed yet. It may still land: inspect the field, never retry blindly. |
-| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was accepted or clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled) and the value reads back unchanged. |
+| `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The value has not changed yet, but the write may still land: it returned an error that is not a clear rejection (for example a busy app's messaging timeout), or it was accepted on a target that is web content or not provably native, whose echo can arrive after the readback poll. Inspect the field, never retry blindly. |
+| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled), or accepted on a provably native target, and the value reads back unchanged. |
 
 ### Refusals before a text write
 

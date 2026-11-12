@@ -234,9 +234,13 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     }
     let exact = after.as_deref() == Some(expected.as_str());
     let changed = after.as_deref().is_some_and(|s| s != before);
+    // Unchanged proves nothing landed only after a clear rejection, or an
+    // accepted write on a native target (AppKit applies it synchronously).
+    // Web content can accept the write and echo it after this poll ends.
+    let landing_unknown = write == Write::Uncertain || (accepted && !trusted);
     let effect = if exact && trusted {
         "confirmed"
-    } else if after.is_none() || exact || write == Write::Uncertain {
+    } else if after.is_none() || exact || landing_unknown {
         "unverifiable"
     } else if !changed {
         "suspected_noop"
@@ -249,7 +253,7 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         "BACKGROUND_TEXT_READBACK_UNAVAILABLE"
     } else if changed {
         "BACKGROUND_TEXT_UNEXPECTED_VALUE"
-    } else if write == Write::Uncertain {
+    } else if landing_unknown {
         "BACKGROUND_TEXT_WRITE_UNCONFIRMED"
     } else {
         "BACKGROUND_TEXT_UNCHANGED"
@@ -441,6 +445,8 @@ mod tests {
         focus_sticks: Cell<bool>,
         write_result: Cell<Write>,
         settable_once_focused: Cell<bool>,
+        /// The write is accepted but the value echo has not caught up.
+        echo_lags: Cell<bool>,
     }
     impl Control {
         fn tick(&self) {
@@ -504,7 +510,7 @@ mod tests {
         }
         fn insert(&self, t: &str) -> Write {
             self.writes.set(self.writes.get() + 1);
-            if self.write_result.get() != Write::Accepted {
+            if self.write_result.get() != Write::Accepted || self.echo_lags.get() {
                 return self.write_result.get();
             }
             // The write itself is not a read: a late selection that lands
@@ -543,6 +549,7 @@ mod tests {
             focus_sticks: Cell::new(true),
             write_result: Cell::new(Write::Accepted),
             settable_once_focused: Cell::new(false),
+            echo_lags: Cell::new(false),
         }
     }
     fn transact_result(
@@ -944,5 +951,31 @@ mod tests {
         c.settable_once_focused.set(true);
         assert!(keystrokes(plan(&c, InsertAt::Caret, "!", false)));
         assert_eq!(c.focused.get(), Some(false));
+    }
+    #[test]
+    fn an_accepted_write_with_no_echo_is_a_noop_only_on_a_native_target() {
+        // Web content can accept the write and echo it after the readback
+        // poll ends: the text may still land, so it must not invite a retry.
+        let c = control(true, false);
+        c.echo_lags.set(true);
+        let s = state(transact_result(&c, InsertAt::End, "!", false));
+        assert_eq!(
+            s["effect"], "unverifiable",
+            "an accepted write on web content may still land: {s}"
+        );
+        assert_eq!(s["code"], "BACKGROUND_TEXT_WRITE_UNCONFIRMED");
+        assert_eq!(c.writes.get(), 1);
+        // AppKit applies the write synchronously: unchanged means nothing landed.
+        let c = control(true, false);
+        c.echo_lags.set(true);
+        let s = state(transact_result(&c, InsertAt::End, "!", true));
+        assert_eq!(s["effect"], "suspected_noop", "{s}");
+        assert_eq!(s["code"], "BACKGROUND_TEXT_UNCHANGED");
+        // A clear rejection wrote nothing, on any target.
+        let c = control(true, false);
+        c.write_result.set(Write::Rejected);
+        let s = state(transact_result(&c, InsertAt::End, "!", false));
+        assert_eq!(s["effect"], "suspected_noop", "{s}");
+        assert_eq!(s["code"], "BACKGROUND_TEXT_UNCHANGED");
     }
 }
