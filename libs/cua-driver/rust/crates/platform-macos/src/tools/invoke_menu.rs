@@ -30,6 +30,7 @@ pub struct InvokeMenuTool;
 
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const MENU_DISPATCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 unsafe fn set_messaging_timeout(element: AXUIElementRef) {
     let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
@@ -212,7 +213,27 @@ fn choose_action(actions: &[String], final_segment: bool) -> Option<&'static str
     order.iter().copied().find(|action| supports(action))
 }
 
-unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
+fn settle_menu_dispatch(open_menus: impl FnMut() -> Option<usize>) -> Option<bool> {
+    // A one-segment path can itself open a menu asynchronously. Give that
+    // window the same appearance grace as a traversal hop before interpreting
+    // an empty window list as closed; include the grace in the total budget.
+    let appearance_grace = Duration::from_millis(80);
+    std::thread::sleep(appearance_grace);
+    crate::windows::poll_until_no_menu(
+        open_menus,
+        MENU_DISPATCH_TIMEOUT.saturating_sub(appearance_grace),
+    )
+}
+
+fn dispatch_summary(menus_closed: Option<bool>) -> &'static str {
+    match menus_closed {
+        Some(true) => "Dispatched the final accessibility action and observed the native menu close; verify the command's semantic effect from fresh state.",
+        Some(false) => "Dispatched the final accessibility action, but the native menu is still open after waiting. The command may still run; inspect fresh state before repeating it.",
+        None => "Dispatched the final accessibility action, but could not observe whether the native menu closed. The command may still run; inspect fresh state before repeating it.",
+    }
+}
+
+unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<Option<bool>, String> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return Err("invoke_menu: target application is unavailable".into());
@@ -264,7 +285,14 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(80));
             }
         }
-        Ok(())
+        // AppKit's AXPress acknowledges a queued selection before menu
+        // tracking ends and the selector runs. Returning or restoring focus
+        // now lets the next input overlap that selection. Keep the target
+        // frontmost until its menu windows close, with a bounded wait. This
+        // observes tracking only, never the command's semantic effect.
+        Ok(settle_menu_dispatch(|| {
+            crate::windows::menu_window_ids(pid).map(|menus| menus.len())
+        }))
     })();
 
     // A failure after a hop opened a menu: close it, so the app is not left
@@ -544,23 +572,22 @@ impl Tool for InvokeMenuTool {
         .await;
 
         match outcome {
-            Ok(Ok(())) => ToolResult::text(
-                "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.",
-            )
-            .with_action_record(
-                ActionExecutionRecord::builder(
-                    ActionEffect::Unverifiable,
-                    ActionTransport::MacosAxAction,
-                    RequestedDelivery::Foreground,
-                )
-                .actual_delivery(ActualDelivery::Foreground)
-                .evidence(ActionEvidence {
-                    kind: EvidenceKind::NativeApiResult,
-                    detail: "Every menu hop resolved uniquely and AX accepted the final action".into(),
-                })
-                .build()
-                .expect("invoke_menu record is valid"),
-            ),
+            Ok(Ok(menus_closed)) => ToolResult::text(dispatch_summary(menus_closed))
+                .with_action_record(
+                    ActionExecutionRecord::builder(
+                        ActionEffect::Unverifiable,
+                        ActionTransport::MacosAxAction,
+                        RequestedDelivery::Foreground,
+                    )
+                    .actual_delivery(ActualDelivery::Foreground)
+                    .evidence(ActionEvidence {
+                        kind: EvidenceKind::NativeApiResult,
+                        detail: "Every menu hop resolved uniquely and AX accepted the final action"
+                            .into(),
+                    })
+                    .build()
+                    .expect("invoke_menu record is valid"),
+                ),
             Ok(Err(error)) => refusal(error),
             Err(error) => refusal(format!("invoke_menu: blocking task failed: {error}")),
         }
@@ -586,6 +613,41 @@ mod tests {
         assert_eq!(choose_action(&actions, false), Some("AXPress"));
         assert_eq!(choose_action(&actions, true), Some("AXPress"));
         assert_eq!(choose_action(&["AXShowMenu".into()], true), None);
+    }
+
+    #[test]
+    fn final_dispatch_waits_for_tracking_longer_than_failure_cleanup() {
+        // Native AppKit selection animations can outlast the 400 ms used
+        // to clean up a failed path. Do not return while one is pending.
+        let mut reads = 0;
+        assert_eq!(
+            settle_menu_dispatch(|| {
+                reads += 1;
+                Some(usize::from(reads < 14))
+            }),
+            Some(true)
+        );
+        assert_eq!(reads, 14);
+    }
+
+    #[test]
+    fn dispatch_does_not_claim_menu_closure_when_unobserved() {
+        assert_eq!(settle_menu_dispatch(|| None), None);
+        for closed in [Some(false), None] {
+            assert!(dispatch_summary(closed).contains("may still run"));
+            assert!(!dispatch_summary(closed).contains("observed the native menu close"));
+        }
+        assert!(dispatch_summary(Some(true)).contains("semantic effect from fresh state"));
+    }
+
+    #[test]
+    fn tracking_that_never_ends_returns_pending_without_retrying() {
+        let closed = settle_menu_dispatch(|| Some(1));
+        assert_eq!(closed, Some(false));
+        assert_eq!(
+            dispatch_summary(closed),
+            "Dispatched the final accessibility action, but the native menu is still open after waiting. The command may still run; inspect fresh state before repeating it."
+        );
     }
 
     #[test]

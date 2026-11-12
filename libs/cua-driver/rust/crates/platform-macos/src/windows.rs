@@ -513,7 +513,7 @@ pub(crate) fn wait_for_new_menus_closed(pid: i32, before: &[u32]) -> Option<bool
     )
 }
 
-fn poll_until_no_menu(
+pub(crate) fn poll_until_no_menu(
     mut open_menus: impl FnMut() -> Option<usize>,
     timeout: std::time::Duration,
 ) -> Option<bool> {
