@@ -283,7 +283,8 @@ def measure(route, operation, effect, timeout=4, mode='background'):
         'target_became_foreground': target['hwnd'] in changes,
         'cursor_before': cursor_before, 'cursor_after': cursor(),
         'target_before': target_before, 'target_after': target_after,
-        'sentinel_unchanged': {k: v for k, v in sentinel_before.items()} == {k: v for k, v in sentinel_after.items()},
+        'sentinel_unchanged': sentinel_before == sentinel_after,
+        'sentinel_changes': {k: [sentinel_before.get(k), v] for k, v in sentinel_after.items() if sentinel_before.get(k) != v},
         'response': response,
     }
     rows.append(record)
@@ -388,13 +389,20 @@ try:
 
     # 2. Posted typing to the window (no element): goes to the window's focused field.
     posted_text = 'XY'
-    rec = measure('type text to window (WM_CHAR, no element)',
-                  lambda mode: call('type_text', {'pid': target['pid'], 'window_id': target['hwnd'], 'text': posted_text, 'delivery_mode': mode}),
-                  lambda b, a: a['filled'] != b['filled'] or a['empty'] != b['empty'])
-    rec['filled_classification'] = classify(rec['target_before']['filled'], rec['target_after']['filled'], posted_text, rec['target_before']['filled_caret'])
-    rec['empty_classification'] = classify(rec['target_before']['empty'], rec['target_after']['empty'], posted_text, 0)
-
     actions = []
+
+    def window_action(route, tool, extra, effect, after=None):
+        operation = lambda mode: call(tool, dict(extra, pid=target['pid'], window_id=target['hwnd'], delivery_mode=mode))
+        record = measure(route, operation, effect)
+        if after:
+            after(record)
+        actions.append((route, operation, effect, after))
+
+    def classify_posted(r):
+        r['filled_classification'] = classify(r['target_before']['filled'], r['target_after']['filled'], posted_text, r['target_before']['filled_caret'])
+        r['empty_classification'] = classify(r['target_before']['empty'], r['target_after']['empty'], posted_text, 0)
+    window_action('type text to window (WM_CHAR, no element)', 'type_text', {'text': posted_text},
+                  lambda b, a: a['filled'] != b['filled'] or a['empty'] != b['empty'], classify_posted)
 
     def element_action(route, tool, label, extra, effect, after=None):
         def operation(mode):
@@ -421,13 +429,15 @@ try:
     element_action('set value: checkbox', 'set_value', 'Fixture check', {'value': 'true' }, lambda b, a: a['checked'] != b['checked'])
     element_action('press key q (element)', 'press_key', 'Empty edit', {'key': 'q'},
                    lambda b, a: len(a['keys']) > len(b['keys']) or a['empty'] != b['empty'])
+    window_action('press key q (window, no element)', 'press_key', {'key': 'q'},
+                  lambda b, a: len(a['keys']) > len(b['keys']) or a['empty'] != b['empty'] or a['filled'] != b['filled'])
+    # Effective only if the control saw Ctrl held with A (select all), not two separate keys.
     element_action('hotkey ctrl+a (element)', 'hotkey', 'Filled edit', {'keys': ['ctrl', 'a']},
-                   lambda b, a: len(a['keys']) > len(b['keys']) or a['filled_selection'] != b['filled_selection'] or a['filled'] != b['filled'])
+                   lambda b, a: 'A, Control' in a['keys'][len(b['keys']):] or (a['filled_selection'] == len(a['filled']) > 0))
     element_action('scroll list down 5 (element)', 'scroll', 'Fixture list', {'direction': 'down', 'amount': 5},
                    lambda b, a: a['list_top'] != b['list_top'])
-    measure('scroll window down 5 (window, no element)',
-            lambda mode: call('scroll', {'pid': target['pid'], 'window_id': target['hwnd'], 'direction': 'down', 'amount': 5, 'delivery_mode': mode}),
-            lambda b, a: a['list_top'] != b['list_top'])
+    window_action('scroll window down 5 (window, no element)', 'scroll', {'direction': 'down', 'amount': 5},
+                  lambda b, a: a['list_top'] != b['list_top'])
 
     # Screenshot of the covered target window only.
     shot = out / 'covered-target.png'
