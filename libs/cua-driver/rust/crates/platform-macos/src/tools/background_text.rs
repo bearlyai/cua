@@ -594,9 +594,31 @@ mod tests {
         misplace_next_set: Cell<Option<TextRange>>,
         value_settable: Cell<bool>,
         native: Cell<bool>,
+        /// A select-all that lands this long after focus, by the clock.
+        select_all_after: Cell<Option<std::time::Duration>>,
+        select_all_at: Cell<Option<std::time::Instant>>,
     }
     impl Control {
+        fn select_all(&self) {
+            let len = self
+                .value
+                .borrow()
+                .as_deref()
+                .map_or(0, |v| v.encode_utf16().count());
+            self.range.set(Some(TextRange {
+                location: 0,
+                length: len,
+            }));
+        }
         fn tick(&self) {
+            if self
+                .select_all_at
+                .get()
+                .is_some_and(|at| std::time::Instant::now() >= at)
+            {
+                self.select_all_at.set(None);
+                self.select_all();
+            }
             match self.late_armed.get() {
                 Some(0) => {
                     let len = self
@@ -640,6 +662,11 @@ mod tests {
             self.focused.set(Some(true));
             self.range.set(self.focus_range.get());
             self.late_armed.set(self.late_select_after.get());
+            self.select_all_at.set(
+                self.select_all_after
+                    .get()
+                    .map(|after| std::time::Instant::now() + after),
+            );
             true
         }
         fn value(&self) -> Option<String> {
@@ -725,6 +752,8 @@ mod tests {
             misplace_next_set: Cell::new(None),
             value_settable: Cell::new(true),
             native: Cell::new(true),
+            select_all_after: Cell::new(None),
+            select_all_at: Cell::new(None),
         }
     }
     /// An element addressed by token.
@@ -1392,6 +1421,30 @@ mod tests {
         // A busy app's messaging timeout can still apply the write.
         for unclear in [-25204, -25200, -25212] {
             assert_eq!(write_outcome(unclear), Write::Uncertain, "{unclear}");
+        }
+    }
+    #[test]
+    fn a_select_all_that_lands_just_after_focus_is_waited_for() {
+        // AppKit can apply its select-on-focus a few milliseconds after
+        // AXFocused reads true. Read once and the driver writes at the
+        // transient caret before the selection lands, then leaves the field
+        // wholly selected for the person's next keystroke to replace.
+        for mode in [InsertAt::Caret, InsertAt::Selection] {
+            let c = control(true, false);
+            c.focused.set(Some(false));
+            c.focus_range.set(Some(TextRange {
+                location: 0,
+                length: 0,
+            }));
+            c.select_all_after
+                .set(Some(std::time::Duration::from_millis(5)));
+            let s = state(transact_result(&c, mode, "!", true));
+            assert_eq!(
+                s["code"], "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE",
+                "{mode:?} wrote before focus finished selecting: {s}"
+            );
+            assert_eq!(c.writes.get(), 0);
+            assert_eq!(s["range_restored"], true, "{s}");
         }
     }
 }
