@@ -1118,8 +1118,6 @@ fn classify_target_web_area(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
 ) -> WebAreaClassification {
-    use crate::ax::bindings::AXUIElementCopyAttributeValue;
-    use core_foundation::base::{CFTypeRef, TCFType};
     use core_foundation::string::CFString;
     unsafe {
         // Start element: the addressed one (borrowed — do NOT release) or the
@@ -1142,42 +1140,86 @@ fn classify_target_web_area(
                 },
             },
         };
-        let parent_attr = CFString::new("AXParent");
-        let mut cur = start;
-        let mut cur_owned = start_owned;
-        let mut classification = WebAreaClassification::Incomplete;
-        for _ in 0..40 {
-            match copy_string_attr(cur, "AXRole").as_deref() {
-                Some("AXWebArea") => {
-                    classification = WebAreaClassification::WebContent;
-                    break;
-                }
-                // No web area lives above the window/app root — stop.
-                Some("AXWindow") | Some("AXApplication") => {
-                    classification = WebAreaClassification::NonWebContent;
-                    break;
-                }
-                None => break,
-                _ => {}
+        classify_role_chain(AncestorRoles {
+            cur: start,
+            owned: start_owned,
+            started: false,
+            parent_attr: CFString::new("AXParent"),
+        })
+    }
+}
+
+/// Classify an element from its own role and its ancestors' roles, nearest
+/// first. A chain that ends (an unreadable role or parent) or runs past 40
+/// levels before reaching a window, the app, or a web area is incomplete.
+fn classify_role_chain(roles: impl IntoIterator<Item = Option<String>>) -> WebAreaClassification {
+    for role in roles.into_iter().take(40) {
+        match role.as_deref() {
+            Some("AXWebArea") => return WebAreaClassification::WebContent,
+            // No web area lives above the window/app root — stop.
+            Some("AXWindow") | Some("AXApplication") => {
+                return WebAreaClassification::NonWebContent
             }
-            let mut parent: CFTypeRef = std::ptr::null_mut();
-            let err =
-                AXUIElementCopyAttributeValue(cur, parent_attr.as_concrete_TypeRef(), &mut parent);
-            if cur_owned {
-                CFRelease(cur as CFTypeRef);
-            }
-            if err != kAXErrorSuccess || parent.is_null() {
-                cur = std::ptr::null_mut();
-                cur_owned = false;
-                break;
-            }
-            cur = parent as AXUIElementRef;
-            cur_owned = true;
+            None => return WebAreaClassification::Incomplete,
+            _ => {}
         }
-        if cur_owned && !cur.is_null() {
-            CFRelease(cur as CFTypeRef);
+    }
+    WebAreaClassification::Incomplete
+}
+
+/// Background text trusts an accessibility read-back, and may move focus
+/// inside the window, only when the target is provably not web content.
+fn background_text_trusted(classification: WebAreaClassification) -> bool {
+    classification == WebAreaClassification::NonWebContent
+}
+
+/// Roles of an element and its ancestors, read lazily; each `AXParent` copy is
+/// released once the walk moves past it or the walk is dropped.
+struct AncestorRoles {
+    cur: AXUIElementRef,
+    owned: bool,
+    started: bool,
+    parent_attr: core_foundation::string::CFString,
+}
+
+impl Iterator for AncestorRoles {
+    type Item = Option<String>;
+    fn next(&mut self) -> Option<Option<String>> {
+        use crate::ax::bindings::AXUIElementCopyAttributeValue;
+        use core_foundation::base::{CFTypeRef, TCFType};
+        if self.cur.is_null() {
+            return None;
         }
-        classification
+        unsafe {
+            if self.started {
+                let mut parent: CFTypeRef = std::ptr::null_mut();
+                let err = AXUIElementCopyAttributeValue(
+                    self.cur,
+                    self.parent_attr.as_concrete_TypeRef(),
+                    &mut parent,
+                );
+                if self.owned {
+                    CFRelease(self.cur as CFTypeRef);
+                }
+                self.owned = false;
+                if err != kAXErrorSuccess || parent.is_null() {
+                    self.cur = std::ptr::null_mut();
+                    return None;
+                }
+                self.cur = parent as AXUIElementRef;
+                self.owned = true;
+            }
+            self.started = true;
+            Some(copy_string_attr(self.cur, "AXRole"))
+        }
+    }
+}
+
+impl Drop for AncestorRoles {
+    fn drop(&mut self) {
+        if self.owned && !self.cur.is_null() {
+            unsafe { CFRelease(self.cur as core_foundation::base::CFTypeRef) };
+        }
     }
 }
 
@@ -1905,7 +1947,11 @@ fn type_text_blocking(
     };
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
-        let trusted = !target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let trusted = background_text_trusted(classify_target_web_area(
+            pid,
+            Some((element as usize, idx_opt)),
+            window_id,
+        ));
         let plan = unsafe { super::background_text::insert(element, insert_at, text, trusted) };
         if owns {
             unsafe {
@@ -2255,6 +2301,39 @@ mod tests {
         assert!(web_readback_is_untrusted(
             WebAreaClassification::WindowFocusUnavailable
         ));
+    }
+
+    #[test]
+    fn background_text_trusts_only_provably_native_targets() {
+        let chain = |roles: &[&str]| {
+            classify_role_chain(
+                roles
+                    .iter()
+                    .map(|r| Some(r.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // A parent chain that ends without AXWindow or AXWebArea.
+        let incomplete = chain(&["AXTextField", "AXGroup", "AXGroup"]);
+        assert_eq!(incomplete, WebAreaClassification::Incomplete);
+        assert!(
+            !background_text_trusted(incomplete),
+            "an incomplete parent walk must not count as native"
+        );
+        let unreadable = classify_role_chain([Some("AXTextField".to_string()), None]);
+        assert!(!background_text_trusted(unreadable));
+        let deep = classify_role_chain(std::iter::repeat_n(Some("AXGroup".to_string()), 60));
+        assert!(!background_text_trusted(deep));
+        assert!(!background_text_trusted(chain(&[
+            "AXTextField",
+            "AXWebArea"
+        ])));
+        assert!(!background_text_trusted(
+            WebAreaClassification::WindowFocusUnavailable
+        ));
+        let native = chain(&["AXTextField", "AXGroup", "AXWindow"]);
+        assert_eq!(native, WebAreaClassification::NonWebContent);
+        assert!(background_text_trusted(native));
     }
 
     #[test]
