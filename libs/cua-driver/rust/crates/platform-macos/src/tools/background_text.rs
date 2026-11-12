@@ -237,19 +237,26 @@ fn transact(
     };
     let prior_range = control.range();
     let focused_first = control.focused() == Some(false);
-    let prior_caret = caret_before_focus(control);
+    let end = before.encode_utf16().count();
+    // Whether focusing selected the whole value, once the range has settled.
+    // A refusal before that reads it at the restore, before the driver has
+    // set a range itself.
+    let focus_selected_all = std::cell::Cell::new(None);
     // A refusal after the driver moved the range (its focus step or a range
-    // set) puts back the range the field had before this call, or a caret at
-    // the end when that was unreadable, so no later call or keystroke can
-    // replace a selection the driver created.
-    let restore_to = prior_caret.unwrap_or(TextRange {
-        location: before.encode_utf16().count(),
-        length: 0,
-    });
+    // set) puts back the range the field had before this call (see
+    // [`restore_target`]), so no later call or keystroke can replace a
+    // selection the driver created.
     let range_moved = std::cell::Cell::new(false);
     let restore_if_moved = || {
-        (range_moved.get() || (focused_first && control.range() != prior_range))
-            .then(|| put_back(control, restore_to))
+        (range_moved.get() || (focused_first && control.range() != prior_range)).then(|| {
+            let selected_all = focus_selected_all
+                .get()
+                .unwrap_or_else(|| selects_whole_value(control.range(), end));
+            put_back(
+                control,
+                restore_target(prior_range, focused_first && selected_all, end),
+            )
+        })
     };
     let refuse_on = |path: &str, code: &str| {
         let mut result = if focused_first {
@@ -295,6 +302,7 @@ fn transact(
     let Some(original_range) = settled_range(control) else {
         return Plan::Reported(refuse("BACKGROUND_TEXT_RANGE_UNSTABLE"));
     };
+    focus_selected_all.set(Some(selects_whole_value(original_range, end)));
     // Focusing a single-line Cocoa field commonly selects its entire
     // value. That new selection is not a remembered caret or a selection
     // the caller observed. Only an explicit append may collapse it.
@@ -426,44 +434,55 @@ fn transact(
     Plan::Reported(result)
 }
 
-/// The range to put back after the driver focuses a field. An unfocused field
-/// has no caret: the collapsed range it reports (commonly `{0,0}`) is not
-/// where a person's typing would go, so it is `None` and the caret goes to
-/// the end of the text, where a click after it would put it. A focused
-/// field's caret, and any nonempty selection, are kept.
-fn caret_before_focus(control: &impl TextControl) -> Option<TextRange> {
-    let range = control.range();
-    if control.focused() == Some(false) && range.is_some_and(|r| r.length == 0) {
-        return None;
+/// Whether `range` covers the whole of a nonempty value `len` long.
+fn selects_whole_value(range: Option<TextRange>, len: usize) -> bool {
+    len > 0
+        && range
+            == Some(TextRange {
+                location: 0,
+                length: len,
+            })
+}
+
+/// The range a restore puts back: the range the field reported before the
+/// call. `no_caret`: the field read unfocused and the driver's focus then
+/// selected its whole value, as single-line fields do; such a field has no
+/// caret while unfocused, so its collapsed range (commonly `{0,0}`) is not
+/// where a person's typing would go and the caret goes to the end (`len`),
+/// where a click after the text would put it. A multi-line text view keeps a
+/// real caret while unfocused and focusing it selects nothing, so that caret is
+/// put back. A nonempty selection is always kept; an unreadable range becomes
+/// a caret at the end.
+fn restore_target(prior: Option<TextRange>, no_caret: bool, len: usize) -> TextRange {
+    match prior {
+        Some(range) if !(no_caret && range.length == 0) => range,
+        _ => TextRange {
+            location: len,
+            length: 0,
+        },
     }
-    range
 }
 
 /// After the driver's own focus step: when focusing turned the range into one
-/// covering the whole non-empty value and it did not cover it before, put the
-/// pre-focus range back (or a caret at the end when it was unreadable) and read
-/// it back. `Ok(true)`: focus had selected everything and the range is
-/// restored; `Ok(false)`: focus selected nothing new; `Err(())`: the restore
-/// did not hold.
+/// covering the whole non-empty value and it did not cover it before, put back
+/// the pre-focus range (see [`restore_target`]; `was_unfocused`: the field read
+/// unfocused before the focus step) and read it back. `Ok(true)`: focus had
+/// selected everything and the range is restored; `Ok(false)`: focus selected
+/// nothing new; `Err(())`: the restore did not hold.
 fn undo_focus_select_all(
     control: &impl TextControl,
     before_focus: Option<TextRange>,
+    was_unfocused: bool,
 ) -> Result<bool, ()> {
     let Some(value) = control.value().filter(|v| !v.is_empty()) else {
         return Ok(false);
     };
     let end = value.encode_utf16().count();
-    let whole = TextRange {
-        location: 0,
-        length: end,
-    };
-    if control.range() != Some(whole) || before_focus == Some(whole) {
+    let range = control.range();
+    if !selects_whole_value(range, end) || before_focus == range {
         return Ok(false);
     }
-    let target = before_focus.unwrap_or(TextRange {
-        location: end,
-        length: 0,
-    });
+    let target = restore_target(before_focus, was_unfocused, end);
     if control.set_range(target) && control.range() == Some(target) {
         Ok(true)
     } else {
@@ -501,14 +520,15 @@ pub(super) fn foreground_focus(
     reapply_after: std::time::Duration,
     settle: std::time::Duration,
 ) -> Result<ForegroundFocus, ()> {
-    let before_focus = caret_before_focus(control);
+    let before_focus = control.range();
+    let was_unfocused = control.focused() == Some(false);
     let _ = control.focus();
     if !is_focused() {
         std::thread::sleep(reapply_after);
         let _ = control.focus();
     }
     std::thread::sleep(settle);
-    undo_focus_select_all(control, before_focus)
+    undo_focus_select_all(control, before_focus, was_unfocused)
         .map(|focus_selected_all| ForegroundFocus { focus_selected_all })
 }
 
@@ -1151,11 +1171,11 @@ mod tests {
         };
         let c = control(true, false);
         c.range.set(Some(all));
-        assert_eq!(undo_focus_select_all(&c, Some(caret)), Ok(true));
+        assert_eq!(undo_focus_select_all(&c, Some(caret), false), Ok(true));
         assert_eq!(c.range.get(), Some(caret), "the pre-focus caret comes back");
         let c = control(true, false);
         c.range.set(Some(all));
-        assert_eq!(undo_focus_select_all(&c, None), Ok(true));
+        assert_eq!(undo_focus_select_all(&c, None, false), Ok(true));
         assert_eq!(
             c.range.get(),
             Some(TextRange {
@@ -1166,16 +1186,16 @@ mod tests {
         );
         let c = control(false, false);
         c.range.set(Some(all));
-        assert_eq!(undo_focus_select_all(&c, Some(caret)), Err(()));
+        assert_eq!(undo_focus_select_all(&c, Some(caret), false), Err(()));
         // A selection the field already had, or a partial one, is left alone.
         let c = control(true, false);
         c.range.set(Some(all));
-        assert_eq!(undo_focus_select_all(&c, Some(all)), Ok(false));
+        assert_eq!(undo_focus_select_all(&c, Some(all), false), Ok(false));
         c.range.set(Some(TextRange {
             location: 0,
             length: 3,
         }));
-        assert_eq!(undo_focus_select_all(&c, Some(caret)), Ok(false));
+        assert_eq!(undo_focus_select_all(&c, Some(caret), false), Ok(false));
     }
     #[test]
     fn a_write_error_that_is_not_a_rejection_is_unverifiable() {
@@ -1770,8 +1790,72 @@ mod tests {
         // A whole-value selection there before the call stays the person's.
         let c = unfocused();
         c.range.set(Some(all));
-        assert_eq!(undo_focus_select_all(&c, caret_before_focus(&c)), Ok(false));
+        assert_eq!(undo_focus_select_all(&c, c.range.get(), true), Ok(false));
         assert_eq!(c.range.get(), Some(all));
+    }
+    #[test]
+    fn an_unfocused_text_view_keeps_its_real_caret_through_every_restore() {
+        // A multi-line text view keeps a real caret while unfocused, and
+        // focusing it selects nothing: every restore puts that caret back.
+        for at in [3, 0] {
+            let caret = TextRange {
+                location: at,
+                length: 0,
+            };
+            let text_view = || {
+                let c = control(true, false);
+                c.role.replace("AXTextArea".into());
+                c.focused.set(Some(false));
+                c.range.set(Some(caret));
+                c.focus_range.set(Some(caret));
+                c
+            };
+            // The focus request errors unclearly.
+            let c = text_view();
+            c.focus_uncertain.set(true);
+            let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+            assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+            assert_eq!(s["range_restored"], true, "{s}");
+            assert_eq!(
+                c.range.get(),
+                Some(caret),
+                "caret {at}: unclear focus error"
+            );
+            // The driver's own range set did not hold.
+            let c = text_view();
+            c.misplace_next_set.set(Some(TextRange {
+                location: 5,
+                length: 0,
+            }));
+            let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+            assert_eq!(s["code"], "BACKGROUND_TEXT_RANGE_NOT_RETAINED");
+            assert_eq!(s["range_restored"], true, "{s}");
+            assert_eq!(c.range.get(), Some(caret), "caret {at}: range not retained");
+            // The value changed after the driver set the range.
+            let c = text_view();
+            let s = state(transact_with_edit(&c, InsertAt::Caret, "!"));
+            assert_eq!(s["code"], "BACKGROUND_TEXT_VALUE_CHANGED");
+            assert_eq!(s["range_restored"], true, "{s}");
+            assert_eq!(c.range.get(), Some(caret), "caret {at}: value changed");
+            // The keystroke step's move to the end did not hold.
+            let c = text_view();
+            c.selected_text_settable.set(false);
+            c.misplace_next_set.set(Some(TextRange {
+                location: 5,
+                length: 0,
+            }));
+            let s = reported(plan(&c, InsertAt::End, "!", true));
+            assert_eq!(s["code"], "BACKGROUND_TEXT_CARET_UNAVAILABLE");
+            assert_eq!(s["range_restored"], true, "{s}");
+            assert_eq!(c.range.get(), Some(caret), "caret {at}: caret unavailable");
+            // A successful call types at that caret.
+            let c = text_view();
+            let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+            assert_eq!(s["effect"], "confirmed", "{s}");
+            let mut expected = String::from("Original");
+            expected.insert(at, '!');
+            assert_eq!(c.value(), Some(expected));
+        }
     }
     #[test]
     fn a_focused_field_keeps_its_own_caret_and_range() {

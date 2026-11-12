@@ -15,14 +15,20 @@ this document.
 
 ## Background accessibility route
 
-**The range before the call.** A field that already read focused keeps its own
-caret or selection. A field that read unfocused has no caret: the collapsed
-range it reports (commonly `{0,0}`) is ignored, and wherever the driver puts
-the range back after focusing it, the caret goes to the end of the text, where
-a click after the text would put it (**changed:** it used to go back to
-`{0,0}`, so a later keyboard retry typed at the start). An unreadable range
-also becomes a caret at the end. A nonempty selection the field reported
-before the call is still the person's and is kept.
+**The range before the call.** Wherever the driver puts the range back, it
+puts back the range the field reported before the call, with one exception. A
+single-line field that read unfocused has no caret, and focusing it selects
+its whole value. When the field read unfocused and the driver's focus then
+selected the whole value, the collapsed range it reported (commonly `{0,0}`)
+is ignored and the caret goes to the end of the text, where a click after the
+text would put it (**changed:** it used to go back to `{0,0}`, so a later
+keyboard retry typed at the start). A multi-line text view (`NSTextView`)
+keeps a real collapsed caret while unfocused and focusing it selects nothing,
+so that caret is what a restore puts back (**changed:** the previous build
+moved it to the end). A field that already read focused keeps its own caret
+or selection. An unreadable range becomes a caret at the end. A nonempty
+selection the field reported before the call is still the person's and is
+kept.
 
 The driver reads the old value, settles and reads back an exact range, writes
 `AXSelectedText` once, and verifies the exact expected result. It never writes
@@ -213,7 +219,7 @@ The foreground step fronts the window and focuses the addressed field. When
 focusing turned the range into one covering the whole nonempty value and it
 did not cover it before, the driver restores the range before the call (see
 "The range before the call" above: a caret at the end for a field that was not
-focused) before any keystroke or accessibility write, and refuses with
+focused and had only a collapsed range) before any keystroke or accessibility write, and refuses with
 `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` when the restore does not hold. The
 long-text accessibility fallback no longer sets the whole `AXValue` for a
 selection the driver's focus step created. The whole-value write and
