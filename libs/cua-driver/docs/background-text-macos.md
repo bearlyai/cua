@@ -1,24 +1,55 @@
 # macOS background text insertion
 
-`type_text` on a native accessibility element preserves its existing value and
-formatting. The driver reads the old value, establishes and reads back an exact
-range, writes `AXSelectedText` once, and verifies the exact expected result. It
-never writes the whole `AXValue`, activates the application, moves the physical
-pointer, or retries an unverified write through keystrokes on this route.
+`type_text` on macOS has three routes. Which one runs decides what the result
+can mean.
+
+| Route | When | `path` |
+| --- | --- | --- |
+| Background accessibility | Background delivery, the target is an unprotected `AXTextField`, `AXTextArea`, `AXComboBox` or `AXSearchField`, and it reports `AXSelectedText` as settable. An unfocused AppKit field reports that only once focused, so a provably native unfocused field goes through the focus step and is checked again there; if it still is not settable, it takes the keystroke route after that focus step | `ax` |
+| Background keystrokes | Background delivery and the target takes no `AXSelectedText` write (Chromium / Electron inputs, other roles, secure fields), or no accessibility element was found | `key_events` |
+| Foreground | `delivery_mode: "foreground"` | `key_events_fg`, `ax_fg` |
+
+Terminals, remote desktops and desktop scope keep their own routes, outside
+this document.
+
+## Background accessibility route
+
+The driver reads the old value, settles and reads back an exact range, writes
+`AXSelectedText` once, and verifies the exact expected result. It never writes
+the whole `AXValue`, activates the application, moves the physical pointer, or
+retries the write through keystrokes.
 
 The macOS tool accepts `insert_at: "caret" | "end" | "selection"` (default
-`"caret"`). This argument applies only to the background AX route; passing it
-with desktop scope, pixel targeting, or foreground delivery is an argument
-error. Other platforms retain their existing behavior and tool schemas.
+`"caret"`). It applies only to the background routes; passing it with desktop
+scope, pixel targeting, or foreground delivery is an argument error. Other
+platforms retain their existing behavior and tool schemas.
 
 A fresh native field receives `AXFocused=true` inside its own background window
-when its readable `AXFocused` was false. The driver verifies focus, then reads
-the range again. Single-line Cocoa fields commonly select their entire value:
-that selection is not a caret or permission to replace the value. Default
-`caret` refuses. Explicit `end` collapses the range at the UTF-16 value end.
-`selection` may replace a range that existed before focus, but refuses a new
-selection created by focusing. Empty fields may proceed. A missing caret on a
-nonempty value refuses; it never means append implicitly.
+when its readable `AXFocused` was false. The driver waits up to 100 ms for focus
+to read back, then waits until two consecutive range reads agree (at most
+150 ms). That one settled range drives both the focus guard and the write, so a
+toolkit that selects on focus a moment late is still caught. Single-line Cocoa
+fields commonly select their entire value: that selection is not a caret or
+permission to replace the value. Default `caret` refuses. Explicit `end`
+collapses the range at the UTF-16 value end. `selection` may replace a range
+that existed before focus, but refuses a new selection created by focusing.
+Empty fields may proceed. A missing caret on a nonempty value refuses; it never
+means append implicitly. Immediately before the write the driver reads the
+value, then the range, again; if either differs from what the decision used, it
+refuses and writes nothing.
+
+When a call refuses after the driver itself moved the range (its focus step or
+its own range set), it puts back the range the field had before the call, or a
+caret at the end when that was unreadable, reads it back, and reports
+`range_restored: true|false`. A refusal therefore never leaves behind a
+selection the driver created for a later call, or the person's next keystroke,
+to replace. Restoring the range does not undo the focus move itself.
+
+Focus moves only on targets that are provably native: the element's ancestor
+walk must reach its window or the app without passing an `AXWebArea`. A walk
+that ends early (an unreadable role or parent, or more than 40 levels) counts
+as web content: the field is not focused in the background and an
+accessibility echo is never reported `confirmed`.
 
 `get_window_state.elements[]` adds these fields for unprotected text entries:
 
@@ -50,16 +81,27 @@ A successful public response looks like this (the summary is human-readable):
 ```
 
 `focused_first` is omitted in successful output when the driver did not move
-focus. No previous focus is restored by activating another element or app.
-Web-content AX echoes never establish confirmed delivery. Unreadable or known
-truncated readback yields `unverifiable`; a readable unchanged value yields
-`suspected_noop`; an unexpected changed value yields `unverifiable` and an
-error. These outcomes are not refusals and must not trigger a blind retry.
+focus, and defaults to `false` in the generated Python and TypeScript
+`ActionResult`. No previous focus is restored by activating another element or
+app.
 
-## Refusals before a text write
+### Results after the write
 
-Every code below returns this complete envelope, with `CODE` substituted in
-both places:
+The write ran exactly once. None of these is a refusal, and none may trigger a
+blind retry except as the table says.
+
+| `effect` | `code` | Error | Meaning |
+| --- | --- | --- | --- |
+| `confirmed` | `BACKGROUND_TEXT_EXACT_READBACK` | no | The value reads back as exactly the old value with this edit, on a provably native target. |
+| `unverifiable` | `BACKGROUND_TEXT_EXACT_READBACK` | no | Exact readback, but the target is web content or not provably native (changed: an incomplete ancestor walk is now in this row). |
+| `unverifiable` | `BACKGROUND_TEXT_READBACK_UNAVAILABLE` | no | The value cannot be read back, or is known truncated. |
+| `unverifiable` | `BACKGROUND_TEXT_UNEXPECTED_VALUE` | yes | The value changed, but not into the expected value. |
+| `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The write returned an error that is not a clear rejection (for example a busy app's messaging timeout) and the value has not changed yet. It may still land: inspect the field, never retry blindly. |
+| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was accepted or clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled) and the value reads back unchanged. |
+
+### Refusals before a text write
+
+Every code below returns this envelope, with `CODE` substituted in both places:
 
 ```json
 {
@@ -69,7 +111,8 @@ both places:
 }
 ```
 
-If focus was successfully moved first, the full envelope instead is:
+If the driver asked for focus first, and the request was accepted, the envelope
+instead is:
 
 ```json
 {
@@ -79,24 +122,70 @@ If focus was successfully moved first, the full envelope instead is:
 }
 ```
 
-| Code | Meaning |
-| --- | --- |
-| `BACKGROUND_TEXT_TARGET_UNSUPPORTED` | Not an unprotected supported text-entry element, or an insertion mode requires AX on a key-driven/missing-field route. |
-| `BACKGROUND_TEXT_VALUE_UNREADABLE` | Cannot read the whole old value, including a detected character-count mismatch. |
-| `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` | An unfocused web-content target cannot safely use native-only AX focus. |
-| `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | The focus setter failed or readable focus did not confirm it. |
-| `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | Focus created a nonempty selection, and the caller did not request end insertion. |
-| `BACKGROUND_TEXT_CARET_UNAVAILABLE` | Default insertion has no reported caret on a nonempty value. |
-| `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT` | Default caret insertion encountered an existing nonempty selection. |
-| `BACKGROUND_TEXT_SELECTION_UNAVAILABLE` | Explicit selection replacement has no readable selected range. |
-| `BACKGROUND_TEXT_RANGE_INVALID` | Range exceeds the value, overflows, or splits a UTF-16 surrogate pair. |
-| `BACKGROUND_TEXT_RANGE_NOT_RETAINED` | The control rejected or ignored an exact range write. |
-| `BACKGROUND_TEXT_VALUE_CHANGED` | Value changed while establishing focus/range, before the text write. |
+Either envelope adds `"range_restored": true|false` when the driver had moved
+the range before refusing (**new field**).
 
-These codes mean no **text write** ran. A refusal with `focused_first:true`
-means in-window focus did change. Generic tool errors, partial delivery,
-unverifiable results, and pre-existing foreground errors do not establish that
-no input was sent.
+Routes: **AX** is the background accessibility route, **Keys** the background
+keystroke route's caret checks, **Fg** the foreground route.
+
+| Code | Routes | Meaning |
+| --- | --- | --- |
+| `BACKGROUND_TEXT_TARGET_UNSUPPORTED` | Keys | **Changed:** `insert_at` `end` or `selection` was passed for a terminal or for a target with no accessibility element. Unsupported roles no longer refuse; they take the keystroke route. |
+| `BACKGROUND_TEXT_VALUE_UNREADABLE` | AX | Cannot read the whole old value, including a detected character-count mismatch. |
+| `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` | AX | An unfocused target that is web content, or not provably native, cannot use native-only AX focus (changed: now includes an incomplete ancestor walk). |
+| `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | AX | The focus request failed, or was accepted but did not read back within 100 ms. **Changed:** the second case carries `focused_first: true`, because focus may have moved. |
+| `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | AX, Fg | AX: focus created a nonempty selection and the caller did not request end insertion; the range is restored (`range_restored`). **Changed / new route:** Fg: focusing the addressed field selected its whole value and the caret could not be put back; nothing was typed (`path` `key_events_fg` or `key_events`, `focused_first: true`, `range_restored: false`, `posted_keystrokes: 0`). |
+| `BACKGROUND_TEXT_CARET_UNAVAILABLE` | AX, Keys | AX: default insertion has no reported caret on a nonempty value. **New route:** Keys: `end` was requested and the caret could not be moved to the end and read back. |
+| `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT` | AX, Keys | Default or `end` insertion encountered an existing nonempty readable selection (**new route:** Keys, where keystrokes would replace it). |
+| `BACKGROUND_TEXT_SELECTION_UNAVAILABLE` | AX, Keys | Explicit selection replacement has no readable selected range (**new route:** Keys). |
+| `BACKGROUND_TEXT_RANGE_INVALID` | AX | Range exceeds the value, overflows, or splits a UTF-16 surrogate pair. |
+| `BACKGROUND_TEXT_RANGE_NOT_RETAINED` | AX | The control rejected or ignored an exact range write, or (**changed**) the range differed when re-read immediately before the write. |
+| `BACKGROUND_TEXT_RANGE_UNSTABLE` | AX | **New.** Two consecutive range reads never agreed within 150 ms. |
+| `BACKGROUND_TEXT_VALUE_CHANGED` | AX | Value changed while establishing focus/range, or when re-read immediately before the text write. The range is restored when the driver had moved it. |
+
+These codes mean no **text write** ran and no keystroke was sent. A refusal
+with `focused_first:true` means in-window focus may have changed. Generic tool
+errors, partial delivery, unverifiable results, and pre-existing foreground
+errors do not establish that no input was sent.
+
+## Background keystroke route
+
+Fields that take no `AXSelectedText` write get CGEvent keystrokes posted to the
+target process, as before this change, after these checks on the field's
+readable range:
+
+- a readable nonempty selection is replaced only with `insert_at: "selection"`;
+  otherwise `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT`;
+- `end` sets the range to the end and reads it back, or refuses with
+  `BACKGROUND_TEXT_CARET_UNAVAILABLE`; it never types at an unknown position;
+- an unreadable range with the default `caret` types as before.
+
+The result is the keystroke route's existing result (`path: "key_events"`,
+`type_text_not_delivered`, `type_text_incomplete`, the synthesis budget
+refusal, and so on), with `ax_attempt: "rejected"` where it reports one. Web
+content never reports `confirmed`. This is the route the pixel form
+(`x`,`y`) normally reaches in Electron and other web views.
+
+Limit: with an `element_token`, the keystroke step still focuses the element
+(`AXFocused`) right before typing, as it did before this change, and that
+focus is not checked for a new select-all. A native, non-settable field that
+selects all on focus could have its value replaced on this route.
+
+## Foreground route
+
+The foreground step fronts the window and focuses the addressed field. When
+focusing turned the range into one covering the whole nonempty value and it
+did not cover it before, the driver restores the pre-focus range (or a caret at
+the end) before any keystroke or accessibility write, and refuses with
+`BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` when the restore does not hold. The
+long-text accessibility fallback no longer sets the whole `AXValue` for a
+selection the driver's focus step created.
+
+Guarantee on this route: the driver's own focus step never causes the field's
+existing text to be replaced. A selection the field already had before the
+call, including a whole-value one, is replaced as before, because foreground
+typing inserts at the current cursor. Without an `element_token` the driver
+does not focus anything and this check does not apply.
 
 ## Native control test
 
@@ -118,8 +207,9 @@ position through a separate file channel. Plain cargo test skips all app work.
 The 40 cases cover five controls, fresh/default and fresh/append behavior,
 empty values both fresh and previously focused, remembered carets, explicit
 existing selection replacement, and refusal to replace implicit or newly
-focus-created selections. NSTextField, NSSearchField, NSComboBox and SwiftUI
-TextField select all on first focus; NSTextView keeps a collapsed caret.
+focus-created selections; each such refusal must report `range_restored: true`.
+NSTextField, NSSearchField, NSComboBox and SwiftUI TextField select all on
+first focus; NSTextView keeps a collapsed caret.
 
 ## Other platforms inspected
 
@@ -180,7 +270,7 @@ structured content is exactly:
 }
 ```
 
-The foreground/terminal/desktop routes retain their existing codes and are
+The foreground/terminal/desktop routes otherwise retain their existing codes and are
 outside the background AX insertion contract. In particular, do **not** map
 all of these to "nothing sent": `foreground_field_not_accepting`,
 `foreground_focus_lost`, `foreground_input_rate_limited`, `cancelled`,
