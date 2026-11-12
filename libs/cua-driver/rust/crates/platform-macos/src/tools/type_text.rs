@@ -2059,7 +2059,7 @@ fn type_text_blocking(
                 focused_first,
                 range_restored,
             } => {
-                let mut result = match (&keyboard_policy, &synthesis_refusal) {
+                let result = match (&keyboard_policy, &synthesis_refusal) {
                     (BackgroundKeyboardPolicy::SemanticOnly(refusal), _) => {
                         let wid = window_id.expect("semantic-only requires a window target");
                         super::background_refusal_result(pid, wid, refusal)
