@@ -1183,6 +1183,20 @@ fn keystroke_block_after_moves(
             super::background_text::note_range_restored(structured, restored);
         }
     }
+    // The refusal's own advice (retry in chunks, or by the keyboard) would
+    // replace the selection the driver left behind.
+    if range_restored == Some(false) {
+        let code = result
+            .structured_content
+            .as_ref()
+            .and_then(|s| s["code"].as_str())
+            .unwrap_or("type_text_refused")
+            .to_owned();
+        result.content = ToolResult::error(format!(
+            "type_text refused before sending keystrokes ({code}). The field may still hold a selection the driver made: click the field before typing with the keyboard, or the typing would replace it."
+        ))
+        .content;
+    }
     result
 }
 
@@ -2353,7 +2367,34 @@ mod tests {
             s["retryable"], false,
             "a selection the driver made is still there: {s}"
         );
-        assert_ne!(s["escalation"]["recommended"], "chunk", "{s}");
+        assert_eq!(s["escalation"]["recommended"], "verify_state", "{s}");
+        // Nothing may still invite a retry from the start or in chunks.
+        assert!(s.get("retry_from_character").is_none(), "{s}");
+        assert!(s.get("delivered_chars").is_none(), "{s}");
+        let base = synthesis_refusal_result(PATH_KEY_EVENTS, &refusal, AxAttempt::Rejected);
+        let text = format!(
+            "{:?}",
+            keystroke_block_after_moves(base, true, Some(false)).content
+        );
+        assert!(!text.contains("chunks"), "{text}");
+        assert!(text.contains("click the field"), "{text}");
+        // The same for the same-app keyboard gate, whose reason suggests
+        // foreground delivery.
+        let gate = super::super::background_refusal_result(
+            1,
+            2,
+            &BackgroundRefusal {
+                code: "same_pid_keyboard_ambiguity",
+                reason: "Foreground delivery is a last resort".into(),
+                advice: Some("foreground"),
+            },
+        );
+        let result = keystroke_block_after_moves(gate, true, Some(false));
+        let text = format!("{:?}", result.content);
+        let s = result.structured_content.unwrap();
+        assert_eq!(s["escalation"]["recommended"], "verify_state", "{s}");
+        assert!(!text.contains("Foreground delivery"), "{text}");
+        assert!(text.contains("click the field"), "{text}");
         // Put back: the refusal keeps its own retry advice.
         let base = synthesis_refusal_result(PATH_KEY_EVENTS, &refusal, AxAttempt::Rejected);
         let s = keystroke_block_after_moves(base, true, Some(true))

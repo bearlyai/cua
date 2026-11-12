@@ -152,10 +152,24 @@ instead is:
 }
 ```
 
-Either envelope adds `"range_restored": true|false` when the driver had moved
+When the focus request returned an error that is not a clear rejection, the
+same envelope says only that the request may have reached the field
+(**changed:** it used to say "Field focused first"):
+
+```json
+{
+  "content": [{"type": "text", "text": "The focus request may have reached the field inside its background window; text insertion refused before writing: BACKGROUND_TEXT_FOCUS_NOT_RETAINED."}],
+  "isError": true,
+  "structuredContent": {"code": "BACKGROUND_TEXT_FOCUS_NOT_RETAINED", "effect": "refused", "path": "ax", "verified": false, "focused_first": true, "range_restored": true}
+}
+```
+
+Every envelope adds `"range_restored": true|false` when the driver had moved
 the range before refusing (**new field**), and with `false` also
 `"retryable": false` and `"escalation": {"recommended": "verify_state", …}`
-(see above).
+(see above). A refusal with `range_restored: false` never names a place to
+resume: it carries no `retry_from_character` and no `delivered_chars`
+(**changed**).
 
 Routes: **AX** is the background accessibility route, **Keys** the background
 keystroke route's caret and focus checks, **Fg** the foreground route.
@@ -205,7 +219,12 @@ and the exact-target gate's `same_pid_keyboard_ambiguity` (the app has another
 window that could receive the keys) and `minimized_or_hidden_window` (the
 window is minimized or the app hidden, or that could not be proven). When a provably native field reaches this route only after the guarded
 focus step, those refusals keep their envelopes and add `focused_first: true`
-and, when the range had moved, `range_restored: true|false`.
+and, when the range had moved, `range_restored: true|false`. With
+`range_restored: false` (**changed**) they also drop `retry_from_character`
+and `delivered_chars`, and their message no longer suggests retrying in chunks
+or by the keyboard: it reads "type_text refused before sending keystrokes
+(CODE). The field may still hold a selection the driver made: click the field
+before typing with the keyboard, or the typing would replace it."
 
 The result is the keystroke route's existing result (`path: "key_events"`,
 `type_text_not_delivered`, `type_text_incomplete`, the synthesis budget

@@ -99,6 +99,11 @@ pub(super) enum Plan {
 pub(super) fn note_range_restored(structured: &mut serde_json::Value, restored: bool) {
     structured["range_restored"] = restored.into();
     if !restored {
+        // Nothing may still name a place to resume typing from.
+        if let Some(fields) = structured.as_object_mut() {
+            fields.remove("retry_from_character");
+            fields.remove("delivered_chars");
+        }
         structured["retryable"] = false.into();
         structured["escalation"] = serde_json::json!({
             "recommended": "verify_state",
@@ -287,7 +292,10 @@ fn transact(
             Write::Uncertain => {
                 range_moved.set(true);
                 std::thread::sleep(RANGE_SETTLE);
-                return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
+                let code = "BACKGROUND_TEXT_FOCUS_NOT_RETAINED";
+                let mut result = refuse(code);
+                result.content = ToolResult::error(format!("The focus request may have reached the field inside its background window; text insertion refused before writing: {code}.")).content;
+                return Plan::Reported(result);
             }
         }
         // The request was accepted, so focus may have moved, or still move
@@ -1723,7 +1731,11 @@ mod tests {
         let c = control(true, false);
         c.focused.set(Some(false));
         c.focus_uncertain.set(true);
-        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        let result = transact_result(&c, InsertAt::Caret, "!", true);
+        let text = format!("{:?}", result.content);
+        assert!(!text.contains("Field focused first"), "{text}");
+        assert!(text.contains("may have reached the field"), "{text}");
+        let s = state(result);
         assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
         assert_eq!(s["focused_first"], true, "focus may have moved: {s}");
         assert_eq!(c.range_sets.get(), 1, "the restore must be sent: {s}");
