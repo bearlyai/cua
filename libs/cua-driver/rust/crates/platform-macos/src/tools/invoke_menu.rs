@@ -698,13 +698,12 @@ mod tests {
     #[test]
     fn the_final_wait_ignores_menus_that_were_open_before_the_call() {
         // A menu window another menu left on screen is not this call's: the
-        // wait ends as soon as the call's own menus close.
-        let started = std::time::Instant::now();
+        // wait ends as soon as the call's own menus close. Counting it would
+        // wait out the timeout and report the menu still open.
         assert_eq!(
             settle_after_final_action(2, &[7], || Some(vec![7])),
             MenuSettle::Tracked(Some(true))
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
         let mut reads = 0;
         assert_eq!(
             settle_after_final_action(2, &[7], || {
