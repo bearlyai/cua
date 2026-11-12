@@ -1327,7 +1327,8 @@ fn incomplete_result(outcome: &TypeTextOutcome, requested: usize) -> ToolResult 
         .with_structured(serde_json::json!({
             "code": "type_text_not_delivered",
             "path": outcome.path,
-            "effect": "refused",
+            // Keystrokes were posted and may still land: not "nothing sent".
+            "effect": "unverifiable",
             "requested_chars": requested,
             "verified_chars": 0,
             "retryable": false,
@@ -2272,6 +2273,24 @@ mod tests {
         assert_eq!(delivery, (false, Some(5)));
     }
 
+    #[test]
+    fn keystrokes_that_did_not_show_up_are_unverifiable_not_refused() {
+        // Posted keystrokes can still land after the readback window, on web
+        // content and native fields alike: never an invitation to retry.
+        for path in [PATH_KEY_EVENTS, PATH_KEY_EVENTS_FG] {
+            let outcome = TypeTextOutcome {
+                detail: String::new(),
+                path,
+                verified: false,
+                delivered_chars: Some(0),
+            };
+            let result = serde_json::to_value(incomplete_result(&outcome, 3)).unwrap();
+            let s = &result["structuredContent"];
+            assert_eq!(s["code"], "type_text_not_delivered");
+            assert_eq!(s["effect"], "unverifiable", "keystrokes were posted: {s}");
+            assert_eq!(s["retryable"], false);
+        }
+    }
     #[test]
     fn path_constants_are_stable_tokens() {
         // These string constants are part of the structured-response

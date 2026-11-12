@@ -289,5 +289,11 @@ all of these to "nothing sent": `foreground_field_not_accepting`,
 `foreground_focus_changed`, and `type_text_synthesis_budget_exceeded`. Their
 delivery counters or an earlier AX attempt can indicate an attempted write or
 posted events. `foreground_target_not_focused` and
-`foreground_target_not_editable` are pre-keystroke refusals. Exact shapes remain
+`foreground_target_not_editable` are pre-keystroke refusals. **Changed:** on
+every keystroke route, `effect: "refused"` now means no keystroke was posted.
+Keystrokes that were posted but do not show up in the field
+(`type_text_not_delivered`, and `foreground_field_not_accepting`,
+`foreground_focus_lost`, `cancelled` or `type_text_incomplete` with
+`verified_chars: 0` and `posted_keystrokes` above 0) report
+`effect: "unverifiable"`, because they may still land. Exact shapes remain
 owned by `foreground_typing.rs`, `type_text.rs`, and their existing tests.

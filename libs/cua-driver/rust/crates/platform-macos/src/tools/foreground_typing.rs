@@ -501,10 +501,12 @@ pub(crate) fn keystroke_result(
     } else {
         message
     };
+    // "refused" only when nothing was sent: posted keystrokes that do not
+    // show up yet may still land.
     let effect = match verified {
-        Some(0) => "refused",
+        Some(0) if posted == 0 => "refused",
+        Some(0) | None => "unverifiable",
         Some(_) => "partial",
-        None => "unverifiable",
     };
     let mut structured = serde_json::json!({
         "code": code,
@@ -1060,7 +1062,10 @@ mod tests {
         );
         let s = result.structured_content.unwrap();
         assert_eq!(s["code"], "foreground_field_not_accepting");
-        assert_eq!(s["effect"], "refused");
+        assert_eq!(
+            s["effect"], "unverifiable",
+            "posted keystrokes may still land: {s}"
+        );
         assert_eq!(s["posted_keystrokes"], PROBE_KEYSTROKES);
         assert_eq!(s["verified_chars"], 0);
         assert_eq!(s["retryable"], false);
