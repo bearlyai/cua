@@ -5,11 +5,11 @@ on:
       run_unit_tests:
         description: 'Run native workspace tests as well as background proof'
         type: boolean
-        default: true
-      build_run:
-        description: 'Exact Bearly driver build run supplying Windows x64 archive'
+        default: false
+      release_tag:
+        description: 'Bearly driver release whose Windows x64 asset is tested'
         required: true
-        default: '43112319746'
+        default: 'cua-driver-rs-v0.34.1-bearly.1'
 permissions:
   contents: read
   actions: read
@@ -45,7 +45,7 @@ jobs:
           path: evidence
   background:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     env:
       CUA_TELEMETRY: '0'
       DO_NOT_TRACK: '1'
@@ -54,22 +54,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-x86_64
-          path: evidence/archive
-          run-id: ${{ inputs.build_run }}
-          github-token: ${{ github.token }}
+      - name: Download released Windows driver
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          New-Item -ItemType Directory -Force evidence/archive, evidence/background | Out-Null
+          gh release download $env:TAG -R $env:GITHUB_REPOSITORY -D evidence/archive -p '*-windows-x86_64.zip' -p checksums.txt
+          $zip = @(Get-ChildItem evidence/archive/*-windows-x86_64.zip)
+          if ($zip.Count -ne 1) { throw 'Expected one Windows x64 asset' }
+          $hash = (Get-FileHash $zip[0].FullName -Algorithm SHA256).Hash.ToLower()
+          $listed = Select-String -Path evidence/archive/checksums.txt -SimpleMatch $zip[0].Name | ForEach-Object { ($_.Line -split '\s+')[0].ToLower() }
+          if ($listed -ne $hash) { throw "Checksum mismatch for $($zip[0].Name): $hash vs $listed" }
+          Expand-Archive $zip[0].FullName -DestinationPath evidence/driver
+          $drivers = @(Get-ChildItem evidence/driver -Recurse -Filter cua-driver.exe)
+          if ($drivers.Count -ne 1) { throw 'Expected one regular driver' }
+          @{ tag = $env:TAG; asset = $zip[0].Name; asset_sha256 = $hash
+             driver = $drivers[0].FullName; driver_sha256 = (Get-FileHash $drivers[0].FullName -Algorithm SHA256).Hash.ToLower()
+             files = @(Get-ChildItem evidence/driver -Recurse -File | ForEach-Object { $_.Name }) } |
+            ConvertTo-Json | Tee-Object evidence/background/driver.json
       - name: Check background routes at ordinary integrity
         shell: pwsh
         run: |
-          $zips = @(Get-ChildItem evidence/archive/*.zip)
-          if ($zips.Count -ne 1) { throw "Expected one Windows archive" }
-          Expand-Archive $zips[0].FullName -DestinationPath evidence/driver
-          $drivers = @(Get-ChildItem evidence/driver -Recurse -Filter cua-driver.exe)
-          if ($drivers.Count -ne 1) { throw "Expected one regular driver" }
+          $driver = (Get-ChildItem evidence/driver -Recurse -Filter cua-driver.exe).FullName
           $python = (Get-Command python).Source
-          ./scripts/bearly/windows-medium.ps1 -Driver $drivers[0].FullName -Python $python -Output evidence/background
+          ./scripts/bearly/windows-medium.ps1 -Driver $driver -Python $python -Output evidence/background
       - uses: actions/upload-artifact@v4
         if: always()
         with:
