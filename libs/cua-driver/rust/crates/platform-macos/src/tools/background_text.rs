@@ -11,10 +11,11 @@ trait TextControl {
     fn value(&self) -> Option<String>;
     fn range(&self) -> Option<TextRange>;
     fn set_range(&self, range: TextRange) -> bool;
-    fn insert(&self, text: &str) -> bool;
+    fn insert(&self, text: &str) -> Write;
     fn focused(&self) -> Option<bool> {
         None
     }
+    /// Ask for focus; true when the request itself was accepted.
     fn focus(&self) -> bool {
         false
     }
@@ -22,6 +23,26 @@ trait TextControl {
     fn role_facts(&self) -> (String, Option<String>, Option<bool>);
     /// Whether the element reports `AXSelectedText` as settable.
     fn selected_text_settable(&self) -> bool;
+}
+
+/// How the text write itself answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Write {
+    Accepted,
+    /// The element refused the write outright: nothing was written.
+    Rejected,
+    /// Any other error, such as a busy app's messaging timeout: the write may
+    /// still land.
+    Uncertain,
+}
+
+/// Up to 100 ms for an accepted focus request to read back as focused.
+fn focus_retained(control: &impl TextControl) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    while control.focused() != Some(true) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    control.focused() == Some(true)
 }
 
 /// What the background route does with an accessibility target.
@@ -122,8 +143,13 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         if !trusted {
             return refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
         }
-        if !control.focus() || control.focused() != Some(true) {
+        if !control.focus() {
             return refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+        }
+        // The request was accepted, so focus may have moved even when it
+        // does not read back in time.
+        if !focus_retained(control) {
+            return refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
         }
         if control.value().as_deref() != Some(before.as_str()) {
             return refuse("BACKGROUND_TEXT_VALUE_CHANGED");
@@ -181,12 +207,14 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     if control.range() != Some(range) {
         return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
     }
-    let accepted = control.insert(text);
+    let write = control.insert(text);
+    let accepted = write == Write::Accepted;
     // Native apps may update AXValue on their next main-loop turn. Poll only
-    // readback: this non-idempotent operation is never retried.
+    // readback: this non-idempotent operation is never retried. A write that
+    // errored without a clear rejection may still land, so it is polled too.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     let mut after = control.value();
-    while accepted
+    while write != Write::Rejected
         && after.as_deref() == Some(before.as_str())
         && before != expected
         && std::time::Instant::now() < deadline
@@ -198,7 +226,7 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     let changed = after.as_deref().is_some_and(|s| s != before);
     let effect = if exact && trusted {
         "confirmed"
-    } else if after.is_none() || exact {
+    } else if after.is_none() || exact || write == Write::Uncertain {
         "unverifiable"
     } else if !changed {
         "suspected_noop"
@@ -211,6 +239,8 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         "BACKGROUND_TEXT_READBACK_UNAVAILABLE"
     } else if changed {
         "BACKGROUND_TEXT_UNEXPECTED_VALUE"
+    } else if write == Write::Uncertain {
+        "BACKGROUND_TEXT_WRITE_UNCONFIRMED"
     } else {
         "BACKGROUND_TEXT_UNCHANGED"
     };
@@ -326,16 +356,7 @@ impl TextControl for AxTextControl {
         unsafe { copy_bool_attr(self.0, "AXFocused") }
     }
     fn focus(&self) -> bool {
-        unsafe {
-            if set_bool_attr_true(self.0, "AXFocused") != kAXErrorSuccess {
-                return false;
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-            while self.focused() != Some(true) && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            self.focused() == Some(true)
-        }
+        unsafe { set_bool_attr_true(self.0, "AXFocused") == kAXErrorSuccess }
     }
     fn value(&self) -> Option<String> {
         unsafe {
@@ -354,8 +375,14 @@ impl TextControl for AxTextControl {
     fn set_range(&self, r: TextRange) -> bool {
         unsafe { set_text_range(self.0, r) == kAXErrorSuccess }
     }
-    fn insert(&self, text: &str) -> bool {
-        unsafe { set_string_attr(self.0, "AXSelectedText", text) == kAXErrorSuccess }
+    fn insert(&self, text: &str) -> Write {
+        match unsafe { set_string_attr(self.0, "AXSelectedText", text) } {
+            error if error == kAXErrorSuccess => Write::Accepted,
+            // Unsupported attribute, illegal argument, invalid element,
+            // action unsupported, not implemented, API disabled.
+            -25205 | -25201 | -25202 | -25206 | -25208 | -25211 => Write::Rejected,
+            _ => Write::Uncertain,
+        }
     }
     fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
         unsafe {
@@ -401,6 +428,8 @@ mod tests {
         /// A select-all that lands this many value/range reads after focus.
         late_select_after: Cell<Option<usize>>,
         late_armed: Cell<Option<usize>>,
+        focus_sticks: Cell<bool>,
+        write_result: Cell<Write>,
     }
     impl Control {
         fn tick(&self) {
@@ -436,6 +465,9 @@ mod tests {
             if !self.focus_supported.get() {
                 return false;
             }
+            if !self.focus_sticks.get() {
+                return true;
+            }
             self.focused.set(Some(true));
             self.range.set(self.focus_range.get());
             self.late_armed.set(self.late_select_after.get());
@@ -458,8 +490,11 @@ mod tests {
             }
             true
         }
-        fn insert(&self, t: &str) -> bool {
+        fn insert(&self, t: &str) -> Write {
             self.writes.set(self.writes.get() + 1);
+            if self.write_result.get() != Write::Accepted {
+                return self.write_result.get();
+            }
             // The write itself is not a read: a late selection that lands
             // after the last check cannot be observed by any reader.
             let v = (!self.hide_after_write.get())
@@ -472,7 +507,7 @@ mod tests {
                     text_range::splice(&v, self.range.get()?, t)
                 }
             });
-            true
+            Write::Accepted
         }
     }
     fn control(holds: bool, wrong: bool) -> Control {
@@ -493,6 +528,8 @@ mod tests {
             selected_text_settable: Cell::new(true),
             late_select_after: Cell::new(None),
             late_armed: Cell::new(None),
+            focus_sticks: Cell::new(true),
+            write_result: Cell::new(Write::Accepted),
         }
     }
     fn state(r: ToolResult) -> serde_json::Value {
@@ -761,7 +798,7 @@ mod tests {
                 }
                 self.0.set_range(r)
             }
-            fn insert(&self, t: &str) -> bool {
+            fn insert(&self, t: &str) -> Write {
                 self.0.insert(t)
             }
             fn focused(&self) -> Option<bool> {
@@ -816,5 +853,41 @@ mod tests {
             length: 3,
         }));
         assert_eq!(undo_focus_select_all(&c, Some(caret)), Ok(false));
+    }
+    #[test]
+    fn a_write_error_that_is_not_a_rejection_is_unverifiable() {
+        let c = control(true, false);
+        c.write_result.set(Write::Uncertain);
+        let s = state(transact(&c, InsertAt::End, "!", true));
+        assert_eq!(
+            s["effect"], "unverifiable",
+            "a timed-out write may still land, so it must not invite a retry: {s}"
+        );
+        assert_eq!(s["code"], "BACKGROUND_TEXT_WRITE_UNCONFIRMED");
+        assert_eq!(c.writes.get(), 1);
+        let c = control(true, false);
+        c.write_result.set(Write::Rejected);
+        let s = state(transact(&c, InsertAt::End, "!", true));
+        assert_eq!(s["effect"], "suspected_noop");
+        assert_eq!(s["code"], "BACKGROUND_TEXT_UNCHANGED");
+    }
+    #[test]
+    fn focus_that_was_set_but_not_retained_reports_focused_first() {
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_sticks.set(false);
+        let s = state(transact(&c, InsertAt::End, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+        assert_eq!(
+            s["focused_first"], true,
+            "an accepted focus request may have moved focus: {s}"
+        );
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_supported.set(false);
+        let s = state(transact(&c, InsertAt::End, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+        assert!(s.get("focused_first").is_none(), "{s}");
+        assert_eq!(c.writes.get(), 0);
     }
 }

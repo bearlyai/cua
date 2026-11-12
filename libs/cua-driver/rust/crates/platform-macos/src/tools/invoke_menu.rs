@@ -225,6 +225,32 @@ fn settle_menu_dispatch(open_menus: impl FnMut() -> Option<usize>) -> Option<boo
     )
 }
 
+/// What happened to the menu after the final accessibility action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuSettle {
+    /// A one-segment path opens a top-level menu that stays open by design.
+    TopLevelOpened,
+    /// Tracking was awaited: closed, still open, or unobservable.
+    Tracked(Option<bool>),
+}
+
+fn settle_after_final_action(
+    segments: usize,
+    open_menus: impl FnMut() -> Option<usize>,
+) -> MenuSettle {
+    if segments == 1 {
+        return MenuSettle::TopLevelOpened;
+    }
+    MenuSettle::Tracked(settle_menu_dispatch(open_menus))
+}
+
+fn settle_summary(settle: MenuSettle) -> &'static str {
+    match settle {
+        MenuSettle::TopLevelOpened => "Opened the top-level native menu, which stays open until an item is chosen or it is dismissed; inspect fresh state, and press escape on the window before unrelated input.",
+        MenuSettle::Tracked(menus_closed) => dispatch_summary(menus_closed),
+    }
+}
+
 fn dispatch_summary(menus_closed: Option<bool>) -> &'static str {
     match menus_closed {
         Some(true) => "Dispatched the final accessibility action and observed the native menu close; verify the command's semantic effect from fresh state.",
@@ -233,7 +259,7 @@ fn dispatch_summary(menus_closed: Option<bool>) -> &'static str {
     }
 }
 
-unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<Option<bool>, String> {
+unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<MenuSettle, String> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return Err("invoke_menu: target application is unavailable".into());
@@ -290,8 +316,9 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<Option<bool>, String>
         // now lets the next input overlap that selection. Keep the target
         // frontmost until its menu windows close, with a bounded wait. This
         // observes tracking only, never the command's semantic effect.
-        Ok(settle_menu_dispatch(|| {
-            crate::windows::menu_window_ids(pid).map(|menus| menus.len())
+        // Count only the menu windows this call opened, as the failure path does.
+        Ok(settle_after_final_action(path.len(), || {
+            crate::windows::new_menu_windows(pid, &menus_before)
         }))
     })();
 
@@ -572,22 +599,21 @@ impl Tool for InvokeMenuTool {
         .await;
 
         match outcome {
-            Ok(Ok(menus_closed)) => ToolResult::text(dispatch_summary(menus_closed))
-                .with_action_record(
-                    ActionExecutionRecord::builder(
-                        ActionEffect::Unverifiable,
-                        ActionTransport::MacosAxAction,
-                        RequestedDelivery::Foreground,
-                    )
-                    .actual_delivery(ActualDelivery::Foreground)
-                    .evidence(ActionEvidence {
-                        kind: EvidenceKind::NativeApiResult,
-                        detail: "Every menu hop resolved uniquely and AX accepted the final action"
-                            .into(),
-                    })
-                    .build()
-                    .expect("invoke_menu record is valid"),
-                ),
+            Ok(Ok(settle)) => ToolResult::text(settle_summary(settle)).with_action_record(
+                ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    ActionTransport::MacosAxAction,
+                    RequestedDelivery::Foreground,
+                )
+                .actual_delivery(ActualDelivery::Foreground)
+                .evidence(ActionEvidence {
+                    kind: EvidenceKind::NativeApiResult,
+                    detail: "Every menu hop resolved uniquely and AX accepted the final action"
+                        .into(),
+                })
+                .build()
+                .expect("invoke_menu record is valid"),
+            ),
             Ok(Err(error)) => refusal(error),
             Err(error) => refusal(format!("invoke_menu: blocking task failed: {error}")),
         }
@@ -647,6 +673,20 @@ mod tests {
         assert_eq!(
             dispatch_summary(closed),
             "Dispatched the final accessibility action, but the native menu is still open after waiting. The command may still run; inspect fresh state before repeating it."
+        );
+    }
+
+    #[test]
+    fn a_one_segment_path_does_not_wait_for_its_open_menu() {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            settle_after_final_action(1, || Some(1)),
+            MenuSettle::TopLevelOpened
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(
+            settle_after_final_action(2, || Some(0)),
+            MenuSettle::Tracked(Some(true))
         );
     }
 

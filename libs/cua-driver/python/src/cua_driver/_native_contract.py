@@ -1519,7 +1519,7 @@ class _UniffiFfiConverterOptionalTypeActionError(_UniffiConverterRustBuffer):
 
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], focused_first:typing.Optional[bool], error:typing.Optional[ActionError]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], focused_first:typing.Optional[bool] = False, error:typing.Optional[ActionError]):
         self.effect = effect
         self.route = route
         self.delivery = delivery

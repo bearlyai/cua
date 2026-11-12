@@ -505,7 +505,7 @@ pub(crate) fn new_menu_windows(pid: i32, before: &[u32]) -> Option<usize> {
 
 /// `Some(true)` once no menu window of `pid` outside `before` is on screen
 /// (polled for up to 400 ms), `Some(false)` when one still is, `None` when
-/// that could not be read.
+/// the last read could not be made.
 pub(crate) fn wait_for_new_menus_closed(pid: i32, before: &[u32]) -> Option<bool> {
     poll_until_no_menu(
         || new_menu_windows(pid, before),
@@ -519,11 +519,14 @@ pub(crate) fn poll_until_no_menu(
 ) -> Option<bool> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if open_menus()? == 0 {
+        // An unreadable window list is one missed observation, not the end of
+        // the wait; only the final read decides between open and unknown.
+        let open = open_menus();
+        if open == Some(0) {
             return Some(true);
         }
         if std::time::Instant::now() >= deadline {
-            return Some(false);
+            return open.map(|_| false);
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
@@ -595,6 +598,19 @@ mod tests {
             poll_until_no_menu(|| reads.next().flatten(), timeout),
             Some(true)
         );
+    }
+
+    #[test]
+    fn one_unreadable_window_list_read_does_not_end_the_wait() {
+        let timeout = std::time::Duration::from_millis(200);
+        let mut reads = [None, Some(1), Some(0)].into_iter();
+        assert_eq!(
+            poll_until_no_menu(|| reads.next().flatten(), timeout),
+            Some(true),
+            "a single unreadable read must keep polling"
+        );
+        let mut reads = std::iter::once(Some(1)).chain(std::iter::repeat(None));
+        assert_eq!(poll_until_no_menu(|| reads.next().flatten(), timeout), None);
     }
 
     fn helper(window_id: u32, pid: i32) -> WindowInfo {

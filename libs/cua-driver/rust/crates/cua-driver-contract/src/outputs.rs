@@ -695,6 +695,7 @@ pub struct ActionResult {
     pub summary: Option<String>,
     /// True when the action first moved keyboard focus inside its background window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = false)]
     pub focused_first: Option<bool>,
     /// Present only with `effect: refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

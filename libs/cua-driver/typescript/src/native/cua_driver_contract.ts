@@ -463,6 +463,7 @@ export type ActionResult = {
  */
 export const ActionResult = (() => {
     const defaults = () => ({
+        focusedFirst: false,
     });
     const create = (() => {
         return uniffiCreateRecord<ActionResult, ReturnType<typeof defaults>>(defaults);
