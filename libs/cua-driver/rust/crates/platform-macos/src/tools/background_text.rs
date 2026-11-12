@@ -1626,4 +1626,22 @@ mod tests {
         assert_eq!(s["range_restored"], true);
         assert!(s.get("retryable").is_none(), "{s}");
     }
+    #[test]
+    fn an_element_whose_walk_cannot_be_read_is_not_native() {
+        // An application element for a process that no longer exists: every
+        // attribute read fails, so the ancestor walk is incomplete. No input
+        // or window state is touched.
+        let pid = (40_000..90_000)
+            .rev()
+            .find(|&pid| unsafe { libc::kill(pid, 0) } == -1)
+            .expect("an unused pid");
+        let element = unsafe { AXUIElementCreateApplication(pid) };
+        assert!(!element.is_null());
+        let native = AxTextControl(element).provably_native();
+        unsafe { core_foundation::base::CFRelease(element as _) };
+        assert!(
+            !native,
+            "an unreadable ancestor walk must not count as native"
+        );
+    }
 }
