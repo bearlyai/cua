@@ -34,8 +34,7 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_string_attr, focused_element_of_pid, is_attribute_settable, kAXErrorSuccess,
-    set_string_attr, AXUIElementRef,
+    copy_string_attr, focused_element_of_pid, kAXErrorSuccess, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
