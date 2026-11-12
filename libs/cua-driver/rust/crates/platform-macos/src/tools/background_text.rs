@@ -282,15 +282,19 @@ fn transact(
                 return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
             }
             // A busy app can still apply the request later, and selecting
-            // on focus with it: send the restore behind it all the same.
+            // on focus with it: send the restore behind it all the same,
+            // once a select-all that follows focus has had time to land.
             Write::Uncertain => {
                 range_moved.set(true);
+                std::thread::sleep(RANGE_SETTLE);
                 return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
             }
         }
-        // The request was accepted, so focus may have moved even when it
-        // does not read back in time.
+        // The request was accepted, so focus may have moved, or still move
+        // and select the whole value, even when it does not read back in
+        // time: wait as long again before deciding whether to restore.
         if !focus_retained(control) {
+            std::thread::sleep(RANGE_SETTLE);
             return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
         }
         if control.value().as_deref() != Some(before.as_str()) {
@@ -549,10 +553,14 @@ pub(super) fn foreground_focus_refusal(path: &str, requested: usize) -> ToolResu
     })
 }
 
+/// How long a toolkit gets to apply its select-on-focus.
+const RANGE_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// The selected range once two consecutive reads agree (unreadable counts as
-/// a reading), polled for at most 150 ms; `None` when it never settles.
+/// a reading), polled for at most [`RANGE_SETTLE`]; `None` when it never
+/// settles.
 fn settled_range(control: &impl TextControl) -> Option<Option<TextRange>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    let deadline = std::time::Instant::now() + RANGE_SETTLE;
     let mut last = control.range();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -681,8 +689,23 @@ mod tests {
         /// How a whole-`AXValue` write answers, and how many were sent.
         set_value_result: Cell<Write>,
         value_writes: Cell<usize>,
+        /// The focus request takes effect this long after it was sent: the
+        /// range becomes `focus_range`, though `AXFocused` does not read back
+        /// true, so the outcome never depends on how long the focus poll ran.
+        focus_lands_after: Cell<Option<std::time::Duration>>,
+        focus_lands_at: Cell<Option<std::time::Instant>>,
     }
     impl Control {
+        fn land_focus(&self) {
+            if self
+                .focus_lands_at
+                .get()
+                .is_some_and(|at| std::time::Instant::now() >= at)
+            {
+                self.focus_lands_at.set(None);
+                self.range.set(self.focus_range.get());
+            }
+        }
         fn select_all(&self) {
             let len = self
                 .value
@@ -733,10 +756,20 @@ mod tests {
             self.native.get()
         }
         fn focused(&self) -> Option<bool> {
+            self.land_focus();
             self.focused.get()
         }
         fn focus(&self) -> Write {
             self.focus_calls.set(self.focus_calls.get() + 1);
+            if let Some(after) = self.focus_lands_after.get() {
+                self.focus_lands_at
+                    .set(Some(std::time::Instant::now() + after));
+                return if self.focus_uncertain.get() {
+                    Write::Uncertain
+                } else {
+                    Write::Accepted
+                };
+            }
             if self.focus_uncertain.get() {
                 return Write::Uncertain;
             }
@@ -757,6 +790,7 @@ mod tests {
             Write::Accepted
         }
         fn value(&self) -> Option<String> {
+            self.land_focus();
             self.tick();
             if self.hide_after_write.get() && self.writes.get() > 0 {
                 return None;
@@ -764,6 +798,7 @@ mod tests {
             self.value.borrow().clone()
         }
         fn range(&self) -> Option<TextRange> {
+            self.land_focus();
             self.tick();
             self.range.get()
         }
@@ -849,6 +884,8 @@ mod tests {
             range_sets: Cell::new(0),
             set_value_result: Cell::new(Write::Accepted),
             value_writes: Cell::new(0),
+            focus_lands_after: Cell::new(None),
+            focus_lands_at: Cell::new(None),
         }
     }
     /// An element addressed by token.
@@ -1701,6 +1738,36 @@ mod tests {
         assert!(s.get("focused_first").is_none(), "{s}");
         assert!(s.get("range_restored").is_none(), "{s}");
         assert_eq!(c.range_sets.get(), 0);
+    }
+    #[test]
+    fn a_focus_that_takes_effect_late_is_undone_before_the_refusal() {
+        // A single-line field whose focus takes effect after the 100 ms focus
+        // poll (accepted), or behind an unclear error, and selects everything:
+        // the refusal waits for it and puts the caret at the end, so a keyboard
+        // retry cannot read that selection as the person's and type over it.
+        // The select-all lands within the settle window that follows the poll.
+        let end = TextRange {
+            location: 8,
+            length: 0,
+        };
+        for (uncertain, after_ms) in [(false, 200), (true, 50)] {
+            let c = control(true, false);
+            c.focused.set(Some(false));
+            c.focus_range.set(Some(TextRange {
+                location: 0,
+                length: 8,
+            }));
+            c.focus_uncertain.set(uncertain);
+            c.focus_lands_after
+                .set(Some(std::time::Duration::from_millis(after_ms)));
+            let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+            assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+            assert_eq!(s["focused_first"], true, "{s}");
+            assert_eq!(s["range_restored"], true, "uncertain={uncertain}: {s}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(c.range(), Some(end), "uncertain={uncertain}: {s}");
+            assert_eq!(c.writes.get(), 0);
+        }
     }
     #[test]
     fn a_refusal_that_could_not_put_the_range_back_is_not_retryable() {
