@@ -95,6 +95,29 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     };
     let prior_range = control.range();
     let focused_first = control.focused() == Some(false);
+    // A refusal after the driver moved the range (its focus step or a range
+    // set) puts back the range the field had before this call, or a caret at
+    // the end when that was unreadable, so no later call or keystroke can
+    // replace a selection the driver created.
+    let restore_to = prior_range.unwrap_or(TextRange {
+        location: before.encode_utf16().count(),
+        length: 0,
+    });
+    let range_moved = std::cell::Cell::new(false);
+    let refuse = |code: &str| {
+        let mut result = if focused_first {
+            focused_refusal(code)
+        } else {
+            refusal(code)
+        };
+        if range_moved.get() || (focused_first && control.range() != prior_range) {
+            let restored = control.set_range(restore_to) && control.range() == Some(restore_to);
+            if let Some(structured) = result.structured_content.as_mut() {
+                structured["range_restored"] = restored.into();
+            }
+        }
+        result
+    };
     if focused_first {
         if !trusted {
             return refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
@@ -103,16 +126,9 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
             return refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
         }
         if control.value().as_deref() != Some(before.as_str()) {
-            return focused_refusal("BACKGROUND_TEXT_VALUE_CHANGED");
+            return refuse("BACKGROUND_TEXT_VALUE_CHANGED");
         }
     }
-    let refuse = |code| {
-        if focused_first {
-            focused_refusal(code)
-        } else {
-            refusal(code)
-        }
-    };
     // A toolkit may apply its select-on-focus a moment after AXFocused reads
     // true. One settled range read drives both the focus guard and the write.
     let Some(original_range) = settled_range(control) else {
@@ -127,7 +143,7 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         && original_range.is_some_and(|r| r.length > 0)
         && !(mode == InsertAt::Selection && original_range == prior_range)
     {
-        return focused_refusal("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+        return refuse("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
     }
     let range = match mode.range(&before, original_range) {
         Ok(r) => r,
@@ -149,11 +165,11 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     } else {
         None
     };
-    let holds = |r| control.set_range(r) && control.range() == Some(r);
+    let holds = |r| {
+        range_moved.set(true);
+        control.set_range(r) && control.range() == Some(r)
+    };
     if probe.is_some_and(|r| !holds(r)) || !holds(range) {
-        if let Some(r) = original_range {
-            control.set_range(r);
-        }
         return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
     }
     // Setting a range must not edit the value; also catch concurrent edits.
@@ -620,5 +636,82 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn a_refusal_never_leaves_behind_a_selection_the_driver_created() {
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        let first = state(transact(&c, InsertAt::Caret, "!", true));
+        let _second = state(transact(&c, InsertAt::Caret, "!", true));
+        let third = state(transact(&c, InsertAt::Selection, "!", true));
+        let value = c.value.borrow().clone().unwrap();
+        assert!(
+            value.contains("Original"),
+            "default, default, selection replaced the value: {value:?} ({third})"
+        );
+        assert_eq!(first["code"], "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+        assert_eq!(
+            first["range_restored"], true,
+            "the refusal must restore the range focus changed: {first}"
+        );
+    }
+    #[test]
+    fn a_value_change_after_the_range_was_set_restores_the_caret() {
+        // A concurrent edit lands while the driver sets the caret.
+        let c = control(true, false);
+        c.range.set(Some(TextRange {
+            location: 3,
+            length: 0,
+        }));
+        let s = state(transact_with_edit(&c, InsertAt::End, "!"));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_VALUE_CHANGED");
+        assert_eq!(s["range_restored"], true, "{s}");
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 3,
+                length: 0
+            })
+        );
+        assert_eq!(c.writes.get(), 0);
+    }
+    /// Runs a transaction on a control whose value changes on its first
+    /// range set, as a concurrent edit would.
+    fn transact_with_edit(c: &Control, mode: InsertAt, text: &str) -> ToolResult {
+        struct Editing<'a>(&'a Control, Cell<bool>);
+        impl TextControl for Editing<'_> {
+            fn value(&self) -> Option<String> {
+                self.0.value()
+            }
+            fn range(&self) -> Option<TextRange> {
+                self.0.range()
+            }
+            fn set_range(&self, r: TextRange) -> bool {
+                if !self.1.replace(true) {
+                    *self.0.value.borrow_mut() = Some("Origin".into());
+                }
+                self.0.set_range(r)
+            }
+            fn insert(&self, t: &str) -> bool {
+                self.0.insert(t)
+            }
+            fn focused(&self) -> Option<bool> {
+                self.0.focused()
+            }
+            fn focus(&self) -> bool {
+                self.0.focus()
+            }
+            fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
+                self.0.role_facts()
+            }
+            fn selected_text_settable(&self) -> bool {
+                true
+            }
+        }
+        transact(&Editing(c, Cell::new(false)), mode, text, true)
     }
 }
