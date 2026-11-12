@@ -1502,4 +1502,25 @@ mod tests {
         assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
         assert_eq!(s["path"], "ax", "{s}");
     }
+    #[test]
+    fn a_foreground_write_that_timed_out_is_never_followed_by_another() {
+        // A busy app's timeout can still apply the write later: neither the
+        // whole-value fallback nor keystrokes may follow it.
+        for value in ["", "Original"] {
+            let c = control(true, false);
+            *c.value.borrow_mut() = Some(value.into());
+            c.range.set(Some(TextRange {
+                location: value.len(),
+                length: 0,
+            }));
+            c.write_result.set(Write::Uncertain);
+            let delivery = ForegroundFocus::default().atomic_insert(&c, "long text", Some(value));
+            assert_eq!(
+                delivery,
+                (false, None),
+                "{value:?}: an uncertain write must end as indeterminate"
+            );
+            assert_eq!(c.value().as_deref(), Some(value), "a second write ran");
+        }
+    }
 }

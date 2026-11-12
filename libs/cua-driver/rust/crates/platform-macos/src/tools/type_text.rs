@@ -1460,7 +1460,13 @@ pub(super) fn atomic_insert(
 ) -> (bool, Option<usize>) {
     let read = || field.reported_value();
     let selected = field.selected_text();
-    if field.insert(text) == super::background_text::Write::Accepted {
+    let write = field.insert(text);
+    // A busy app's timeout can still apply the write later: any further write
+    // or keystroke could type the text twice.
+    if write == super::background_text::Write::Uncertain {
+        return (false, None);
+    }
+    if write == super::background_text::Write::Accepted {
         let delivery = await_typed_delivery(
             before,
             text,
