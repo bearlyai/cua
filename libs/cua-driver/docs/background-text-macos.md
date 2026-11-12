@@ -213,12 +213,14 @@ launches it with `open -n -a`, and scores the app's own values, model binding,
 formatting, activation notifications, key-window notifications, and pointer
 position through a separate file channel. Plain cargo test skips all app work.
 
-The 40 cases cover five controls, fresh/default and fresh/append behavior,
+The 45 cases cover five controls, fresh/default and fresh/append behavior,
 empty values both fresh and previously focused, remembered carets, explicit
 existing selection replacement, and refusal to replace implicit or newly
 focus-created selections; each such refusal must report `range_restored: true`.
 NSTextField, NSSearchField, NSComboBox and SwiftUI TextField select all on
-first focus; NSTextView keeps a collapsed caret.
+first focus; NSTextView keeps a collapsed caret. Five more rows type into each
+fresh control with `delivery_mode: "foreground"` and require the typed text to
+join `Original` rather than replace it.
 
 ## Other platforms inspected
 

@@ -1285,7 +1285,7 @@ fn cgevent_type_verified(
     }))
 }
 
-fn await_typed_delivery(
+pub(super) fn await_typed_delivery(
     before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
@@ -1438,19 +1438,18 @@ fn verify_keystrokes(
 /// then read back. Inserts at the cursor (replacing any selection) through
 /// `AXSelectedText`; when that doesn't land and the field is empty or wholly
 /// selected, sets its whole `AXValue`, which is the same edit. Returns whether
-/// the whole text landed and how many characters were verified.
-///
-/// # Safety
-/// `field` must be a live `AXUIElementRef`.
-unsafe fn atomic_insert(
-    field: AXUIElementRef,
+/// the whole text landed and how many characters were verified. Callers reach
+/// it through [`super::background_text::ForegroundFocus::atomic_insert`], which
+/// carries whether the driver's own focus step selected everything.
+pub(super) fn atomic_insert(
+    field: &impl super::background_text::TextControl,
     text: &str,
     before: Option<&str>,
     focus_selected_all: bool,
 ) -> (bool, Option<usize>) {
-    let read = || unsafe { copy_string_attr(field, "AXValue") };
-    let selected = copy_string_attr(field, "AXSelectedText");
-    if set_string_attr(field, "AXSelectedText", text) == kAXErrorSuccess {
+    let read = || field.reported_value();
+    let selected = field.selected_text();
+    if field.insert(text) == super::background_text::Write::Accepted {
         let delivery = await_typed_delivery(
             before,
             text,
@@ -1463,10 +1462,7 @@ unsafe fn atomic_insert(
     }
     let replaces_whole_value =
         whole_value_write_allowed(before, selected.as_deref(), focus_selected_all);
-    if replaces_whole_value
-        && is_attribute_settable(field, "AXValue")
-        && set_string_attr(field, "AXValue", text) == kAXErrorSuccess
-    {
+    if replaces_whole_value && field.value_settable() && field.set_value(text) {
         return await_typed_delivery(
             Some(""),
             text,
@@ -1480,7 +1476,7 @@ unsafe fn atomic_insert(
 /// Whether the long-text fallback may set the whole `AXValue`: the field is
 /// empty, or its whole value is selected and that selection is not one the
 /// driver's own focus step created.
-fn whole_value_write_allowed(
+pub(super) fn whole_value_write_allowed(
     before: Option<&str>,
     selected: Option<&str>,
     focus_selected_all: bool,
@@ -1521,38 +1517,31 @@ fn type_text_foreground_guarded(
         // Focus the requested element after activation so it lands after the
         // window's remembered first responder, re-applying once if it didn't
         // stick (see cgevent_type_verified).
-        let before_focus = element_ptr_and_idx.and_then(|(ptr, _)| unsafe {
-            super::background_text::range_of(ptr as AXUIElementRef)
-        });
-        if let Some((ptr, _)) = element_ptr_and_idx {
-            let _ = crate::input::ax_actions::focus_element(ptr);
-            if !crate::input::ax_actions::is_element_focused(pid, ptr) {
-                std::thread::sleep(FOCUS_REAPPLY_DELAY);
-                let _ = crate::input::ax_actions::focus_element(ptr);
-            }
-        }
         // First-keystroke settle — see the "i love u" -> "love u" note.
-        std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        let settle = std::time::Duration::from_millis(settle_ms);
         // Focusing a Cocoa field commonly selects its whole value; keystrokes
-        // or the long-text write would then replace it. Put the caret back
-        // before anything is typed, or type nothing.
-        let mut focus_selected_all = false;
-        if let Some((ptr, _)) = element_ptr_and_idx {
-            match unsafe {
-                super::background_text::undo_focus_select_all_of(
-                    ptr as AXUIElementRef,
-                    before_focus,
-                )
-            } {
-                Ok(created) => focus_selected_all = created,
+        // or the long-text write would then replace it. The focus step puts
+        // the caret back before anything is typed, or nothing is typed.
+        let focus = match element_ptr_and_idx {
+            Some((ptr, _)) => match super::background_text::foreground_focus(
+                &super::background_text::AxTextControl(ptr as AXUIElementRef),
+                || crate::input::ax_actions::is_element_focused(pid, ptr),
+                FOCUS_REAPPLY_DELAY,
+                settle,
+            ) {
+                Ok(focus) => focus,
                 Err(()) => {
                     delivery = Some(TypeTextDelivery::Reported(
                         super::background_text::foreground_focus_refusal(path, requested),
                     ));
                     return Ok(());
                 }
+            },
+            None => {
+                std::thread::sleep(settle);
+                super::background_text::ForegroundFocus::default()
             }
-        }
+        };
 
         let (field, owned, is_requested) = match element_ptr_and_idx {
             Some((ptr, _)) => (
@@ -1588,9 +1577,11 @@ fn type_text_foreground_guarded(
                 if foreground_typing::foreground_route(requested, ax_confirmable)
                     == ForegroundRoute::AtomicAxFirst
                 {
-                    match unsafe {
-                        atomic_insert(field, text, before.as_deref(), focus_selected_all)
-                    } {
+                    match focus.atomic_insert(
+                        &super::background_text::AxTextControl(field),
+                        text,
+                        before.as_deref(),
+                    ) {
                         (true, verified) => {
                             break 'typed TypeTextDelivery::Typed(TypeTextOutcome {
                                 detail: " via one accessibility write".into(),
@@ -1710,7 +1701,11 @@ fn type_text_desktop_guarded(
             if foreground_typing::foreground_route(requested, ax_confirmable)
                 == ForegroundRoute::AtomicAxFirst
             {
-                match unsafe { atomic_insert(field, text, before.as_deref(), false) } {
+                match super::background_text::ForegroundFocus::default().atomic_insert(
+                    &super::background_text::AxTextControl(field),
+                    text,
+                    before.as_deref(),
+                ) {
                     (true, _) => break 'typed ToolResult::text(format!(
                         "✅ Inserted {requested} char(s) into the frontmost app via one accessibility write."
                     ))

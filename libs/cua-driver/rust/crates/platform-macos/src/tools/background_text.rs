@@ -6,9 +6,25 @@ use crate::ax::{
 };
 use cua_driver_core::protocol::ToolResult;
 
-trait TextControl {
+pub(super) trait TextControl {
     /// None includes unreadable or demonstrably truncated values.
     fn value(&self) -> Option<String>;
+    /// `AXValue` as the element reports it, without the truncation check.
+    fn reported_value(&self) -> Option<String> {
+        self.value()
+    }
+    /// `AXSelectedText`, when readable.
+    fn selected_text(&self) -> Option<String> {
+        None
+    }
+    /// Whether the whole `AXValue` is settable.
+    fn value_settable(&self) -> bool {
+        false
+    }
+    /// Set the whole `AXValue`; true when the write was accepted.
+    fn set_value(&self, _text: &str) -> bool {
+        false
+    }
     fn range(&self) -> Option<TextRange>;
     fn set_range(&self, range: TextRange) -> bool;
     fn insert(&self, text: &str) -> Write;
@@ -27,7 +43,7 @@ trait TextControl {
 
 /// How the text write itself answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Write {
+pub(super) enum Write {
     Accepted,
     /// The element refused the write outright: nothing was written.
     Rejected,
@@ -119,10 +135,7 @@ fn plan(
 /// caret, so a readable selection is replaced only on request, and `end`
 /// types only once the caret provably sits at the end. A refusal says whether
 /// the gate itself asked to move the caret.
-fn keystroke_gate(
-    control: &impl TextControl,
-    mode: InsertAt,
-) -> Result<(), (&'static str, bool)> {
+fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), (&'static str, bool)> {
     let range = control.range();
     if mode != InsertAt::Selection && range.is_some_and(|r| r.length > 0) {
         return Err((
@@ -386,23 +399,45 @@ fn undo_focus_select_all(
     }
 }
 
-/// The selected range of an accessibility element, when readable.
-///
-/// # Safety
-/// `element` must be a live `AXUIElementRef`.
-pub(super) unsafe fn range_of(element: AXUIElementRef) -> Option<TextRange> {
-    copy_text_range(element)
+/// What the foreground focus step did to the field it focused.
+#[derive(Default)]
+pub(super) struct ForegroundFocus {
+    /// Focusing selected the whole value, and the caret was put back.
+    focus_selected_all: bool,
 }
 
-/// [`undo_focus_select_all`] for an accessibility element.
-///
-/// # Safety
-/// `element` must be a live `AXUIElementRef`.
-pub(super) unsafe fn undo_focus_select_all_of(
-    element: AXUIElementRef,
-    before_focus: Option<TextRange>,
-) -> Result<bool, ()> {
-    undo_focus_select_all(&AxTextControl(element), before_focus)
+impl ForegroundFocus {
+    /// The long-text accessibility write, which never sets the whole value
+    /// for a selection this focus step created.
+    pub(super) fn atomic_insert(
+        &self,
+        field: &impl TextControl,
+        text: &str,
+        before: Option<&str>,
+    ) -> (bool, Option<usize>) {
+        super::type_text::atomic_insert(field, text, before, self.focus_selected_all)
+    }
+}
+
+/// The foreground step's focus on an addressed field: focus it, once more
+/// after `reapply_after` when it did not take, wait `settle`, then undo a
+/// whole-value selection the focus created. `Err(())`: that selection could
+/// not be undone, so nothing may be typed.
+pub(super) fn foreground_focus(
+    control: &impl TextControl,
+    is_focused: impl Fn() -> bool,
+    reapply_after: std::time::Duration,
+    settle: std::time::Duration,
+) -> Result<ForegroundFocus, ()> {
+    let before_focus = control.range();
+    control.focus();
+    if !is_focused() {
+        std::thread::sleep(reapply_after);
+        control.focus();
+    }
+    std::thread::sleep(settle);
+    undo_focus_select_all(control, before_focus)
+        .map(|focus_selected_all| ForegroundFocus { focus_selected_all })
 }
 
 /// The foreground step refuses before any keystroke: focusing the field
@@ -437,8 +472,21 @@ fn settled_range(control: &impl TextControl) -> Option<Option<TextRange>> {
     }
 }
 
-struct AxTextControl(AXUIElementRef);
+/// A live accessibility element; the caller keeps it alive.
+pub(super) struct AxTextControl(pub(super) AXUIElementRef);
 impl TextControl for AxTextControl {
+    fn reported_value(&self) -> Option<String> {
+        unsafe { copy_string_attr(self.0, "AXValue") }
+    }
+    fn selected_text(&self) -> Option<String> {
+        unsafe { copy_string_attr(self.0, "AXSelectedText") }
+    }
+    fn value_settable(&self) -> bool {
+        unsafe { is_attribute_settable(self.0, "AXValue") }
+    }
+    fn set_value(&self, text: &str) -> bool {
+        unsafe { set_string_attr(self.0, "AXValue", text) == kAXErrorSuccess }
+    }
     fn focused(&self) -> Option<bool> {
         unsafe { copy_bool_attr(self.0, "AXFocused") }
     }
@@ -532,6 +580,7 @@ mod tests {
         focus_calls: Cell<usize>,
         /// The next range set lands here instead of where it was asked to.
         misplace_next_set: Cell<Option<TextRange>>,
+        value_settable: Cell<bool>,
     }
     impl Control {
         fn tick(&self) {
@@ -596,6 +645,24 @@ mod tests {
             }
             true
         }
+        fn selected_text(&self) -> Option<String> {
+            let range = self.range()?;
+            let value = self.value()?;
+            Some(
+                value
+                    .chars()
+                    .skip(range.location)
+                    .take(range.length)
+                    .collect(),
+            )
+        }
+        fn value_settable(&self) -> bool {
+            self.value_settable.get()
+        }
+        fn set_value(&self, text: &str) -> bool {
+            *self.value.borrow_mut() = Some(text.into());
+            true
+        }
         fn insert(&self, t: &str) -> Write {
             self.writes.set(self.writes.get() + 1);
             if self.write_result.get() != Write::Accepted || self.echo_lags.get() {
@@ -640,6 +707,7 @@ mod tests {
             echo_lags: Cell::new(false),
             focus_calls: Cell::new(0),
             misplace_next_set: Cell::new(None),
+            value_settable: Cell::new(true),
         }
     }
     /// An element addressed by token.
@@ -1070,7 +1138,10 @@ mod tests {
             c.settable_once_focused.set(true);
             c.focus_range.set(Some(all));
             let s = reported(plan(&c, mode, "!", false));
-            assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED", "{mode:?}: {s}");
+            assert_eq!(
+                s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED",
+                "{mode:?}: {s}"
+            );
             assert_eq!(c.focus_calls.get(), 0, "{mode:?}: focus must not move");
             assert_eq!(
                 c.range.get(),
@@ -1214,5 +1285,60 @@ mod tests {
         assert_eq!(s["code"], "BACKGROUND_TEXT_CARET_UNAVAILABLE");
         assert_eq!(s["range_restored"], true, "{s}");
         assert_eq!(c.range.get(), Some(caret));
+    }
+    #[test]
+    fn the_foreground_focus_step_never_lets_text_replace_the_value() {
+        let zero = std::time::Duration::ZERO;
+        let all = TextRange {
+            location: 0,
+            length: 8,
+        };
+        // A fresh Cocoa field: focusing it selects the whole value.
+        let fresh = || {
+            let c = control(true, false);
+            c.focused.set(Some(false));
+            c.focus_range.set(Some(all));
+            c
+        };
+        // Short text is typed at the caret the focus step leaves behind.
+        let c = fresh();
+        let focus = foreground_focus(&c, || true, zero, zero).expect("restorable");
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 0,
+                length: 0
+            }),
+            "keystrokes would replace a whole-value selection left by focus"
+        );
+        // Long text: the selected-text write does not land, so only the
+        // whole-value fallback is left.
+        c.write_result.set(Write::Rejected);
+        let _ = focus.atomic_insert(&c, "!", Some("Original"));
+        assert_eq!(c.value().as_deref(), Some("Original"));
+        // The field selects everything again after the caret was put back:
+        // the fallback still never replaces a selection focus created.
+        let c = fresh();
+        c.late_select_after.set(Some(3));
+        c.write_result.set(Write::Rejected);
+        let focus = foreground_focus(&c, || true, zero, zero).expect("restorable");
+        let _ = focus.atomic_insert(&c, "!", Some("Original"));
+        assert_eq!(
+            c.value().as_deref(),
+            Some("Original"),
+            "the long-text fallback replaced a selection the focus step created"
+        );
+        // A selection the field already had is the caller's to replace.
+        let c = control(true, false);
+        c.range.set(Some(all));
+        c.focus_range.set(Some(all));
+        c.write_result.set(Write::Rejected);
+        let focus = foreground_focus(&c, || true, zero, zero).expect("restorable");
+        let _ = focus.atomic_insert(&c, "!", Some("Original"));
+        assert_eq!(c.value().as_deref(), Some("!"));
+        // A focus selection that cannot be undone types nothing.
+        let c = fresh();
+        c.misplace_next_set.set(Some(all));
+        assert!(foreground_focus(&c, || true, zero, zero).is_err());
     }
 }

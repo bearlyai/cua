@@ -330,6 +330,43 @@ mod native {
                 }
             }
         }
-        println!("40 control cases passed: independent app values, retained formatting, frontmost app and pointer unchanged");
+        // Foreground delivery fronts the window and focuses the field, which
+        // selects a Cocoa field's whole value: the typed text must still join
+        // the old value, never replace it.
+        for kind in ["field", "search", "combo", "rich", "swift"] {
+            command(path, "reset", &mut n);
+            background(&mut n);
+            let snapshot = call(
+                "get_window_state",
+                json!({"pid":pid,"window_id":wid,"include_screenshot":false}),
+            );
+            let entry = snapshot["structuredContent"]["elements"]
+                .as_array()
+                .expect("elements")
+                .iter()
+                .find(|e| e["label"] == kind && e["role"] != "AXButton")
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {kind}"));
+            let result = call(
+                "type_text",
+                json!({"pid":pid,"window_id":wid,"element_token":entry["element_token"],
+                       "text":"!","delivery_mode":"foreground"}),
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            let after = state(path);
+            let value = after[kind].as_str().unwrap_or_default().to_owned();
+            let s = &result["structuredContent"];
+            println!(
+                "{kind:6} {:17} effect={} code={} path={} value={value}",
+                "foreground_fresh", s["effect"], s["code"], s["path"]
+            );
+            assert_eq!(
+                value.replacen('!', "", 1),
+                "Original",
+                "foreground typing replaced or lost the value: {kind}: {result}"
+            );
+            assert_eq!(value.chars().count(), 9, "{kind}: {result}");
+        }
+        println!("45 control cases passed: independent app values, retained formatting, frontmost app and pointer unchanged in the background, and foreground typing kept the value");
     }
 }
