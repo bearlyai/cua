@@ -120,7 +120,7 @@ blind retry except as the table says.
 | `unverifiable` | `BACKGROUND_TEXT_READBACK_UNAVAILABLE` | no | The value cannot be read back, or is known truncated. |
 | `unverifiable` | `BACKGROUND_TEXT_UNEXPECTED_VALUE` | yes | The value changed, but not into the expected value. |
 | `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The value has not changed yet, but the write may still land: it was accepted (on any target, native included, because a toolkit need not apply it before the 200 ms readback poll ends), or it returned an error that is not a clear rejection (for example a busy app's messaging timeout). Inspect the field, never retry blindly. |
-| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled) and the value reads back unchanged. |
+| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was clearly rejected (unsupported attribute, illegal argument, invalid element, action unsupported, not implemented, API disabled) and the value reads back unchanged. |
 
 ### Refusals before a text write
 
