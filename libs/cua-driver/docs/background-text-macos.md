@@ -42,12 +42,18 @@ refuses and writes nothing.
 When a call refuses after the driver itself moved the range (its focus step or
 its own range set), it puts back the range the field had before the call, or a
 caret at the end when that was unreadable, reads it back, and reports
-`range_restored: true|false`. A refusal therefore never leaves behind a
-selection the driver created for a later call, or the person's next keystroke,
-to replace. Restoring the range does not undo the focus move itself.
+`range_restored: true|false`. Restoring the range does not undo the focus move
+itself. When the restore did not hold (`range_restored: false`), the field may
+still hold a selection the driver made, which the next keystroke or a keyboard
+retry would replace: that refusal also carries `retryable: false` and
+`escalation.recommended: "verify_state"` (**new**), and it must not be retried
+with the keyboard until the field has been clicked.
 
-On every background route, focus moves only on targets that are provably
-native, and only in this guarded focus step: the element's ancestor walk must
+On the background routes in this document, focus moves only on targets that
+are provably native, and only in this guarded focus step. The terminal route
+and the pixel form's focus click are outside this rule: a terminal addressed
+by `element_token` has that element focused, and the pixel form clicks the
+field. Provably native means the element's ancestor walk must
 reach its window or the app without passing an `AXWebArea`. A walk that ends
 early (an unreadable role or parent, or more than 40 levels) counts as web
 content: the field is not focused in the background and an accessibility echo
@@ -98,13 +104,8 @@ blind retry except as the table says.
 | `unverifiable` | `BACKGROUND_TEXT_EXACT_READBACK` | no | Exact readback, but the target is web content or not provably native (changed: an incomplete ancestor walk is now in this row). |
 | `unverifiable` | `BACKGROUND_TEXT_READBACK_UNAVAILABLE` | no | The value cannot be read back, or is known truncated. |
 | `unverifiable` | `BACKGROUND_TEXT_UNEXPECTED_VALUE` | yes | The value changed, but not into the expected value. |
-| `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The value has not changed yet, but the write may still land: it returned an error that is not a clear rejection (for example a busy app's messaging timeout), or it was accepted on a target that is web content or not provably native, whose echo can arrive after the readback poll. Inspect the field, never retry blindly. |
-| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled), or accepted on a provably native target, and the value reads back unchanged. |
-
-For an accepted write on a native target, `suspected_noop` relies on AppKit
-applying an `AXSelectedText` write synchronously, before the 200 ms readback
-poll ends. That holds for AppKit and the SwiftUI fields it hosts; it is
-unproven for other native toolkits.
+| `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The value has not changed yet, but the write may still land: it was accepted (on any target, native included, because a toolkit need not apply it before the 200 ms readback poll ends), or it returned an error that is not a clear rejection (for example a busy app's messaging timeout). Inspect the field, never retry blindly. |
+| `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled) and the value reads back unchanged. |
 
 ### Refusals before a text write
 
@@ -137,7 +138,9 @@ instead is:
 ```
 
 Either envelope adds `"range_restored": true|false` when the driver had moved
-the range before refusing (**new field**).
+the range before refusing (**new field**), and with `false` also
+`"retryable": false` and `"escalation": {"recommended": "verify_state", …}`
+(see above).
 
 Routes: **AX** is the background accessibility route, **Keys** the background
 keystroke route's caret and focus checks, **Fg** the foreground route.
@@ -147,8 +150,8 @@ keystroke route's caret and focus checks, **Fg** the foreground route.
 | `BACKGROUND_TEXT_TARGET_UNSUPPORTED` | Keys | **Changed:** `insert_at` `end` or `selection` was passed for a terminal or for a target with no accessibility element. Unsupported roles no longer refuse; they take the keystroke route. |
 | `BACKGROUND_TEXT_VALUE_UNREADABLE` | AX | Cannot read the whole old value, including a detected character-count mismatch. |
 | `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` | AX, Keys | An unfocused target that is web content, or not provably native, cannot use native-only AX focus (changed: now includes an incomplete ancestor walk). **New route:** Keys: an element addressed by `element_token` that does not read `AXFocused` true; the keystroke step never sets focus. |
-| `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | AX | The focus request failed, or was accepted but did not read back within 100 ms. **Changed:** the second case carries `focused_first: true`, because focus may have moved. |
-| `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | AX, Fg | AX: focus created a nonempty selection and the caller did not request end insertion; the range is restored (`range_restored`). **Changed / new route:** Fg: focusing the addressed field selected its whole value and the caret could not be put back; nothing was typed (`path` `key_events_fg` or `key_events`, `focused_first: true`, `range_restored: false`, `posted_keystrokes: 0`). |
+| `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | AX | The focus request was clearly rejected (plain envelope; nothing moved), or it was accepted but did not read back within 100 ms, or (**changed**) it returned an error that is not a clear rejection, such as a busy app's timeout. The last two carry `focused_first: true`, because focus may have moved or still move; after an unclear error the driver sends the range restore behind the request and reports `range_restored`. |
+| `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | AX, Fg | AX: focus created a nonempty selection and the caller did not request end insertion; the range is restored (`range_restored`). **Changed / new route:** Fg: focusing the addressed field selected its whole value and the caret could not be put back; nothing was typed (`path` `key_events_fg` or `key_events`, `focused_first: true`, `range_restored: false`, `retryable: false`, `posted_keystrokes: 0`). |
 | `BACKGROUND_TEXT_CARET_UNAVAILABLE` | AX, Keys | AX: default insertion has no reported caret on a nonempty value. **New route:** Keys: `end` was requested and the caret could not be moved to the end and read back; the old caret is put back (`range_restored`). |
 | `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT` | AX, Keys | AX: default (`caret`) insertion encountered an existing nonempty readable selection; `end` there collapses the selection at the value end and appends instead. **New route:** Keys: default or `end` insertion encountered an existing nonempty readable selection, which keystrokes would replace. |
 | `BACKGROUND_TEXT_SELECTION_UNAVAILABLE` | AX, Keys | Explicit selection replacement has no readable selected range (**new route:** Keys). |
@@ -179,10 +182,13 @@ target process, as before this change, after these checks:
   `BACKGROUND_TEXT_CARET_UNAVAILABLE`; it never types at an unknown position;
 - an unreadable range with the default `caret` types as before.
 
-Whether the call may send keystrokes at all (the synthesis budget, and the
-exact-target gate's `same_pid_keyboard_ambiguity`) is decided before any of
-these checks, so a direct call refuses with those codes before the caret
-moves. When a provably native field reaches this route only after the guarded
+Whether the call may send keystrokes at all is decided before any of these
+checks, so a direct call refuses before the caret moves. Three codes block
+keystrokes while still allowing the accessibility write:
+`type_text_synthesis_budget_exceeded` (the text is over the keystroke budget),
+and the exact-target gate's `same_pid_keyboard_ambiguity` (the app has another
+window that could receive the keys) and `minimized_or_hidden_window` (the
+window is minimized or the app hidden, or that could not be proven). When a provably native field reaches this route only after the guarded
 focus step, those refusals keep their envelopes and add `focused_first: true`
 and, when the range had moved, `range_restored: true|false`.
 
@@ -200,7 +206,11 @@ did not cover it before, the driver restores the pre-focus range (or a caret at
 the end) before any keystroke or accessibility write, and refuses with
 `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` when the restore does not hold. The
 long-text accessibility fallback no longer sets the whole `AXValue` for a
-selection the driver's focus step created.
+selection the driver's focus step created. When the long-text `AXSelectedText`
+write returns an error that is not a clear rejection (a busy app's timeout),
+the call ends as `type_text_indeterminate` (`effect: "indeterminate"`,
+`retryable: false`) with no second write and no keystrokes (**changed**:
+it used to fall through to the whole-value write or to keystrokes).
 
 Guarantee on this route: the driver's own focus step never causes the field's
 existing text to be replaced. A selection the field already had before the
@@ -314,5 +324,10 @@ Keystrokes that were posted but do not show up in the field
 (`type_text_not_delivered`, and `foreground_field_not_accepting`,
 `foreground_focus_lost`, `cancelled` or `type_text_incomplete` with
 `verified_chars: 0` and `posted_keystrokes` above 0) report
-`effect: "unverifiable"`, because they may still land. Exact shapes remain
+`effect: "unverifiable"`, because they may still land. **Changed:**
+`type_text_incomplete` (`effect: "partial"`), where every keystroke was posted
+but only some show, is `retryable: false` with no `retry_from_character`: the
+rest may still arrive, so read the field before typing more. Only
+`foreground_focus_lost` with a verified prefix still names a suffix to retry.
+Exact shapes remain
 owned by `foreground_typing.rs`, `type_text.rs`, and their existing tests.
