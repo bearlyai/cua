@@ -101,17 +101,29 @@ blind retry except as the table says.
 | `unverifiable` | `BACKGROUND_TEXT_WRITE_UNCONFIRMED` | yes | **New.** The value has not changed yet, but the write may still land: it returned an error that is not a clear rejection (for example a busy app's messaging timeout), or it was accepted on a target that is web content or not provably native, whose echo can arrive after the readback poll. Inspect the field, never retry blindly. |
 | `suspected_noop` | `BACKGROUND_TEXT_UNCHANGED` | yes | **Changed:** only when the write was clearly rejected (unsupported attribute, illegal argument, invalid element, not implemented, API disabled), or accepted on a provably native target, and the value reads back unchanged. |
 
+For an accepted write on a native target, `suspected_noop` relies on AppKit
+applying an `AXSelectedText` write synchronously, before the 200 ms readback
+poll ends. That holds for AppKit and the SwiftUI fields it hosts; it is
+unproven for other native toolkits.
+
 ### Refusals before a text write
 
-Every code below returns this envelope, with `CODE` substituted in both places:
+Every code below returns this envelope, with `CODE` substituted in both places
+and `PATH` naming the route that refused (**changed:** keystroke-route
+refusals used to say `"ax"`):
 
 ```json
 {
   "content": [{"type": "text", "text": "Background insertion refused before writing text: CODE."}],
   "isError": true,
-  "structuredContent": {"code": "CODE", "effect": "refused", "path": "ax", "verified": false}
+  "structuredContent": {"code": "CODE", "effect": "refused", "path": "PATH", "verified": false}
 }
 ```
+
+`PATH` is `"ax"` for the background accessibility route, `"key_events"` for
+the background keystroke route's checks (every **Keys** row below, including
+`BACKGROUND_TEXT_TARGET_UNSUPPORTED`), and `"key_events_fg"` or `"key_events"`
+for the foreground row of `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE`.
 
 If the driver asked for focus first, and the request was accepted, the envelope
 instead is:
@@ -120,7 +132,7 @@ instead is:
 {
   "content": [{"type": "text", "text": "Field focused first inside its background window; text insertion refused before writing: CODE."}],
   "isError": true,
-  "structuredContent": {"code": "CODE", "effect": "refused", "path": "ax", "verified": false, "focused_first": true}
+  "structuredContent": {"code": "CODE", "effect": "refused", "path": "PATH", "verified": false, "focused_first": true}
 }
 ```
 
@@ -128,7 +140,7 @@ Either envelope adds `"range_restored": true|false` when the driver had moved
 the range before refusing (**new field**).
 
 Routes: **AX** is the background accessibility route, **Keys** the background
-keystroke route's caret checks, **Fg** the foreground route.
+keystroke route's caret and focus checks, **Fg** the foreground route.
 
 | Code | Routes | Meaning |
 | --- | --- | --- |
@@ -138,7 +150,7 @@ keystroke route's caret checks, **Fg** the foreground route.
 | `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | AX | The focus request failed, or was accepted but did not read back within 100 ms. **Changed:** the second case carries `focused_first: true`, because focus may have moved. |
 | `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | AX, Fg | AX: focus created a nonempty selection and the caller did not request end insertion; the range is restored (`range_restored`). **Changed / new route:** Fg: focusing the addressed field selected its whole value and the caret could not be put back; nothing was typed (`path` `key_events_fg` or `key_events`, `focused_first: true`, `range_restored: false`, `posted_keystrokes: 0`). |
 | `BACKGROUND_TEXT_CARET_UNAVAILABLE` | AX, Keys | AX: default insertion has no reported caret on a nonempty value. **New route:** Keys: `end` was requested and the caret could not be moved to the end and read back; the old caret is put back (`range_restored`). |
-| `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT` | AX, Keys | Default or `end` insertion encountered an existing nonempty readable selection (**new route:** Keys, where keystrokes would replace it). |
+| `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT` | AX, Keys | AX: default (`caret`) insertion encountered an existing nonempty readable selection; `end` there collapses the selection at the value end and appends instead. **New route:** Keys: default or `end` insertion encountered an existing nonempty readable selection, which keystrokes would replace. |
 | `BACKGROUND_TEXT_SELECTION_UNAVAILABLE` | AX, Keys | Explicit selection replacement has no readable selected range (**new route:** Keys). |
 | `BACKGROUND_TEXT_RANGE_INVALID` | AX | Range exceeds the value, overflows, or splits a UTF-16 surrogate pair. |
 | `BACKGROUND_TEXT_RANGE_NOT_RETAINED` | AX | The control rejected or ignored an exact range write, or (**changed**) the range differed when re-read immediately before the write. |
@@ -195,6 +207,13 @@ existing text to be replaced. A selection the field already had before the
 call, including a whole-value one, is replaced as before, because foreground
 typing inserts at the current cursor. Without an `element_token` the driver
 does not focus anything and this check does not apply.
+
+## Known limits
+
+- Background typing addresses the app's key window only. A field in another
+  window of the app does not read focused within 100 ms after the focus step,
+  so it is refused with `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` (`path: "ax"`,
+  `focused_first: true`); nothing is typed.
 
 ## Native control test
 

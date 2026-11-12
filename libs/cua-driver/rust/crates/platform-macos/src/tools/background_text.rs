@@ -129,13 +129,13 @@ fn plan(
     // must already read focused. Focusing it here could select its value for
     // the keystrokes to replace, and web content must not be focused at all.
     if addressed && control.focused() != Some(true) {
-        return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
+        return Plan::Reported(keystroke_refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
     }
     let prior = control.range();
     match keystroke_gate(control, mode) {
         Ok(()) => Plan::Keystrokes,
         Err((code, moved)) => {
-            let mut result = refusal(code);
+            let mut result = keystroke_refusal(code);
             if moved {
                 let restored = prior.is_some_and(|prior| put_back(control, prior));
                 if let Some(structured) = result.structured_content.as_mut() {
@@ -179,18 +179,34 @@ fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), (&'s
     Ok(())
 }
 
-pub(super) fn refusal(code: &str) -> ToolResult {
+/// The accessibility route's path token.
+const AX: &str = "ax";
+/// The background keystroke route's path token.
+const KEYS: &str = "key_events";
+
+/// A refusal before any text write or keystroke on the background route
+/// `path`.
+fn refusal_on(path: &str, code: &str) -> ToolResult {
     ToolResult::error(format!(
         "Background insertion refused before writing text: {code}."
     ))
     .with_structured(
-        serde_json::json!({"code":code,"effect":"refused","path":"ax","verified":false}),
+        serde_json::json!({"code":code,"effect":"refused","path":path,"verified":false}),
     )
 }
 
-fn focused_refusal(code: &str) -> ToolResult {
+/// A refusal on the background keystroke route.
+pub(super) fn keystroke_refusal(code: &str) -> ToolResult {
+    refusal_on(KEYS, code)
+}
+
+fn refusal(code: &str) -> ToolResult {
+    refusal_on(AX, code)
+}
+
+fn focused_refusal(path: &str, code: &str) -> ToolResult {
     ToolResult::error(format!("Field focused first inside its background window; text insertion refused before writing: {code}."))
-        .with_structured(serde_json::json!({"code":code,"effect":"refused","path":"ax","verified":false,"focused_first":true}))
+        .with_structured(serde_json::json!({"code":code,"effect":"refused","path":path,"verified":false,"focused_first":true}))
 }
 
 fn transact(
@@ -219,11 +235,11 @@ fn transact(
         (range_moved.get() || (focused_first && control.range() != prior_range))
             .then(|| put_back(control, restore_to))
     };
-    let refuse = |code: &str| {
+    let refuse_on = |path: &str, code: &str| {
         let mut result = if focused_first {
-            focused_refusal(code)
+            focused_refusal(path, code)
         } else {
-            refusal(code)
+            refusal_on(path, code)
         };
         if let Some(restored) = restore_if_moved() {
             if let Some(structured) = result.structured_content.as_mut() {
@@ -232,6 +248,7 @@ fn transact(
         }
         result
     };
+    let refuse = |code: &str| refuse_on(AX, code);
     if focused_first {
         if !trusted {
             return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
@@ -268,7 +285,7 @@ fn transact(
     // keystroke step, under the same caret rules.
     if !control.selected_text_settable() {
         if addressed && control.focused() != Some(true) {
-            return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
+            return Plan::Reported(refuse_on(KEYS, "BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
         }
         if !keystrokes_allowed {
             return Plan::NoKeystrokes {
@@ -280,7 +297,7 @@ fn transact(
             Ok(()) => Plan::Keystrokes,
             Err((code, moved)) => {
                 range_moved.set(moved);
-                Plan::Reported(refuse(code))
+                Plan::Reported(refuse_on(KEYS, code))
             }
         };
     }
@@ -1446,5 +1463,43 @@ mod tests {
             assert_eq!(c.writes.get(), 0);
             assert_eq!(s["range_restored"], true, "{s}");
         }
+    }
+    #[test]
+    fn a_refusal_names_the_route_that_refused() {
+        // The keystroke route's caret checks.
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        c.range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        let s = reported(plan(&c, InsertAt::Caret, "!", true));
+        assert_eq!(
+            s["code"],
+            "BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT"
+        );
+        assert_eq!(s["path"], "key_events", "{s}");
+        // The keystroke route's focus rule.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        let s = reported(plan(&c, InsertAt::Caret, "!", false));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
+        assert_eq!(s["path"], "key_events", "{s}");
+        // The keystroke route after the guarded focus step.
+        let c = control(false, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        let s = reported(plan(&c, InsertAt::End, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_CARET_UNAVAILABLE");
+        assert_eq!(s["path"], "key_events", "{s}");
+        assert_eq!(s["focused_first"], true, "{s}");
+        // The accessibility route.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.native.set(false);
+        let s = reported(super::plan(&c, InsertAt::Caret, "!", true, true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED");
+        assert_eq!(s["path"], "ax", "{s}");
     }
 }

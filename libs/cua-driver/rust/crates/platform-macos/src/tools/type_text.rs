@@ -1822,9 +1822,9 @@ fn type_text_blocking(
         && !delivery_mode.is_foreground()
         && insert_at != crate::ax::text_range::InsertAt::Caret
     {
-        return Ok(TypeTextDelivery::Reported(super::background_text::refusal(
-            "BACKGROUND_TEXT_TARGET_UNSUPPORTED",
-        )));
+        return Ok(TypeTextDelivery::Reported(
+            super::background_text::keystroke_refusal("BACKGROUND_TEXT_TARGET_UNSUPPORTED"),
+        ));
     }
     if is_terminal_target && !delivery_mode.is_foreground() {
         if let BackgroundKeyboardPolicy::SemanticOnly(refusal) = &keyboard_policy {
@@ -2058,9 +2058,9 @@ fn type_text_blocking(
         }
     } else {
         if insert_at != crate::ax::text_range::InsertAt::Caret {
-            return Ok(TypeTextDelivery::Reported(super::background_text::refusal(
-                "BACKGROUND_TEXT_TARGET_UNSUPPORTED",
-            )));
+            return Ok(TypeTextDelivery::Reported(
+                super::background_text::keystroke_refusal("BACKGROUND_TEXT_TARGET_UNSUPPORTED"),
+            ));
         }
         tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
     }
