@@ -53,7 +53,15 @@ pub(super) enum Plan {
     Keystrokes,
 }
 
-fn plan(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
+/// `addressed`: the element came from an element token, not from the app's
+/// focused element.
+fn plan(
+    control: &impl TextControl,
+    mode: InsertAt,
+    text: &str,
+    trusted: bool,
+    addressed: bool,
+) -> Plan {
     let (role, subrole, protected) = control.role_facts();
     // An unfocused AppKit field reports AXSelectedText as settable only once
     // it is focused, so a native unfocused field goes through the focus step
@@ -61,7 +69,13 @@ fn plan(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -
     if text_range::is_text_entry(&role, subrole.as_deref(), protected)
         && (control.selected_text_settable() || (trusted && control.focused() == Some(false)))
     {
-        return transact(control, mode, text, trusted);
+        return transact(control, mode, text, trusted, addressed);
+    }
+    // The background keystroke step never sets focus, so an addressed element
+    // must already read focused. Focusing it here could select its value for
+    // the keystrokes to replace, and web content must not be focused at all.
+    if addressed && control.focused() != Some(true) {
+        return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
     }
     match keystroke_gate(control, mode) {
         Ok(()) => Plan::Keystrokes,
@@ -111,7 +125,13 @@ fn focused_refusal(code: &str) -> ToolResult {
         .with_structured(serde_json::json!({"code":code,"effect":"refused","path":"ax","verified":false,"focused_first":true}))
 }
 
-fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
+fn transact(
+    control: &impl TextControl,
+    mode: InsertAt,
+    text: &str,
+    trusted: bool,
+    addressed: bool,
+) -> Plan {
     let Some(before) = control.value() else {
         return Plan::Reported(refusal("BACKGROUND_TEXT_VALUE_UNREADABLE"));
     };
@@ -175,6 +195,9 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
     // A field that still takes no AXSelectedText write once focused gets the
     // keystroke step, under the same caret rules.
     if !control.selected_text_settable() {
+        if addressed && control.focused() != Some(true) {
+            return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
+        }
         range_moved.set(mode == InsertAt::End);
         return match keystroke_gate(control, mode) {
             Ok(()) => Plan::Keystrokes,
@@ -419,8 +442,9 @@ pub(super) unsafe fn insert(
     mode: InsertAt,
     text: &str,
     trusted: bool,
+    addressed: bool,
 ) -> Plan {
-    plan(&AxTextControl(element), mode, text, trusted)
+    plan(&AxTextControl(element), mode, text, trusted, addressed)
 }
 
 #[cfg(test)]
@@ -447,6 +471,7 @@ mod tests {
         settable_once_focused: Cell<bool>,
         /// The write is accepted but the value echo has not caught up.
         echo_lags: Cell<bool>,
+        focus_calls: Cell<usize>,
     }
     impl Control {
         fn tick(&self) {
@@ -480,6 +505,7 @@ mod tests {
             self.focused.get()
         }
         fn focus(&self) -> bool {
+            self.focus_calls.set(self.focus_calls.get() + 1);
             if !self.focus_supported.get() {
                 return false;
             }
@@ -538,7 +564,7 @@ mod tests {
             holds,
             writes: Cell::new(0),
             wrong,
-            focused: Cell::new(None),
+            focused: Cell::new(Some(true)),
             focus_range: Cell::new(None),
             focus_supported: Cell::new(true),
             hide_after_write: Cell::new(false),
@@ -550,7 +576,12 @@ mod tests {
             write_result: Cell::new(Write::Accepted),
             settable_once_focused: Cell::new(false),
             echo_lags: Cell::new(false),
+            focus_calls: Cell::new(0),
         }
+    }
+    /// An element addressed by token.
+    fn plan(c: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
+        super::plan(c, mode, text, trusted, true)
     }
     fn transact_result(
         control: &impl TextControl,
@@ -558,7 +589,7 @@ mod tests {
         text: &str,
         trusted: bool,
     ) -> ToolResult {
-        match transact(control, mode, text, trusted) {
+        match transact(control, mode, text, trusted, true) {
             Plan::Reported(result) => result,
             Plan::Keystrokes => panic!("expected the accessibility route"),
         }
@@ -673,6 +704,10 @@ mod tests {
                 false
             }
         }
+    }
+    /// The focused-element path: no element token was passed.
+    fn plan_focused(c: &impl TextControl, mode: InsertAt) -> Plan {
+        super::plan(c, mode, "!", true, false)
     }
     fn reported(p: Plan) -> serde_json::Value {
         match p {
@@ -944,13 +979,78 @@ mod tests {
                 length: 0
             })
         );
-        // Untrusted targets are never focused by this route.
+        // Untrusted targets are never focused, and keystrokes never reach a
+        // field that does not already read focused.
         let c = control(true, false);
         c.focused.set(Some(false));
         c.selected_text_settable.set(false);
         c.settable_once_focused.set(true);
-        assert!(keystrokes(plan(&c, InsertAt::Caret, "!", false)));
+        let s = reported(plan(&c, InsertAt::Caret, "!", false));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED", "{s}");
+        assert_eq!(c.focus_calls.get(), 0);
         assert_eq!(c.focused.get(), Some(false));
+    }
+    #[test]
+    fn the_background_keystroke_step_types_only_into_a_focused_field() {
+        let all = TextRange {
+            location: 0,
+            length: 8,
+        };
+        // An unfocused AppKit field whose parent walk came back incomplete:
+        // untrusted, and not settable until focused. Focusing it would select
+        // the whole value for the keystrokes to replace.
+        for mode in [InsertAt::Caret, InsertAt::End, InsertAt::Selection] {
+            let c = control(true, false);
+            c.focused.set(Some(false));
+            c.selected_text_settable.set(false);
+            c.settable_once_focused.set(true);
+            c.focus_range.set(Some(all));
+            let s = reported(plan(&c, mode, "!", false));
+            assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED", "{mode:?}: {s}");
+            assert_eq!(c.focus_calls.get(), 0, "{mode:?}: focus must not move");
+            assert_eq!(
+                c.range.get(),
+                Some(TextRange {
+                    location: 0,
+                    length: 0
+                })
+            );
+        }
+        // An unfocused browser field addressed by element: web content takes
+        // no AXSelectedText write and is never focused in the background.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        let s = reported(plan(&c, InsertAt::Caret, "!", false));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED", "{s}");
+        assert_eq!(c.focus_calls.get(), 0);
+        // Unreadable focus is not focus.
+        let c = control(true, false);
+        c.focused.set(None);
+        c.selected_text_settable.set(false);
+        let s = reported(plan(&c, InsertAt::Caret, "!", false));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_UNSUPPORTED", "{s}");
+        // A native field that stays non-settable after its guarded focus step
+        // arrives at the keystroke step focused, focused exactly once, and
+        // only after the select-all check.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        c.focus_range.set(Some(all));
+        let s = reported(plan(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE", "{s}");
+        assert_eq!(s["range_restored"], true, "{s}");
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        assert!(keystrokes(plan(&c, InsertAt::End, "!", true)));
+        assert_eq!(c.focus_calls.get(), 1);
+        assert_eq!(c.focused.get(), Some(true));
+        // The focused element itself (no element token) keeps its keystrokes.
+        let c = control(true, false);
+        c.focused.set(None);
+        c.selected_text_settable.set(false);
+        assert!(keystrokes(plan_focused(&c, InsertAt::Caret)));
     }
     #[test]
     fn an_accepted_write_with_no_echo_is_a_noop_only_on_a_native_target() {

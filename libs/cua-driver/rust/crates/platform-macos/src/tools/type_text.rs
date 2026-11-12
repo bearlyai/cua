@@ -80,7 +80,9 @@ fn def() -> &'static ToolDef {
              range writes refuses before any text write, with no keystroke fallback. A field that \
              takes no AXSelectedText write gets keystrokes instead, after the same checks: a \
              readable selection is replaced only with selection, and end refuses unless the caret \
-             provably moved to the end. Confirmation requires the exact old value with that edit, \
+             provably moved to the end. Background keystrokes never move focus: an element_token \
+             target must already be focused, or be a native field the guarded focus step focused; \
+             otherwise use the px form or foreground delivery. Confirmation requires the exact old value with that edit, \
              rather than a substring match.\n\n\
              Optional `element_token` (from the last \
              `get_window_state` snapshot) directs the write to a specific field. \
@@ -1226,12 +1228,18 @@ impl Drop for AncestorRoles {
 /// Type via CGEvent keystrokes at the current insertion point, then verify by
 /// read-back. `type_text` is deliberately non-idempotent: it must never clear
 /// an existing value merely because AX cannot read that value back.
+///
+/// `focus_element`: set `AXFocused` on the element first. The background
+/// keystroke step passes false: its element already reads focused, and a
+/// second focus could select the field's value for the keystrokes to replace.
+#[allow(clippy::too_many_arguments)]
 fn cgevent_type_verified(
     pid: i32,
     text: &str,
     delay_ms: u64,
     before: Option<&str>,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    focus_element: bool,
     settle_ms: u64,
     window_id: Option<u32>,
     cancel: &Cancellation,
@@ -1246,7 +1254,7 @@ fn cgevent_type_verified(
     // window's remembered first responder by now and this write lands *after*
     // it rather than being clobbered by it. Re-applying once on a failed
     // read-back covers apps that install their responder slightly late.
-    if let Some((ptr, _)) = element_ptr_and_idx {
+    if let Some((ptr, _)) = element_ptr_and_idx.filter(|_| focus_element) {
         let _ = crate::input::ax_actions::focus_element(ptr);
         if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
             std::thread::sleep(FOCUS_REAPPLY_DELAY);
@@ -1881,6 +1889,7 @@ fn type_text_blocking(
                 delay_ms,
                 before.as_deref(),
                 element_ptr_and_idx,
+                /*focus_element=*/ true,
                 foreground_settle_ms,
                 window_id,
                 &cancel,
@@ -1956,6 +1965,7 @@ fn type_text_blocking(
             delay_ms,
             before.as_deref(),
             element_ptr_and_idx,
+            /*focus_element=*/ true,
             /*settle_ms=*/ 0,
             window_id,
             &cancel,
@@ -1989,7 +1999,8 @@ fn type_text_blocking(
             Some((element as usize, idx_opt)),
             window_id,
         ));
-        let plan = unsafe { super::background_text::insert(element, insert_at, text, trusted) };
+        let plan =
+            unsafe { super::background_text::insert(element, insert_at, text, trusted, !owns) };
         if owns {
             unsafe {
                 CFRelease(element as _);
@@ -2039,13 +2050,15 @@ fn type_text_blocking(
 
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
-    // insert-at-cursor semantics.
+    // insert-at-cursor semantics. Never focus here either: an addressed element
+    // already reads focused, either as found or after the guarded focus step.
     let (verified, delivered_chars) = cgevent_type_verified(
         pid,
         text,
         delay_ms,
         before.as_deref(),
         element_ptr_and_idx,
+        /*focus_element=*/ false,
         /*settle_ms=*/ 0,
         window_id,
         &cancel,

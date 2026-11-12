@@ -9,7 +9,8 @@ can mean.
 | Background keystrokes | Background delivery and the target takes no `AXSelectedText` write (Chromium / Electron inputs, other roles, secure fields), or no accessibility element was found | `key_events` |
 | Foreground | `delivery_mode: "foreground"` | `key_events_fg`, `ax_fg` |
 
-Terminals, remote desktops and desktop scope keep their own routes, outside
+Terminals, remote desktops and desktop scope keep their own routes (a terminal
+addressed by `element_token` still has that element focused), outside
 this document.
 
 ## Background accessibility route
@@ -45,11 +46,12 @@ caret at the end when that was unreadable, reads it back, and reports
 selection the driver created for a later call, or the person's next keystroke,
 to replace. Restoring the range does not undo the focus move itself.
 
-Focus moves only on targets that are provably native: the element's ancestor
-walk must reach its window or the app without passing an `AXWebArea`. A walk
-that ends early (an unreadable role or parent, or more than 40 levels) counts
-as web content: the field is not focused in the background and an
-accessibility echo is never reported `confirmed`.
+On every background route, focus moves only on targets that are provably
+native, and only in this guarded focus step: the element's ancestor walk must
+reach its window or the app without passing an `AXWebArea`. A walk that ends
+early (an unreadable role or parent, or more than 40 levels) counts as web
+content: the field is not focused in the background and an accessibility echo
+is never reported `confirmed`.
 
 `get_window_state.elements[]` adds these fields for unprotected text entries:
 
@@ -132,7 +134,7 @@ keystroke route's caret checks, **Fg** the foreground route.
 | --- | --- | --- |
 | `BACKGROUND_TEXT_TARGET_UNSUPPORTED` | Keys | **Changed:** `insert_at` `end` or `selection` was passed for a terminal or for a target with no accessibility element. Unsupported roles no longer refuse; they take the keystroke route. |
 | `BACKGROUND_TEXT_VALUE_UNREADABLE` | AX | Cannot read the whole old value, including a detected character-count mismatch. |
-| `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` | AX | An unfocused target that is web content, or not provably native, cannot use native-only AX focus (changed: now includes an incomplete ancestor walk). |
+| `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` | AX, Keys | An unfocused target that is web content, or not provably native, cannot use native-only AX focus (changed: now includes an incomplete ancestor walk). **New route:** Keys: an element addressed by `element_token` that does not read `AXFocused` true; the keystroke step never sets focus. |
 | `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | AX | The focus request failed, or was accepted but did not read back within 100 ms. **Changed:** the second case carries `focused_first: true`, because focus may have moved. |
 | `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | AX, Fg | AX: focus created a nonempty selection and the caller did not request end insertion; the range is restored (`range_restored`). **Changed / new route:** Fg: focusing the addressed field selected its whole value and the caret could not be put back; nothing was typed (`path` `key_events_fg` or `key_events`, `focused_first: true`, `range_restored: false`, `posted_keystrokes: 0`). |
 | `BACKGROUND_TEXT_CARET_UNAVAILABLE` | AX, Keys | AX: default insertion has no reported caret on a nonempty value. **New route:** Keys: `end` was requested and the caret could not be moved to the end and read back. |
@@ -151,10 +153,15 @@ errors do not establish that no input was sent.
 ## Background keystroke route
 
 Fields that take no `AXSelectedText` write get CGEvent keystrokes posted to the
-target process, as before this change, after these checks on the field's
-readable range:
+target process, as before this change, after these checks:
 
-- a readable nonempty selection is replaced only with `insert_at: "selection"`;
+- this step never sets `AXFocused`. An element addressed by `element_token`
+  must already read focused, either as found or after the guarded focus step
+  above (provably native fields only); otherwise
+  `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` before anything is sent. Without an
+  `element_token` the keystrokes go to the app's focused element;
+
+- on the field's readable range, a readable nonempty selection is replaced only with `insert_at: "selection"`;
   otherwise `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT`;
 - `end` sets the range to the end and reads it back, or refuses with
   `BACKGROUND_TEXT_CARET_UNAVAILABLE`; it never types at an unknown position;
@@ -165,11 +172,6 @@ The result is the keystroke route's existing result (`path: "key_events"`,
 refusal, and so on), with `ax_attempt: "rejected"` where it reports one. Web
 content never reports `confirmed`. This is the route the pixel form
 (`x`,`y`) normally reaches in Electron and other web views.
-
-Limit: with an `element_token`, the keystroke step still focuses the element
-(`AXFocused`) right before typing, as it did before this change, and that
-focus is not checked for a new select-all. A native, non-settable field that
-selects all on focus could have its value replaced on this route.
 
 ## Foreground route
 
