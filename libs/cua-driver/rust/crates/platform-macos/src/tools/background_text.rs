@@ -105,16 +105,6 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         if control.value().as_deref() != Some(before.as_str()) {
             return focused_refusal("BACKGROUND_TEXT_VALUE_CHANGED");
         }
-        // Focusing a single-line Cocoa field commonly selects its entire
-        // value. That new selection is not a remembered caret or a selection
-        // the caller observed. Only an explicit append may collapse it.
-        if !before.is_empty()
-            && mode != InsertAt::End
-            && control.range().is_some_and(|r| r.length > 0)
-            && !(mode == InsertAt::Selection && control.range() == prior_range)
-        {
-            return focused_refusal("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
-        }
     }
     let refuse = |code| {
         if focused_first {
@@ -123,7 +113,22 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
             refusal(code)
         }
     };
-    let original_range = control.range();
+    // A toolkit may apply its select-on-focus a moment after AXFocused reads
+    // true. One settled range read drives both the focus guard and the write.
+    let Some(original_range) = settled_range(control) else {
+        return refuse("BACKGROUND_TEXT_RANGE_UNSTABLE");
+    };
+    // Focusing a single-line Cocoa field commonly selects its entire
+    // value. That new selection is not a remembered caret or a selection
+    // the caller observed. Only an explicit append may collapse it.
+    if focused_first
+        && !before.is_empty()
+        && mode != InsertAt::End
+        && original_range.is_some_and(|r| r.length > 0)
+        && !(mode == InsertAt::Selection && original_range == prior_range)
+    {
+        return focused_refusal("BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+    }
     let range = match mode.range(&before, original_range) {
         Ok(r) => r,
         Err(code) => return refuse(code),
@@ -152,8 +157,13 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
     }
     // Setting a range must not edit the value; also catch concurrent edits.
+    // Re-read value, then range, immediately before the write: the decision
+    // holds only for exactly this value and range.
     if control.value().as_deref() != Some(before.as_str()) {
         return refuse("BACKGROUND_TEXT_VALUE_CHANGED");
+    }
+    if control.range() != Some(range) {
+        return refuse("BACKGROUND_TEXT_RANGE_NOT_RETAINED");
     }
     let accepted = control.insert(text);
     // Native apps may update AXValue on their next main-loop turn. Poll only
@@ -209,6 +219,24 @@ fn transact(control: &impl TextControl, mode: InsertAt, text: &str, trusted: boo
         "readback_available":after.is_some(), "value_changed":changed, "focused_first":focused_first,
     }));
     result
+}
+
+/// The selected range once two consecutive reads agree (unreadable counts as
+/// a reading), polled for at most 150 ms; `None` when it never settles.
+fn settled_range(control: &impl TextControl) -> Option<Option<TextRange>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    let mut last = control.range();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let next = control.range();
+        if next == last {
+            return Some(next);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        last = next;
+    }
 }
 
 struct AxTextControl(AXUIElementRef);
@@ -289,6 +317,29 @@ mod tests {
         hide_after_write: Cell<bool>,
         role: RefCell<String>,
         selected_text_settable: Cell<bool>,
+        /// A select-all that lands this many value/range reads after focus.
+        late_select_after: Cell<Option<usize>>,
+        late_armed: Cell<Option<usize>>,
+    }
+    impl Control {
+        fn tick(&self) {
+            match self.late_armed.get() {
+                Some(0) => {
+                    let len = self
+                        .value
+                        .borrow()
+                        .as_deref()
+                        .map_or(0, |v| v.encode_utf16().count());
+                    self.range.set(Some(TextRange {
+                        location: 0,
+                        length: len,
+                    }));
+                    self.late_armed.set(None);
+                }
+                Some(n) => self.late_armed.set(Some(n - 1)),
+                None => {}
+            }
+        }
     }
     impl TextControl for Control {
         fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
@@ -306,15 +357,18 @@ mod tests {
             }
             self.focused.set(Some(true));
             self.range.set(self.focus_range.get());
+            self.late_armed.set(self.late_select_after.get());
             true
         }
         fn value(&self) -> Option<String> {
+            self.tick();
             if self.hide_after_write.get() && self.writes.get() > 0 {
                 return None;
             }
             self.value.borrow().clone()
         }
         fn range(&self) -> Option<TextRange> {
+            self.tick();
             self.range.get()
         }
         fn set_range(&self, r: TextRange) -> bool {
@@ -325,7 +379,11 @@ mod tests {
         }
         fn insert(&self, t: &str) -> bool {
             self.writes.set(self.writes.get() + 1);
-            let v = self.value();
+            // The write itself is not a read: a late selection that lands
+            // after the last check cannot be observed by any reader.
+            let v = (!self.hide_after_write.get())
+                .then(|| self.value.borrow().clone())
+                .flatten();
             *self.value.borrow_mut() = v.and_then(|v| {
                 if self.wrong {
                     Some(t.to_string())
@@ -352,6 +410,8 @@ mod tests {
             hide_after_write: Cell::new(false),
             role: RefCell::new("AXTextField".into()),
             selected_text_settable: Cell::new(true),
+            late_select_after: Cell::new(None),
+            late_armed: Cell::new(None),
         }
     }
     fn state(r: ToolResult) -> serde_json::Value {
@@ -540,5 +600,25 @@ mod tests {
             "BACKGROUND_TEXT_SELECTION_UNAVAILABLE"
         );
         assert_eq!(c.writes.get(), 0);
+    }
+    #[test]
+    fn a_selection_that_lands_after_focus_is_never_replaced() {
+        for mode in [InsertAt::Caret, InsertAt::Selection, InsertAt::End] {
+            for late in 0..12 {
+                let c = control(true, false);
+                c.focused.set(Some(false));
+                c.focus_range.set(Some(TextRange {
+                    location: 8,
+                    length: 0,
+                }));
+                c.late_select_after.set(Some(late));
+                let s = state(transact(&c, mode, "!", true));
+                let value = c.value.borrow().clone().unwrap();
+                assert!(
+                    value.contains("Original"),
+                    "{mode:?} with a select-all {late} reads after focus replaced the value: {value:?} ({s})"
+                );
+            }
+        }
     }
 }
