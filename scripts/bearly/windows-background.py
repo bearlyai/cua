@@ -35,6 +35,7 @@ user = ctypes.WinDLL('user32', use_last_error=True)
 kernel = ctypes.WinDLL('kernel32', use_last_error=True)
 advapi = ctypes.WinDLL('advapi32', use_last_error=True)
 user.GetForegroundWindow.restype = wintypes.HWND
+user.IsWindowEnabled.argtypes = [wintypes.HWND]
 user.SetForegroundWindow.argtypes = [wintypes.HWND]
 user.WindowFromPoint.argtypes = [wintypes.POINT]
 user.WindowFromPoint.restype = wintypes.HWND
@@ -103,6 +104,9 @@ fixture.write_text(r'''
 param([string]$Folder, [string]$Name, [int]$Left, [int]$Top, [int]$Width, [int]$Height, [int]$Red, [int]$Green, [int]$Blue)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# Log fixture exceptions instead of opening WinForms' modal error dialog.
+[Windows.Forms.Application]::SetUnhandledExceptionMode([Windows.Forms.UnhandledExceptionMode]::CatchException)
+[Windows.Forms.Application]::add_ThreadException({ param($sender, $e) Add-Content (Join-Path $Folder "$Name-errors.log") $e.Exception.ToString() })
 $form = New-Object Windows.Forms.Form
 $form.Text = $Name
 $form.StartPosition = 'Manual'
@@ -142,12 +146,20 @@ $form.Add_KeyDown({ [void]$script:keys.Add($_.KeyData.ToString()) })
 $form.Controls.AddRange(@($empty, $filled, $button, $check, $slider, $list))
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 50
+$script:writeErrors = 0
 $timer.Add_Tick({
   $active = if ($form.ActiveControl) { $form.ActiveControl.AccessibleName } else { '' }
-  @{ pid=$PID; hwnd=$form.Handle.ToInt64(); clicks=$script:clicks; empty=$empty.Text; filled=$filled.Text
+  $json = @{ pid=$PID; hwnd=$form.Handle.ToInt64(); clicks=$script:clicks; empty=$empty.Text; filled=$filled.Text
      filled_caret=$filled.SelectionStart; filled_selection=$filled.SelectionLength; checked=$check.Checked
-     slider=$slider.Value; list_top=$list.TopIndex; keys=@($script:keys); active=$active; focused=$form.ContainsFocus } |
-    ConvertTo-Json -Compress | Set-Content -Encoding UTF8 (Join-Path $Folder "$Name.json")
+     slider=$slider.Value; list_top=$list.TopIndex; keys=@($script:keys); active=$active; focused=$form.ContainsFocus
+     write_errors=$script:writeErrors } | ConvertTo-Json -Compress
+  # Never let a state write raise: an unhandled WinForms exception opens a modal
+  # error dialog that disables the fixture for the rest of the run.
+  try {
+    $temp = Join-Path $Folder "$Name.json.tmp"
+    [IO.File]::WriteAllText($temp, $json)
+    Move-Item -Force $temp (Join-Path $Folder "$Name.json")
+  } catch { $script:writeErrors++ }
 })
 # Caret inside the non-empty field: "hello| world".
 $form.Add_Shown({ $form.ActiveControl = $filled; $filled.Select(5, 0); $timer.Start() })
@@ -166,7 +178,13 @@ facts['session_id'] = sid.value
 
 
 def state(name):
-    return json.loads((out / (name + '.json')).read_text(encoding='utf-8-sig'))
+    for attempt in range(40):
+        try:
+            return json.loads((out / (name + '.json')).read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
 
 
 def wait_for(probe, timeout):
@@ -259,6 +277,7 @@ def measure(route, operation, effect, timeout=4, mode='background'):
     target_after, sentinel_after = state('Target'), state('Sentinel')
     record = {
         'route': route, 'delivery_mode': mode, 'effect_observed': worked,
+        'target_window_enabled': bool(user.IsWindowEnabled(target['hwnd'])),
         'sentinel_in_front_before': sentinel_front, 'target_hwnd': target['hwnd'], 'sentinel_hwnd': sentinel['hwnd'],
         'foreground_before': fg_before, 'foreground_after': foreground(), 'foreground_changes_sampled': changes,
         'target_became_foreground': target['hwnd'] in changes,
