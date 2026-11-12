@@ -450,11 +450,9 @@ pub(crate) fn keystroke_result(
 
     let landed = in_field(verified, requested);
     let retry_from = verified.filter(|n| *n > 0 && *n < requested);
-    let retryable = retry_from.is_some()
-        && matches!(
-            report.stop,
-            KeystrokeStop::FocusLost | KeystrokeStop::Completed
-        );
+    // Only a stop on lost focus names a suffix to retry. When every
+    // keystroke went out, the unshown tail may still arrive.
+    let retryable = retry_from.is_some() && report.stop == KeystrokeStop::FocusLost;
     let (code, message, escalation) = match report.stop {
         KeystrokeStop::FieldUnchanged => (
             "foreground_field_not_accepting",
@@ -488,10 +486,12 @@ pub(crate) fn keystroke_result(
         ),
         KeystrokeStop::Completed => (
             "type_text_incomplete",
-            format!("Typed {posted} keystroke(s) but {landed}."),
+            format!(
+                "Typed {posted} keystroke(s) but {landed} so far; the rest may still arrive. Read the field before typing more."
+            ),
             Some((
                 "verify_state",
-                "Re-read the field before deciding whether any text remains to be typed.",
+                "The rest of the text may still arrive; read the field before typing more.",
             )),
         ),
     };
@@ -1111,6 +1111,29 @@ mod tests {
         assert_eq!(s["verified_chars"], 12);
         assert_eq!(s["retryable"], true);
         assert_eq!(s["retry_from_character"], 12);
+    }
+
+    #[test]
+    fn keystrokes_that_all_went_out_but_partly_show_are_not_retried() {
+        let result = keystroke_result(
+            "key_events_fg",
+            40,
+            KeystrokeReport {
+                posted: 40,
+                stop: KeystrokeStop::Completed,
+            },
+            Some(12),
+            "",
+            false,
+        );
+        let text = format!("{:?}", result.content);
+        let s = result.structured_content.unwrap();
+        assert_eq!(s["code"], "type_text_incomplete");
+        assert_eq!(s["effect"], "partial");
+        assert_eq!(s["retryable"], false, "the tail may still land: {s}");
+        assert!(s.get("retry_from_character").is_none(), "{s}");
+        assert!(!text.contains("Retry only the remaining suffix"), "{text}");
+        assert!(text.contains("may still arrive"), "{text}");
     }
 
     #[test]

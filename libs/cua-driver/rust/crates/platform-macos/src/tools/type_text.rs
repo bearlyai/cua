@@ -1366,8 +1366,10 @@ fn incomplete_result(outcome: &TypeTextOutcome, requested: usize) -> ToolResult 
             },
         }));
     }
+    // Every keystroke was posted; the rest may still arrive, so typing the
+    // tail again could type it twice.
     ToolResult::error(format!(
-        "type_text incomplete: {delivered} of {requested} character(s) are in the field{}; retry only the remaining suffix",
+        "type_text incomplete: {delivered} of {requested} character(s) are in the field so far{}; the rest may still arrive. Read the field before typing more.",
         outcome.detail
     ))
     .with_structured(serde_json::json!({
@@ -1376,8 +1378,11 @@ fn incomplete_result(outcome: &TypeTextOutcome, requested: usize) -> ToolResult 
         "effect": "partial",
         "requested_chars": requested,
         "verified_chars": delivered,
-        "retryable": true,
-        "retry_from_character": delivered,
+        "retryable": false,
+        "escalation": {
+            "recommended": "verify_state",
+            "reason": "The rest of the text may still arrive; read the field before typing more.",
+        },
     }))
 }
 
@@ -2308,6 +2313,24 @@ mod tests {
             assert_eq!(s["effect"], "unverifiable", "keystrokes were posted: {s}");
             assert_eq!(s["retryable"], false);
         }
+    }
+    #[test]
+    fn a_partly_shown_delivery_says_the_rest_may_still_arrive() {
+        let outcome = TypeTextOutcome {
+            detail: String::new(),
+            path: PATH_KEY_EVENTS,
+            verified: false,
+            delivered_chars: Some(2),
+        };
+        let result = incomplete_result(&outcome, 5);
+        let text = format!("{:?}", result.content);
+        let s = result.structured_content.unwrap();
+        assert_eq!(s["code"], "type_text_incomplete");
+        assert_eq!(s["effect"], "partial");
+        assert_eq!(s["retryable"], false, "the tail may still land: {s}");
+        assert!(s.get("retry_from_character").is_none(), "{s}");
+        assert!(!text.contains("retry only the remaining suffix"), "{text}");
+        assert!(text.contains("may still arrive"), "{text}");
     }
     #[test]
     fn a_keystroke_block_that_left_a_selection_is_not_retryable() {
