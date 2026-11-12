@@ -31,9 +31,9 @@ pub(super) trait TextControl {
     fn focused(&self) -> Option<bool> {
         None
     }
-    /// Ask for focus; true when the request itself was accepted.
-    fn focus(&self) -> bool {
-        false
+    /// Ask for focus; how the request itself answered.
+    fn focus(&self) -> Write {
+        Write::Rejected
     }
     /// Role, subrole and protected-content flag of the element.
     fn role_facts(&self) -> (String, Option<String>, Option<bool>);
@@ -44,7 +44,7 @@ pub(super) trait TextControl {
     fn provably_native(&self) -> bool;
 }
 
-/// How the text write itself answered.
+/// How a text write, or a focus request, itself answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Write {
     Accepted,
@@ -253,8 +253,17 @@ fn transact(
         if !trusted {
             return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
         }
-        if !control.focus() {
-            return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
+        match control.focus() {
+            Write::Accepted => {}
+            Write::Rejected => {
+                return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
+            }
+            // A busy app can still apply the request later, and selecting
+            // on focus with it: send the restore behind it all the same.
+            Write::Uncertain => {
+                range_moved.set(true);
+                return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_NOT_RETAINED"));
+            }
         }
         // The request was accepted, so focus may have moved even when it
         // does not read back in time.
@@ -464,10 +473,10 @@ pub(super) fn foreground_focus(
     settle: std::time::Duration,
 ) -> Result<ForegroundFocus, ()> {
     let before_focus = control.range();
-    control.focus();
+    let _ = control.focus();
     if !is_focused() {
         std::thread::sleep(reapply_after);
-        control.focus();
+        let _ = control.focus();
     }
     std::thread::sleep(settle);
     undo_focus_select_all(control, before_focus)
@@ -524,8 +533,8 @@ impl TextControl for AxTextControl {
     fn focused(&self) -> Option<bool> {
         unsafe { copy_bool_attr(self.0, "AXFocused") }
     }
-    fn focus(&self) -> bool {
-        unsafe { set_bool_attr_true(self.0, "AXFocused") == kAXErrorSuccess }
+    fn focus(&self) -> Write {
+        write_outcome(unsafe { set_bool_attr_true(self.0, "AXFocused") })
     }
     fn value(&self) -> Option<String> {
         unsafe {
@@ -614,6 +623,9 @@ mod tests {
         /// A select-all that lands this long after focus, by the clock.
         select_all_after: Cell<Option<std::time::Duration>>,
         select_all_at: Cell<Option<std::time::Instant>>,
+        /// The focus request errors without a clear rejection (a busy app).
+        focus_uncertain: Cell<bool>,
+        range_sets: Cell<usize>,
     }
     impl Control {
         fn select_all(&self) {
@@ -668,13 +680,16 @@ mod tests {
         fn focused(&self) -> Option<bool> {
             self.focused.get()
         }
-        fn focus(&self) -> bool {
+        fn focus(&self) -> Write {
             self.focus_calls.set(self.focus_calls.get() + 1);
+            if self.focus_uncertain.get() {
+                return Write::Uncertain;
+            }
             if !self.focus_supported.get() {
-                return false;
+                return Write::Rejected;
             }
             if !self.focus_sticks.get() {
-                return true;
+                return Write::Accepted;
             }
             self.focused.set(Some(true));
             self.range.set(self.focus_range.get());
@@ -684,7 +699,7 @@ mod tests {
                     .get()
                     .map(|after| std::time::Instant::now() + after),
             );
-            true
+            Write::Accepted
         }
         fn value(&self) -> Option<String> {
             self.tick();
@@ -698,6 +713,7 @@ mod tests {
             self.range.get()
         }
         fn set_range(&self, r: TextRange) -> bool {
+            self.range_sets.set(self.range_sets.get() + 1);
             if let Some(wrong) = self.misplace_next_set.take() {
                 self.range.set(Some(wrong));
             } else if self.holds {
@@ -771,6 +787,8 @@ mod tests {
             native: Cell::new(true),
             select_all_after: Cell::new(None),
             select_all_at: Cell::new(None),
+            focus_uncertain: Cell::new(false),
+            range_sets: Cell::new(0),
         }
     }
     /// An element addressed by token.
@@ -1066,7 +1084,7 @@ mod tests {
             fn focused(&self) -> Option<bool> {
                 self.0.focused()
             }
-            fn focus(&self) -> bool {
+            fn focus(&self) -> Write {
                 self.0.focus()
             }
             fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
@@ -1522,5 +1540,29 @@ mod tests {
             );
             assert_eq!(c.value().as_deref(), Some(value), "a second write ran");
         }
+    }
+    #[test]
+    fn a_focus_request_that_errors_unclearly_is_treated_as_sent() {
+        // A busy app can apply a timed-out focus later and select the whole
+        // value. The refusal sends the restore behind it and says focus may
+        // have moved.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_uncertain.set(true);
+        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+        assert_eq!(s["focused_first"], true, "focus may have moved: {s}");
+        assert_eq!(c.range_sets.get(), 1, "the restore must be sent: {s}");
+        assert_eq!(s["range_restored"], true, "{s}");
+        assert_eq!(c.writes.get(), 0);
+        // A clear rejection moved nothing: the plain refusal, nothing sent.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_supported.set(false);
+        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_NOT_RETAINED");
+        assert!(s.get("focused_first").is_none(), "{s}");
+        assert!(s.get("range_restored").is_none(), "{s}");
+        assert_eq!(c.range_sets.get(), 0);
     }
 }
