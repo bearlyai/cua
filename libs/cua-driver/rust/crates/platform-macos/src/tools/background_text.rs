@@ -378,10 +378,10 @@ fn transact(
     }
     let exact = after.as_deref() == Some(expected.as_str());
     let changed = after.as_deref().is_some_and(|s| s != before);
-    // Unchanged proves nothing landed only after a clear rejection, or an
-    // accepted write on a native target (AppKit applies it synchronously).
-    // Web content can accept the write and echo it after this poll ends.
-    let landing_unknown = write == Write::Uncertain || (accepted && !trusted);
+    // Unchanged proves nothing landed only after a clear rejection. Web
+    // content can accept the write and echo it after this poll ends, and a
+    // native toolkit need not apply it synchronously.
+    let landing_unknown = write != Write::Rejected;
     let effect = if exact && trusted {
         "confirmed"
     } else if after.is_none() || exact || landing_unknown {
@@ -1291,7 +1291,7 @@ mod tests {
         assert!(keystrokes(plan_focused(&c, InsertAt::Caret)));
     }
     #[test]
-    fn an_accepted_write_with_no_echo_is_a_noop_only_on_a_native_target() {
+    fn an_accepted_write_with_no_echo_is_never_a_noop() {
         // Web content can accept the write and echo it after the readback
         // poll ends: the text may still land, so it must not invite a retry.
         let c = control(true, false);
@@ -1303,12 +1303,16 @@ mod tests {
         );
         assert_eq!(s["code"], "BACKGROUND_TEXT_WRITE_UNCONFIRMED");
         assert_eq!(c.writes.get(), 1);
-        // AppKit applies the write synchronously: unchanged means nothing landed.
+        // Native targets too: an accepted write proves nothing about when a
+        // toolkit applies it.
         let c = control(true, false);
         c.echo_lags.set(true);
         let s = state(transact_result(&c, InsertAt::End, "!", true));
-        assert_eq!(s["effect"], "suspected_noop", "{s}");
-        assert_eq!(s["code"], "BACKGROUND_TEXT_UNCHANGED");
+        assert_eq!(
+            s["effect"], "unverifiable",
+            "an accepted write on a native target may still land: {s}"
+        );
+        assert_eq!(s["code"], "BACKGROUND_TEXT_WRITE_UNCONFIRMED");
         // A clear rejection wrote nothing, on any target.
         let c = control(true, false);
         c.write_result.set(Write::Rejected);
