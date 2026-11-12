@@ -307,6 +307,10 @@ mod native {
                         "{kind}/{case}: {result}"
                     );
                     assert_eq!(after[kind], "Original");
+                    assert_eq!(
+                        s["range_restored"], true,
+                        "the refusal must undo the focus selection: {kind}/{case}: {result}"
+                    );
                 } else {
                     let expected = match case {
                         "fresh_end" | "fresh_caret" | "fresh_selection" => "Original!",
@@ -317,7 +321,7 @@ mod native {
                     assert_eq!(s["effect"], "confirmed", "{kind}/{case}: {result}");
                     assert_eq!(after[kind], expected, "{kind}/{case}: {result}");
                 }
-                println!("{kind:6} {case:17} effect={} code={} focused_first={} before_range={} value={}", s["effect"],s["code"],s["focused_first"],entry["selected_text_range"],after[kind]);
+                println!("{kind:6} {case:17} effect={} code={} focused_first={} range_restored={} before_range={} value={}", s["effect"],s["code"],s["focused_first"],s["range_restored"],entry["selected_text_range"],after[kind]);
                 if matches!(case, "fresh_end" | "empty") {
                     assert_eq!(
                         s["focused_first"], true,
