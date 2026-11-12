@@ -1993,14 +1993,32 @@ fn type_text_blocking(
         },
     };
     let mut ax_attempt = AxAttempt::NotAttempted;
+    // Whether this call may send keystrokes at all is known before anything
+    // moves, so a field that needs them is refused before its caret or focus
+    // is touched.
+    let synthesis_refusal = synthesis_preflight(
+        TextDeliveryRoute::UnicodeSynthesis,
+        text.chars().count(),
+        delay_ms,
+    );
+    let keystrokes_allowed = !matches!(keyboard_policy, BackgroundKeyboardPolicy::SemanticOnly(_))
+        && synthesis_refusal.is_none();
     if let Some((element, owns, idx_opt)) = ax_target {
         let trusted = background_text_trusted(classify_target_web_area(
             pid,
             Some((element as usize, idx_opt)),
             window_id,
         ));
-        let plan =
-            unsafe { super::background_text::insert(element, insert_at, text, trusted, !owns) };
+        let plan = unsafe {
+            super::background_text::insert(
+                element,
+                insert_at,
+                text,
+                trusted,
+                !owns,
+                keystrokes_allowed,
+            )
+        };
         if owns {
             unsafe {
                 CFRelease(element as _);
@@ -2009,6 +2027,30 @@ fn type_text_blocking(
         match plan {
             super::background_text::Plan::Reported(result) => {
                 return Ok(TypeTextDelivery::Reported(result))
+            }
+            super::background_text::Plan::NoKeystrokes {
+                focused_first,
+                range_restored,
+            } => {
+                let mut result = match (&keyboard_policy, &synthesis_refusal) {
+                    (BackgroundKeyboardPolicy::SemanticOnly(refusal), _) => {
+                        let wid = window_id.expect("semantic-only requires a window target");
+                        super::background_refusal_result(pid, wid, refusal)
+                    }
+                    (_, Some(refusal)) => {
+                        synthesis_refusal_result(PATH_KEY_EVENTS, refusal, AxAttempt::Rejected)
+                    }
+                    _ => unreachable!("keystrokes are refused only for these reasons"),
+                };
+                if let Some(structured) = result.structured_content.as_mut() {
+                    if focused_first {
+                        structured["focused_first"] = true.into();
+                    }
+                    if let Some(restored) = range_restored {
+                        structured["range_restored"] = restored.into();
+                    }
+                }
+                return Ok(TypeTextDelivery::Reported(result));
             }
             // Chromium / Electron inputs and other roles take no
             // AXSelectedText write: type the text instead.
@@ -2036,11 +2078,7 @@ fn type_text_blocking(
         return Ok(TypeTextDelivery::Refused(refusal));
     }
 
-    if let Some(refusal) = synthesis_preflight(
-        TextDeliveryRoute::UnicodeSynthesis,
-        text.chars().count(),
-        delay_ms,
-    ) {
+    if let Some(refusal) = synthesis_refusal {
         return Ok(TypeTextDelivery::SynthesisRefused {
             path: PATH_KEY_EVENTS,
             refusal,

@@ -51,16 +51,31 @@ pub(super) enum Plan {
     Reported(ToolResult),
     /// The field takes no `AXSelectedText` write: use the keystroke step.
     Keystrokes,
+    /// The field needs keystrokes, which the caller does not allow for this
+    /// call; nothing was sent. Says whether the focus step ran and, when the
+    /// driver had moved the range, whether it was put back.
+    NoKeystrokes {
+        focused_first: bool,
+        range_restored: Option<bool>,
+    },
+}
+
+/// Set `to` and read it back.
+fn put_back(control: &impl TextControl, to: TextRange) -> bool {
+    control.set_range(to) && control.range() == Some(to)
 }
 
 /// `addressed`: the element came from an element token, not from the app's
-/// focused element.
+/// focused element. `keystrokes_allowed`: false when the caller already knows
+/// it may not send keystrokes for this call (the keystroke budget, or keyboard
+/// ambiguity within the app), so that is settled before anything moves.
 fn plan(
     control: &impl TextControl,
     mode: InsertAt,
     text: &str,
     trusted: bool,
     addressed: bool,
+    keystrokes_allowed: bool,
 ) -> Plan {
     let (role, subrole, protected) = control.role_facts();
     // An unfocused AppKit field reports AXSelectedText as settable only once
@@ -69,7 +84,13 @@ fn plan(
     if text_range::is_text_entry(&role, subrole.as_deref(), protected)
         && (control.selected_text_settable() || (trusted && control.focused() == Some(false)))
     {
-        return transact(control, mode, text, trusted, addressed);
+        return transact(control, mode, text, trusted, addressed, keystrokes_allowed);
+    }
+    if !keystrokes_allowed {
+        return Plan::NoKeystrokes {
+            focused_first: false,
+            range_restored: None,
+        };
     }
     // The background keystroke step never sets focus, so an addressed element
     // must already read focused. Focusing it here could select its value for
@@ -77,20 +98,37 @@ fn plan(
     if addressed && control.focused() != Some(true) {
         return Plan::Reported(refusal("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
     }
+    let prior = control.range();
     match keystroke_gate(control, mode) {
         Ok(()) => Plan::Keystrokes,
-        Err(code) => Plan::Reported(refusal(code)),
+        Err((code, moved)) => {
+            let mut result = refusal(code);
+            if moved {
+                let restored = prior.is_some_and(|prior| put_back(control, prior));
+                if let Some(structured) = result.structured_content.as_mut() {
+                    structured["range_restored"] = restored.into();
+                }
+            }
+            Plan::Reported(result)
+        }
     }
 }
 
 /// Caret rules for a field that takes keystrokes instead of an
 /// `AXSelectedText` write. Keystrokes replace a selection and type at the
 /// caret, so a readable selection is replaced only on request, and `end`
-/// types only once the caret provably sits at the end.
-fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), &'static str> {
+/// types only once the caret provably sits at the end. A refusal says whether
+/// the gate itself asked to move the caret.
+fn keystroke_gate(
+    control: &impl TextControl,
+    mode: InsertAt,
+) -> Result<(), (&'static str, bool)> {
     let range = control.range();
     if mode != InsertAt::Selection && range.is_some_and(|r| r.length > 0) {
-        return Err("BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT");
+        return Err((
+            "BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT",
+            false,
+        ));
     }
     match mode {
         InsertAt::End => {
@@ -98,12 +136,12 @@ fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), &'st
                 location: v.encode_utf16().count(),
                 length: 0,
             });
-            if !end.is_some_and(|end| control.set_range(end) && control.range() == Some(end)) {
-                return Err("BACKGROUND_TEXT_CARET_UNAVAILABLE");
+            if !end.is_some_and(|end| put_back(control, end)) {
+                return Err(("BACKGROUND_TEXT_CARET_UNAVAILABLE", end.is_some()));
             }
         }
         InsertAt::Selection if range.is_none() => {
-            return Err("BACKGROUND_TEXT_SELECTION_UNAVAILABLE");
+            return Err(("BACKGROUND_TEXT_SELECTION_UNAVAILABLE", false));
         }
         // An unreadable caret keeps the keystroke step it always had.
         _ => {}
@@ -131,6 +169,7 @@ fn transact(
     text: &str,
     trusted: bool,
     addressed: bool,
+    keystrokes_allowed: bool,
 ) -> Plan {
     let Some(before) = control.value() else {
         return Plan::Reported(refusal("BACKGROUND_TEXT_VALUE_UNREADABLE"));
@@ -146,14 +185,17 @@ fn transact(
         length: 0,
     });
     let range_moved = std::cell::Cell::new(false);
+    let restore_if_moved = || {
+        (range_moved.get() || (focused_first && control.range() != prior_range))
+            .then(|| put_back(control, restore_to))
+    };
     let refuse = |code: &str| {
         let mut result = if focused_first {
             focused_refusal(code)
         } else {
             refusal(code)
         };
-        if range_moved.get() || (focused_first && control.range() != prior_range) {
-            let restored = control.set_range(restore_to) && control.range() == Some(restore_to);
+        if let Some(restored) = restore_if_moved() {
             if let Some(structured) = result.structured_content.as_mut() {
                 structured["range_restored"] = restored.into();
             }
@@ -198,10 +240,18 @@ fn transact(
         if addressed && control.focused() != Some(true) {
             return Plan::Reported(refuse("BACKGROUND_TEXT_FOCUS_UNSUPPORTED"));
         }
-        range_moved.set(mode == InsertAt::End);
+        if !keystrokes_allowed {
+            return Plan::NoKeystrokes {
+                focused_first,
+                range_restored: restore_if_moved(),
+            };
+        }
         return match keystroke_gate(control, mode) {
             Ok(()) => Plan::Keystrokes,
-            Err(code) => Plan::Reported(refuse(code)),
+            Err((code, moved)) => {
+                range_moved.set(moved);
+                Plan::Reported(refuse(code))
+            }
         };
     }
     let range = match mode.range(&before, original_range) {
@@ -443,8 +493,16 @@ pub(super) unsafe fn insert(
     text: &str,
     trusted: bool,
     addressed: bool,
+    keystrokes_allowed: bool,
 ) -> Plan {
-    plan(&AxTextControl(element), mode, text, trusted, addressed)
+    plan(
+        &AxTextControl(element),
+        mode,
+        text,
+        trusted,
+        addressed,
+        keystrokes_allowed,
+    )
 }
 
 #[cfg(test)]
@@ -472,6 +530,8 @@ mod tests {
         /// The write is accepted but the value echo has not caught up.
         echo_lags: Cell<bool>,
         focus_calls: Cell<usize>,
+        /// The next range set lands here instead of where it was asked to.
+        misplace_next_set: Cell<Option<TextRange>>,
     }
     impl Control {
         fn tick(&self) {
@@ -529,7 +589,9 @@ mod tests {
             self.range.get()
         }
         fn set_range(&self, r: TextRange) -> bool {
-            if self.holds {
+            if let Some(wrong) = self.misplace_next_set.take() {
+                self.range.set(Some(wrong));
+            } else if self.holds {
                 self.range.set(Some(r));
             }
             true
@@ -577,11 +639,12 @@ mod tests {
             settable_once_focused: Cell::new(false),
             echo_lags: Cell::new(false),
             focus_calls: Cell::new(0),
+            misplace_next_set: Cell::new(None),
         }
     }
     /// An element addressed by token.
     fn plan(c: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
-        super::plan(c, mode, text, trusted, true)
+        super::plan(c, mode, text, trusted, true, true)
     }
     fn transact_result(
         control: &impl TextControl,
@@ -589,9 +652,9 @@ mod tests {
         text: &str,
         trusted: bool,
     ) -> ToolResult {
-        match transact(control, mode, text, trusted, true) {
+        match transact(control, mode, text, trusted, true, true) {
             Plan::Reported(result) => result,
-            Plan::Keystrokes => panic!("expected the accessibility route"),
+            _ => panic!("expected the accessibility route"),
         }
     }
     fn state(r: ToolResult) -> serde_json::Value {
@@ -703,16 +766,17 @@ mod tests {
                 eprintln!("got accessibility result {}", state(r));
                 false
             }
+            Plan::NoKeystrokes { .. } => false,
         }
     }
     /// The focused-element path: no element token was passed.
     fn plan_focused(c: &impl TextControl, mode: InsertAt) -> Plan {
-        super::plan(c, mode, "!", true, false)
+        super::plan(c, mode, "!", true, false, true)
     }
     fn reported(p: Plan) -> serde_json::Value {
         match p {
             Plan::Reported(r) => state(r),
-            Plan::Keystrokes => panic!("expected a refusal before the keystroke step"),
+            _ => panic!("expected a refusal before the keystroke step"),
         }
     }
     #[test]
@@ -1077,5 +1141,78 @@ mod tests {
         let s = state(transact_result(&c, InsertAt::End, "!", false));
         assert_eq!(s["effect"], "suspected_noop", "{s}");
         assert_eq!(s["code"], "BACKGROUND_TEXT_UNCHANGED");
+    }
+    /// Keystrokes are not allowed for this call (the keystroke budget or the
+    /// same-app keyboard ambiguity), as the caller decided before planning.
+    fn plan_without_keystrokes(c: &impl TextControl, mode: InsertAt, trusted: bool) -> Plan {
+        super::plan(c, mode, "!", trusted, true, false)
+    }
+    #[test]
+    fn a_keystroke_refusal_never_leaves_the_caret_or_range_moved() {
+        let caret = TextRange {
+            location: 3,
+            length: 0,
+        };
+        // end on a focused field over the keystroke budget: decided before
+        // the caret moves.
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        c.range.set(Some(caret));
+        let p = plan_without_keystrokes(&c, InsertAt::End, false);
+        assert_eq!(
+            c.range.get(),
+            Some(caret),
+            "the caret moved before keystrokes were refused"
+        );
+        assert!(
+            matches!(
+                p,
+                Plan::NoKeystrokes {
+                    focused_first: false,
+                    range_restored: None
+                }
+            ),
+            "nothing moved, so there is nothing to report"
+        );
+        assert_eq!(c.focus_calls.get(), 0);
+        // After the guarded focus step selected everything, the keystroke
+        // refusal puts the range back and says that focus moved.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.selected_text_settable.set(false);
+        c.focus_range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        let p = plan_without_keystrokes(&c, InsertAt::End, true);
+        assert!(
+            matches!(
+                p,
+                Plan::NoKeystrokes {
+                    focused_first: true,
+                    range_restored: Some(true)
+                }
+            ),
+            "the refusal must say focus moved and the range was put back"
+        );
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 0,
+                length: 0
+            })
+        );
+        // end whose caret move does not hold: the old caret comes back.
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        c.range.set(Some(caret));
+        c.misplace_next_set.set(Some(TextRange {
+            location: 5,
+            length: 0,
+        }));
+        let s = reported(plan(&c, InsertAt::End, "!", false));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_CARET_UNAVAILABLE");
+        assert_eq!(s["range_restored"], true, "{s}");
+        assert_eq!(c.range.get(), Some(caret));
     }
 }

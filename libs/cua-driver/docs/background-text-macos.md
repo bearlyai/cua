@@ -137,7 +137,7 @@ keystroke route's caret checks, **Fg** the foreground route.
 | `BACKGROUND_TEXT_FOCUS_UNSUPPORTED` | AX, Keys | An unfocused target that is web content, or not provably native, cannot use native-only AX focus (changed: now includes an incomplete ancestor walk). **New route:** Keys: an element addressed by `element_token` that does not read `AXFocused` true; the keystroke step never sets focus. |
 | `BACKGROUND_TEXT_FOCUS_NOT_RETAINED` | AX | The focus request failed, or was accepted but did not read back within 100 ms. **Changed:** the second case carries `focused_first: true`, because focus may have moved. |
 | `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` | AX, Fg | AX: focus created a nonempty selection and the caller did not request end insertion; the range is restored (`range_restored`). **Changed / new route:** Fg: focusing the addressed field selected its whole value and the caret could not be put back; nothing was typed (`path` `key_events_fg` or `key_events`, `focused_first: true`, `range_restored: false`, `posted_keystrokes: 0`). |
-| `BACKGROUND_TEXT_CARET_UNAVAILABLE` | AX, Keys | AX: default insertion has no reported caret on a nonempty value. **New route:** Keys: `end` was requested and the caret could not be moved to the end and read back. |
+| `BACKGROUND_TEXT_CARET_UNAVAILABLE` | AX, Keys | AX: default insertion has no reported caret on a nonempty value. **New route:** Keys: `end` was requested and the caret could not be moved to the end and read back; the old caret is put back (`range_restored`). |
 | `BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT` | AX, Keys | Default or `end` insertion encountered an existing nonempty readable selection (**new route:** Keys, where keystrokes would replace it). |
 | `BACKGROUND_TEXT_SELECTION_UNAVAILABLE` | AX, Keys | Explicit selection replacement has no readable selected range (**new route:** Keys). |
 | `BACKGROUND_TEXT_RANGE_INVALID` | AX | Range exceeds the value, overflows, or splits a UTF-16 surrogate pair. |
@@ -166,6 +166,13 @@ target process, as before this change, after these checks:
 - `end` sets the range to the end and reads it back, or refuses with
   `BACKGROUND_TEXT_CARET_UNAVAILABLE`; it never types at an unknown position;
 - an unreadable range with the default `caret` types as before.
+
+Whether the call may send keystrokes at all (the synthesis budget, and the
+exact-target gate's `same_pid_keyboard_ambiguity`) is decided before any of
+these checks, so a direct call refuses with those codes before the caret
+moves. When a provably native field reaches this route only after the guarded
+focus step, those refusals keep their envelopes and add `focused_first: true`
+and, when the range had moved, `range_restored: true|false`.
 
 The result is the keystroke route's existing result (`path: "key_events"`,
 `type_text_not_delivered`, `type_text_incomplete`, the synthesis budget
