@@ -39,6 +39,9 @@ pub(super) trait TextControl {
     fn role_facts(&self) -> (String, Option<String>, Option<bool>);
     /// Whether the element reports `AXSelectedText` as settable.
     fn selected_text_settable(&self) -> bool;
+    /// Whether the element's ancestor walk reaches its window or the app
+    /// without passing a web area.
+    fn provably_native(&self) -> bool;
 }
 
 /// How the text write itself answered.
@@ -50,6 +53,19 @@ pub(super) enum Write {
     /// Any other error, such as a busy app's messaging timeout: the write may
     /// still land.
     Uncertain,
+}
+
+/// How an `AXSelectedText` write's error answers whether text may land.
+fn write_outcome(error: AXError) -> Write {
+    match error {
+        error if error == kAXErrorSuccess => Write::Accepted,
+        // Unsupported attribute, illegal argument, invalid element,
+        // action unsupported, not implemented, API disabled.
+        -25205 | -25201 | -25202 | -25206 | -25208 | -25211 => Write::Rejected,
+        // Anything else, such as a busy app's messaging timeout (-25204,
+        // cannot complete), may still be applied.
+        _ => Write::Uncertain,
+    }
 }
 
 /// Up to 100 ms for an accepted focus request to read back as focused.
@@ -89,10 +105,11 @@ fn plan(
     control: &impl TextControl,
     mode: InsertAt,
     text: &str,
-    trusted: bool,
     addressed: bool,
     keystrokes_allowed: bool,
 ) -> Plan {
+    // Trust an echo, and move focus, only on a provably native target.
+    let trusted = control.provably_native();
     let (role, subrole, protected) = control.role_facts();
     // An unfocused AppKit field reports AXSelectedText as settable only once
     // it is focused, so a native unfocused field goes through the focus step
@@ -511,13 +528,7 @@ impl TextControl for AxTextControl {
         unsafe { set_text_range(self.0, r) == kAXErrorSuccess }
     }
     fn insert(&self, text: &str) -> Write {
-        match unsafe { set_string_attr(self.0, "AXSelectedText", text) } {
-            error if error == kAXErrorSuccess => Write::Accepted,
-            // Unsupported attribute, illegal argument, invalid element,
-            // action unsupported, not implemented, API disabled.
-            -25205 | -25201 | -25202 | -25206 | -25208 | -25211 => Write::Rejected,
-            _ => Write::Uncertain,
-        }
+        write_outcome(unsafe { set_string_attr(self.0, "AXSelectedText", text) })
     }
     fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
         unsafe {
@@ -531,6 +542,9 @@ impl TextControl for AxTextControl {
     fn selected_text_settable(&self) -> bool {
         unsafe { is_attribute_settable(self.0, "AXSelectedText") }
     }
+    fn provably_native(&self) -> bool {
+        super::type_text::element_is_provably_native(self.0)
+    }
 }
 
 /// # Safety
@@ -539,7 +553,6 @@ pub(super) unsafe fn insert(
     element: AXUIElementRef,
     mode: InsertAt,
     text: &str,
-    trusted: bool,
     addressed: bool,
     keystrokes_allowed: bool,
 ) -> Plan {
@@ -547,7 +560,6 @@ pub(super) unsafe fn insert(
         &AxTextControl(element),
         mode,
         text,
-        trusted,
         addressed,
         keystrokes_allowed,
     )
@@ -581,6 +593,7 @@ mod tests {
         /// The next range set lands here instead of where it was asked to.
         misplace_next_set: Cell<Option<TextRange>>,
         value_settable: Cell<bool>,
+        native: Cell<bool>,
     }
     impl Control {
         fn tick(&self) {
@@ -609,6 +622,9 @@ mod tests {
         fn selected_text_settable(&self) -> bool {
             self.selected_text_settable.get()
                 || (self.settable_once_focused.get() && self.focused.get() == Some(true))
+        }
+        fn provably_native(&self) -> bool {
+            self.native.get()
         }
         fn focused(&self) -> Option<bool> {
             self.focused.get()
@@ -708,11 +724,13 @@ mod tests {
             focus_calls: Cell::new(0),
             misplace_next_set: Cell::new(None),
             value_settable: Cell::new(true),
+            native: Cell::new(true),
         }
     }
     /// An element addressed by token.
-    fn plan(c: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
-        super::plan(c, mode, text, trusted, true, true)
+    fn plan(c: &Control, mode: InsertAt, text: &str, trusted: bool) -> Plan {
+        c.native.set(trusted);
+        super::plan(c, mode, text, true, true)
     }
     fn transact_result(
         control: &impl TextControl,
@@ -838,8 +856,8 @@ mod tests {
         }
     }
     /// The focused-element path: no element token was passed.
-    fn plan_focused(c: &impl TextControl, mode: InsertAt) -> Plan {
-        super::plan(c, mode, "!", true, false, true)
+    fn plan_focused(c: &Control, mode: InsertAt) -> Plan {
+        super::plan(c, mode, "!", false, true)
     }
     fn reported(p: Plan) -> serde_json::Value {
         match p {
@@ -1009,6 +1027,9 @@ mod tests {
                 self.0.role_facts()
             }
             fn selected_text_settable(&self) -> bool {
+                true
+            }
+            fn provably_native(&self) -> bool {
                 true
             }
         }
@@ -1215,8 +1236,9 @@ mod tests {
     }
     /// Keystrokes are not allowed for this call (the keystroke budget or the
     /// same-app keyboard ambiguity), as the caller decided before planning.
-    fn plan_without_keystrokes(c: &impl TextControl, mode: InsertAt, trusted: bool) -> Plan {
-        super::plan(c, mode, "!", trusted, true, false)
+    fn plan_without_keystrokes(c: &Control, mode: InsertAt, trusted: bool) -> Plan {
+        c.native.set(trusted);
+        super::plan(c, mode, "!", true, false)
     }
     #[test]
     fn a_keystroke_refusal_never_leaves_the_caret_or_range_moved() {
@@ -1340,5 +1362,36 @@ mod tests {
         let c = fresh();
         c.misplace_next_set.set(Some(all));
         assert!(foreground_focus(&c, || true, zero, zero).is_err());
+    }
+    #[test]
+    fn the_plan_trusts_only_a_target_its_ancestry_proves_native() {
+        for native in [false, true] {
+            let c = control(true, false);
+            c.native.set(native);
+            let s = reported(super::plan(&c, InsertAt::End, "!", true, true));
+            assert_eq!(
+                s["effect"],
+                if native { "confirmed" } else { "unverifiable" },
+                "native={native}: {s}"
+            );
+            assert_eq!(c.value().as_deref(), Some("Original!"));
+            // Only a provably native field is focused in the background.
+            let c = control(true, false);
+            c.native.set(native);
+            c.focused.set(Some(false));
+            let _ = super::plan(&c, InsertAt::End, "!", true, true);
+            assert_eq!(c.focus_calls.get(), usize::from(native), "native={native}");
+        }
+    }
+    #[test]
+    fn only_clear_rejections_mean_the_write_did_not_land() {
+        assert_eq!(write_outcome(kAXErrorSuccess), Write::Accepted);
+        for rejected in [-25205, -25201, -25202, -25206, -25208, -25211] {
+            assert_eq!(write_outcome(rejected), Write::Rejected, "{rejected}");
+        }
+        // A busy app's messaging timeout can still apply the write.
+        for unclear in [-25204, -25200, -25212] {
+            assert_eq!(write_outcome(unclear), Write::Uncertain, "{unclear}");
+        }
     }
 }

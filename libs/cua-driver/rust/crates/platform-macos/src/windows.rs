@@ -500,7 +500,12 @@ pub(crate) fn menu_window_ids(pid: i32) -> Option<Vec<u32>> {
 /// How many menu windows of `pid` are on screen that were not in `before`;
 /// `None` when unknown.
 pub(crate) fn new_menu_windows(pid: i32, before: &[u32]) -> Option<usize> {
-    menu_window_ids(pid).map(|ids| ids.iter().filter(|id| !before.contains(id)).count())
+    menu_window_ids(pid).map(|ids| count_new_menus(&ids, before))
+}
+
+/// How many of `ids` were not in `before`.
+pub(crate) fn count_new_menus(ids: &[u32], before: &[u32]) -> usize {
+    ids.iter().filter(|id| !before.contains(id)).count()
 }
 
 /// `Some(true)` once no menu window of `pid` outside `before` is on screen

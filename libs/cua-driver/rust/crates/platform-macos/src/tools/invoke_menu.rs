@@ -234,14 +234,19 @@ enum MenuSettle {
     Tracked(Option<bool>),
 }
 
+/// `menu_ids` reads the app's on-screen menu windows; only those not in
+/// `menus_before` count as this call's.
 fn settle_after_final_action(
     segments: usize,
-    open_menus: impl FnMut() -> Option<usize>,
+    menus_before: &[u32],
+    mut menu_ids: impl FnMut() -> Option<Vec<u32>>,
 ) -> MenuSettle {
     if segments == 1 {
         return MenuSettle::TopLevelOpened;
     }
-    MenuSettle::Tracked(settle_menu_dispatch(open_menus))
+    MenuSettle::Tracked(settle_menu_dispatch(|| {
+        menu_ids().map(|ids| crate::windows::count_new_menus(&ids, menus_before))
+    }))
 }
 
 fn settle_summary(settle: MenuSettle) -> &'static str {
@@ -317,8 +322,8 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<MenuSettle, String> {
         // frontmost until its menu windows close, with a bounded wait. This
         // observes tracking only, never the command's semantic effect.
         // Count only the menu windows this call opened, as the failure path does.
-        Ok(settle_after_final_action(path.len(), || {
-            crate::windows::new_menu_windows(pid, &menus_before)
+        Ok(settle_after_final_action(path.len(), &menus_before, || {
+            crate::windows::menu_window_ids(pid)
         }))
     })();
 
@@ -680,14 +685,35 @@ mod tests {
     fn a_one_segment_path_does_not_wait_for_its_open_menu() {
         let started = std::time::Instant::now();
         assert_eq!(
-            settle_after_final_action(1, || Some(1)),
+            settle_after_final_action(1, &[], || Some(vec![7])),
             MenuSettle::TopLevelOpened
         );
         assert!(started.elapsed() < Duration::from_millis(50));
         assert_eq!(
-            settle_after_final_action(2, || Some(0)),
+            settle_after_final_action(2, &[], || Some(vec![])),
             MenuSettle::Tracked(Some(true))
         );
+    }
+
+    #[test]
+    fn the_final_wait_ignores_menus_that_were_open_before_the_call() {
+        // A menu window another menu left on screen is not this call's: the
+        // wait ends as soon as the call's own menus close.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            settle_after_final_action(2, &[7], || Some(vec![7])),
+            MenuSettle::Tracked(Some(true))
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        let mut reads = 0;
+        assert_eq!(
+            settle_after_final_action(2, &[7], || {
+                reads += 1;
+                Some(if reads < 3 { vec![7, 9] } else { vec![7] })
+            }),
+            MenuSettle::Tracked(Some(true))
+        );
+        assert_eq!(reads, 3);
     }
 
     #[test]

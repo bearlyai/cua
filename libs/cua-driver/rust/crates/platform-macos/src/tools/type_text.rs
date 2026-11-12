@@ -1175,6 +1175,16 @@ fn background_text_trusted(classification: WebAreaClassification) -> bool {
     classification == WebAreaClassification::NonWebContent
 }
 
+/// [`background_text_trusted`] for a live element, from its own ancestor walk.
+pub(super) fn element_is_provably_native(element: AXUIElementRef) -> bool {
+    background_text_trusted(classify_role_chain(AncestorRoles {
+        cur: element,
+        owned: false,
+        started: false,
+        parent_attr: core_foundation::string::CFString::new("AXParent"),
+    }))
+}
+
 /// Roles of an element and its ancestors, read lazily; each `AXParent` copy is
 /// released once the walk moves past it or the walk is dropped.
 struct AncestorRoles {
@@ -1999,21 +2009,9 @@ fn type_text_blocking(
     );
     let keystrokes_allowed = !matches!(keyboard_policy, BackgroundKeyboardPolicy::SemanticOnly(_))
         && synthesis_refusal.is_none();
-    if let Some((element, owns, idx_opt)) = ax_target {
-        let trusted = background_text_trusted(classify_target_web_area(
-            pid,
-            Some((element as usize, idx_opt)),
-            window_id,
-        ));
+    if let Some((element, owns, _)) = ax_target {
         let plan = unsafe {
-            super::background_text::insert(
-                element,
-                insert_at,
-                text,
-                trusted,
-                !owns,
-                keystrokes_allowed,
-            )
+            super::background_text::insert(element, insert_at, text, !owns, keystrokes_allowed)
         };
         if owns {
             unsafe {
