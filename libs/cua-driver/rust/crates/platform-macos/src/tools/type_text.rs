@@ -6,7 +6,9 @@
 //! inputs in Safari, etc.) and is significantly faster than per-keystroke
 //! CGEvent synthesis.
 //!
-//! Background native AX targets never fall back to keystrokes after a write.
+//! Fields that take no `AXSelectedText` write (Chromium / Electron inputs,
+//! other roles) get CGEvent keystrokes after the same caret checks. A field
+//! that took the accessibility write never falls back to keystrokes after it.
 //! Foreground and key-driven routes retain their explicit event delivery.
 //!
 //! When the target pid belongs to a terminal emulator (Ghostty,
@@ -74,9 +76,12 @@ fn def() -> &'static ToolDef {
              while selection may replace only a selection that existed before focus. \
              Background accessibility writes then set and read back the exact selected range. \
              `insert_at` defaults to caret (a collapsed known range); end appends and selection \
-             explicitly replaces a selected range. A field that ignores range writes refuses \
-             before any text write, with no keystroke fallback. Confirmation requires the exact \
-             old value with that edit, rather than a substring match.\n\n\
+             explicitly replaces a selected range. A field that accepts AXSelectedText but ignores \
+             range writes refuses before any text write, with no keystroke fallback. A field that \
+             takes no AXSelectedText write gets keystrokes instead, after the same checks: a \
+             readable selection is replaced only with selection, and end refuses unless the caret \
+             provably moved to the end. Confirmation requires the exact old value with that edit, \
+             rather than a substring match.\n\n\
              Optional `element_token` (from the last \
              `get_window_state` snapshot) directs the write to a specific field. \
              Without `element_token`, the write goes to the pid's currently \
@@ -106,7 +111,7 @@ fn def() -> &'static ToolDef {
             "properties": {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
                 "pid":  { "type": "integer", "description": "Target process ID." },
-                "insert_at": {"type":"string", "enum":["caret","end","selection"], "default":"caret", "description":"macOS background AX insertion only. caret requires a collapsed readable caret on nonempty fields; end appends; selection explicitly permits replacing the selected range. Unsupported range setters refuse before writing text."},
+                "insert_at": {"type":"string", "enum":["caret","end","selection"], "default":"caret", "description":"macOS background route only. caret requires a collapsed readable caret on nonempty fields; end appends; selection explicitly permits replacing the selected range. Fields that accept AXSelectedText but ignore range writes refuse before writing text; fields that take no AXSelectedText write get keystrokes after the same checks."},
                 "text": { "type": "string",  "description": "Text to insert at the target's cursor." },
                 "window_id": {
                     "type": "integer",
@@ -348,8 +353,9 @@ impl Tool for TypeTextTool {
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
         // field to give the Chromium/Electron renderer the real keyboard focus the
-        // AX path can't, then fall through to the focused-element type path (which
-        // escalates AX → CGEvent and lands once focused). Reuses ClickTool's exact
+        // AX path can't, then fall through to the focused-element type path (a
+        // range-verified AX write when the field takes AXSelectedText, CGEvent
+        // keystrokes when it doesn't, as Chromium inputs). Reuses ClickTool's exact
         // coordinate translation + delivery_mode, so it lands on the same pixel a
         // px-click would.
         let used_pixel_focus = px.is_some() && py.is_some();
@@ -381,7 +387,8 @@ impl Tool for TypeTextTool {
                 return e;
             }
             // element_index stays None → the type path below writes to the now-
-            // focused element via the CGEvent (key_events) rung.
+            // focused element: CGEvent (key_events) when it takes no AXSelectedText
+            // write, the range-verified AX write when it does.
         }
         let element_ptr = element_guard
             .as_ref()
@@ -1686,7 +1693,9 @@ struct KeyboardRoute {
 /// Best-effort-background ladder for `type_text`.
 ///
 /// - `delivery_mode == Background` (default): range-based AX insert → exact
-///   read-back. An AX target never falls through to keystrokes. Never fronts.
+///   read-back when the field takes an `AXSelectedText` write; never falls
+///   through to keystrokes after that write. A field that takes no such write
+///   gets CGEvent keystrokes after the caret checks. Never fronts.
 /// - `delivery_mode == Foreground`: the agent's explicit last resort — briefly
 ///   front `window_id`, insert at the current cursor, restore, then read-back.
 ///
@@ -1894,16 +1903,29 @@ fn type_text_blocking(
             }
         },
     };
-    let ax_attempt = AxAttempt::NotAttempted;
+    let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         let trusted = !target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
-        let result = unsafe { super::background_text::insert(element, insert_at, text, trusted) };
+        let plan = unsafe { super::background_text::insert(element, insert_at, text, trusted) };
         if owns {
             unsafe {
                 CFRelease(element as _);
             }
         }
-        return Ok(TypeTextDelivery::Reported(result));
+        match plan {
+            super::background_text::Plan::Reported(result) => {
+                return Ok(TypeTextDelivery::Reported(result))
+            }
+            // Chromium / Electron inputs and other roles take no
+            // AXSelectedText write: type the text instead.
+            super::background_text::Plan::Keystrokes => {
+                ax_attempt = AxAttempt::Rejected;
+                tracing::debug!(
+                    "AX target for pid {pid} takes no AXSelectedText write; \
+                     falling back to CGEvent keystrokes"
+                );
+            }
+        }
     } else {
         if insert_at != crate::ax::text_range::InsertAt::Caret {
             return Ok(TypeTextDelivery::Reported(super::background_text::refusal(

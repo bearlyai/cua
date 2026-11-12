@@ -18,6 +18,61 @@ trait TextControl {
     fn focus(&self) -> bool {
         false
     }
+    /// Role, subrole and protected-content flag of the element.
+    fn role_facts(&self) -> (String, Option<String>, Option<bool>);
+    /// Whether the element reports `AXSelectedText` as settable.
+    fn selected_text_settable(&self) -> bool;
+}
+
+/// What the background route does with an accessibility target.
+pub(super) enum Plan {
+    /// The range-verified accessibility write ran, or refused before writing.
+    Reported(ToolResult),
+    /// The field takes no `AXSelectedText` write: use the keystroke step.
+    Keystrokes,
+}
+
+fn plan(control: &impl TextControl, mode: InsertAt, text: &str, trusted: bool) -> Plan {
+    let (role, subrole, protected) = control.role_facts();
+    if text_range::is_text_entry(&role, subrole.as_deref(), protected)
+        && control.selected_text_settable()
+    {
+        return Plan::Reported(transact(control, mode, text, trusted));
+    }
+    match keystroke_gate(control, mode) {
+        Ok(()) => Plan::Keystrokes,
+        Err(result) => Plan::Reported(result),
+    }
+}
+
+/// Caret rules for a field that takes keystrokes instead of an
+/// `AXSelectedText` write. Keystrokes replace a selection and type at the
+/// caret, so a readable selection is replaced only on request, and `end`
+/// types only once the caret provably sits at the end.
+fn keystroke_gate(control: &impl TextControl, mode: InsertAt) -> Result<(), ToolResult> {
+    let range = control.range();
+    if mode != InsertAt::Selection && range.is_some_and(|r| r.length > 0) {
+        return Err(refusal(
+            "BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT",
+        ));
+    }
+    match mode {
+        InsertAt::End => {
+            let end = control.value().map(|v| TextRange {
+                location: v.encode_utf16().count(),
+                length: 0,
+            });
+            if !end.is_some_and(|end| control.set_range(end) && control.range() == Some(end)) {
+                return Err(refusal("BACKGROUND_TEXT_CARET_UNAVAILABLE"));
+            }
+        }
+        InsertAt::Selection if range.is_none() => {
+            return Err(refusal("BACKGROUND_TEXT_SELECTION_UNAVAILABLE"));
+        }
+        // An unreadable caret keeps the keystroke step it always had.
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(super) fn refusal(code: &str) -> ToolResult {
@@ -193,6 +248,18 @@ impl TextControl for AxTextControl {
     fn insert(&self, text: &str) -> bool {
         unsafe { set_string_attr(self.0, "AXSelectedText", text) == kAXErrorSuccess }
     }
+    fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
+        unsafe {
+            (
+                copy_string_attr(self.0, "AXRole").unwrap_or_default(),
+                copy_string_attr(self.0, "AXSubrole"),
+                copy_bool_attr(self.0, "AXProtectedContent"),
+            )
+        }
+    }
+    fn selected_text_settable(&self) -> bool {
+        unsafe { is_attribute_settable(self.0, "AXSelectedText") }
+    }
 }
 
 /// # Safety
@@ -202,16 +269,8 @@ pub(super) unsafe fn insert(
     mode: InsertAt,
     text: &str,
     trusted: bool,
-) -> ToolResult {
-    let role = copy_string_attr(element, "AXRole").unwrap_or_default();
-    if !text_range::is_text_entry(
-        &role,
-        copy_string_attr(element, "AXSubrole").as_deref(),
-        copy_bool_attr(element, "AXProtectedContent"),
-    ) {
-        return refusal("BACKGROUND_TEXT_TARGET_UNSUPPORTED");
-    }
-    transact(&AxTextControl(element), mode, text, trusted)
+) -> Plan {
+    plan(&AxTextControl(element), mode, text, trusted)
 }
 
 #[cfg(test)]
@@ -228,8 +287,16 @@ mod tests {
         focus_range: Cell<Option<TextRange>>,
         focus_supported: Cell<bool>,
         hide_after_write: Cell<bool>,
+        role: RefCell<String>,
+        selected_text_settable: Cell<bool>,
     }
     impl TextControl for Control {
+        fn role_facts(&self) -> (String, Option<String>, Option<bool>) {
+            (self.role.borrow().clone(), None, None)
+        }
+        fn selected_text_settable(&self) -> bool {
+            self.selected_text_settable.get()
+        }
         fn focused(&self) -> Option<bool> {
             self.focused.get()
         }
@@ -283,6 +350,8 @@ mod tests {
             focus_range: Cell::new(None),
             focus_supported: Cell::new(true),
             hide_after_write: Cell::new(false),
+            role: RefCell::new("AXTextField".into()),
+            selected_text_settable: Cell::new(true),
         }
     }
     fn state(r: ToolResult) -> serde_json::Value {
@@ -385,5 +454,91 @@ mod tests {
         let s = state(transact(&c, InsertAt::End, "!", false));
         assert_eq!(s["effect"], "unverifiable");
         assert_eq!(s["verified"], false);
+    }
+
+    fn keystrokes(p: Plan) -> bool {
+        match p {
+            Plan::Keystrokes => true,
+            Plan::Reported(r) => {
+                eprintln!("got accessibility result {}", state(r));
+                false
+            }
+        }
+    }
+    fn reported(p: Plan) -> serde_json::Value {
+        match p {
+            Plan::Reported(r) => state(r),
+            Plan::Keystrokes => panic!("expected a refusal before the keystroke step"),
+        }
+    }
+    #[test]
+    fn fields_without_a_settable_selected_text_get_the_keystroke_step() {
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        assert!(
+            keystrokes(plan(&c, InsertAt::Caret, "!", false)),
+            "a field that takes no AXSelectedText write must reach the keystroke step"
+        );
+        assert_eq!(
+            c.writes.get(),
+            0,
+            "no AXSelectedText write may be attempted"
+        );
+        let c = control(true, false);
+        *c.role.borrow_mut() = "AXGroup".into();
+        assert!(
+            keystrokes(plan(&c, InsertAt::Caret, "!", true)),
+            "an unsupported role must reach the keystroke step"
+        );
+        assert_eq!(
+            c.writes.get(),
+            0,
+            "no AXSelectedText write may be attempted"
+        );
+    }
+    #[test]
+    fn keystroke_step_keeps_the_caret_rules() {
+        // A readable selection is replaced only on request.
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        c.range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        for mode in [InsertAt::Caret, InsertAt::End] {
+            let s = reported(plan(&c, mode, "!", true));
+            assert_eq!(
+                s["code"],
+                "BACKGROUND_TEXT_SELECTION_REQUIRES_EXPLICIT_REPLACEMENT"
+            );
+        }
+        assert!(keystrokes(plan(&c, InsertAt::Selection, "!", true)));
+        // end moves the caret to the end and proves it held.
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        assert!(keystrokes(plan(&c, InsertAt::End, "!", true)));
+        assert_eq!(
+            c.range.get(),
+            Some(TextRange {
+                location: 8,
+                length: 0
+            })
+        );
+        let c = control(false, false);
+        c.selected_text_settable.set(false);
+        assert_eq!(
+            reported(plan(&c, InsertAt::End, "!", true))["code"],
+            "BACKGROUND_TEXT_CARET_UNAVAILABLE"
+        );
+        // An unreadable range keeps the default keystroke step.
+        let c = control(true, false);
+        c.selected_text_settable.set(false);
+        c.range.set(None);
+        assert!(keystrokes(plan(&c, InsertAt::Caret, "!", true)));
+        assert_eq!(
+            reported(plan(&c, InsertAt::Selection, "!", true))["code"],
+            "BACKGROUND_TEXT_SELECTION_UNAVAILABLE"
+        );
+        assert_eq!(c.writes.get(), 0);
     }
 }
