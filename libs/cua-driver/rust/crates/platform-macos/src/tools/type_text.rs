@@ -1169,6 +1169,24 @@ fn classify_role_chain(roles: impl IntoIterator<Item = Option<String>>) -> WebAr
     WebAreaClassification::Incomplete
 }
 
+/// A refusal that blocks keystrokes after the guarded focus step: says that
+/// focus moved and whether the range it moved was put back.
+fn keystroke_block_after_moves(
+    mut result: ToolResult,
+    focused_first: bool,
+    range_restored: Option<bool>,
+) -> ToolResult {
+    if let Some(structured) = result.structured_content.as_mut() {
+        if focused_first {
+            structured["focused_first"] = true.into();
+        }
+        if let Some(restored) = range_restored {
+            super::background_text::note_range_restored(structured, restored);
+        }
+    }
+    result
+}
+
 /// Background text trusts an accessibility read-back, and may move focus
 /// inside the window, only when the target is provably not web content.
 fn background_text_trusted(classification: WebAreaClassification) -> bool {
@@ -2042,15 +2060,11 @@ fn type_text_blocking(
                     }
                     _ => unreachable!("keystrokes are refused only for these reasons"),
                 };
-                if let Some(structured) = result.structured_content.as_mut() {
-                    if focused_first {
-                        structured["focused_first"] = true.into();
-                    }
-                    if let Some(restored) = range_restored {
-                        structured["range_restored"] = restored.into();
-                    }
-                }
-                return Ok(TypeTextDelivery::Reported(result));
+                return Ok(TypeTextDelivery::Reported(keystroke_block_after_moves(
+                    result,
+                    focused_first,
+                    range_restored,
+                )));
             }
             // Chromium / Electron inputs and other roles take no
             // AXSelectedText write: type the text instead.
@@ -2294,6 +2308,31 @@ mod tests {
             assert_eq!(s["effect"], "unverifiable", "keystrokes were posted: {s}");
             assert_eq!(s["retryable"], false);
         }
+    }
+    #[test]
+    fn a_keystroke_block_that_left_a_selection_is_not_retryable() {
+        let refusal = SynthesisRefusal {
+            requested_chars: 20_000,
+            estimated_duration_ms: 400_000,
+            per_character_ms: 20,
+            max_chunk_chars: 4_900,
+        };
+        let base = synthesis_refusal_result(PATH_KEY_EVENTS, &refusal, AxAttempt::Rejected);
+        let s = keystroke_block_after_moves(base, true, Some(false))
+            .structured_content
+            .unwrap();
+        assert_eq!(s["range_restored"], false);
+        assert_eq!(
+            s["retryable"], false,
+            "a selection the driver made is still there: {s}"
+        );
+        assert_ne!(s["escalation"]["recommended"], "chunk", "{s}");
+        // Put back: the refusal keeps its own retry advice.
+        let base = synthesis_refusal_result(PATH_KEY_EVENTS, &refusal, AxAttempt::Rejected);
+        let s = keystroke_block_after_moves(base, true, Some(true))
+            .structured_content
+            .unwrap();
+        assert_eq!(s["retryable"], true);
     }
     #[test]
     fn path_constants_are_stable_tokens() {

@@ -92,6 +92,21 @@ pub(super) enum Plan {
     },
 }
 
+/// Record on a refusal whether the range the driver moved was put back. When
+/// it was not, the field may still hold a selection the driver made, which a
+/// keyboard retry would replace: the refusal is not retryable until the field
+/// is clicked.
+pub(super) fn note_range_restored(structured: &mut serde_json::Value, restored: bool) {
+    structured["range_restored"] = restored.into();
+    if !restored {
+        structured["retryable"] = false.into();
+        structured["escalation"] = serde_json::json!({
+            "recommended": "verify_state",
+            "reason": "The field may still hold a selection the driver made. Click the field before typing with the keyboard, or the typing would replace it.",
+        });
+    }
+}
+
 /// Set `to` and read it back.
 fn put_back(control: &impl TextControl, to: TextRange) -> bool {
     control.set_range(to) && control.range() == Some(to)
@@ -139,7 +154,7 @@ fn plan(
             if moved {
                 let restored = prior.is_some_and(|prior| put_back(control, prior));
                 if let Some(structured) = result.structured_content.as_mut() {
-                    structured["range_restored"] = restored.into();
+                    note_range_restored(structured, restored);
                 }
             }
             Plan::Reported(result)
@@ -243,7 +258,7 @@ fn transact(
         };
         if let Some(restored) = restore_if_moved() {
             if let Some(structured) = result.structured_content.as_mut() {
-                structured["range_restored"] = restored.into();
+                note_range_restored(structured, restored);
             }
         }
         result
@@ -490,11 +505,14 @@ pub(super) fn foreground_focus_refusal(path: &str, requested: usize) -> ToolResu
     ToolResult::error(format!(
         "Focusing the field selected its whole value and the caret could not be restored; nothing was typed: {code}."
     ))
-    .with_structured(serde_json::json!({
-        "code": code, "effect": "refused", "path": path, "verified": false,
-        "focused_first": true, "range_restored": false,
-        "requested_chars": requested, "posted_keystrokes": 0,
-    }))
+    .with_structured({
+        let mut structured = serde_json::json!({
+            "code": code, "effect": "refused", "path": path, "verified": false,
+            "focused_first": true, "requested_chars": requested, "posted_keystrokes": 0,
+        });
+        note_range_restored(&mut structured, false);
+        structured
+    })
 }
 
 /// The selected range once two consecutive reads agree (unreadable counts as
@@ -1564,5 +1582,44 @@ mod tests {
         assert!(s.get("focused_first").is_none(), "{s}");
         assert!(s.get("range_restored").is_none(), "{s}");
         assert_eq!(c.range_sets.get(), 0);
+    }
+    #[test]
+    fn a_refusal_that_could_not_put_the_range_back_is_not_retryable() {
+        // Focus selected everything and the field ignores the restore.
+        let c = control(false, false);
+        c.focused.set(Some(false));
+        c.focus_range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+        assert_eq!(s["range_restored"], false, "{s}");
+        assert_eq!(s["retryable"], false, "{s}");
+        // The keystroke route's end move landed elsewhere and stayed there.
+        let c = control(false, false);
+        c.selected_text_settable.set(false);
+        c.misplace_next_set.set(Some(TextRange {
+            location: 5,
+            length: 0,
+        }));
+        let s = reported(plan(&c, InsertAt::End, "!", false));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_CARET_UNAVAILABLE");
+        assert_eq!(s["range_restored"], false, "{s}");
+        assert_eq!(s["retryable"], false, "{s}");
+        // The foreground step's own refusal.
+        let s = state(foreground_focus_refusal("key_events_fg", 1));
+        assert_eq!(s["range_restored"], false);
+        assert_eq!(s["retryable"], false, "{s}");
+        // A restore that held changes nothing.
+        let c = control(true, false);
+        c.focused.set(Some(false));
+        c.focus_range.set(Some(TextRange {
+            location: 0,
+            length: 8,
+        }));
+        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["range_restored"], true);
+        assert!(s.get("retryable").is_none(), "{s}");
     }
 }
