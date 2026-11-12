@@ -360,12 +360,12 @@ mod native {
                 "{kind:6} {:17} effect={} code={} path={} value={value}",
                 "foreground_fresh", s["effect"], s["code"], s["path"]
             );
+            // A fresh field has no caret: the text goes after the old value,
+            // where a click after it would put the caret.
             assert_eq!(
-                value.replacen('!', "", 1),
-                "Original",
-                "foreground typing replaced or lost the value: {kind}: {result}"
+                value, "Original!",
+                "foreground typing replaced the value or typed away from its end: {kind}: {result}"
             );
-            assert_eq!(value.chars().count(), 9, "{kind}: {result}");
         }
         println!("45 control cases passed: independent app values, retained formatting, frontmost app and pointer unchanged in the background, and foreground typing kept the value");
     }

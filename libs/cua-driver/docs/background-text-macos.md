@@ -15,6 +15,15 @@ this document.
 
 ## Background accessibility route
 
+**The range before the call.** A field that already read focused keeps its own
+caret or selection. A field that read unfocused has no caret: the collapsed
+range it reports (commonly `{0,0}`) is ignored, and wherever the driver puts
+the range back after focusing it, the caret goes to the end of the text, where
+a click after the text would put it (**changed:** it used to go back to
+`{0,0}`, so a later keyboard retry typed at the start). An unreadable range
+also becomes a caret at the end. A nonempty selection the field reported
+before the call is still the person's and is kept.
+
 The driver reads the old value, settles and reads back an exact range, writes
 `AXSelectedText` once, and verifies the exact expected result. It never writes
 the whole `AXValue`, activates the application, moves the physical pointer, or
@@ -40,8 +49,8 @@ value, then the range, again; if either differs from what the decision used, it
 refuses and writes nothing.
 
 When a call refuses after the driver itself moved the range (its focus step or
-its own range set), it puts back the range the field had before the call, or a
-caret at the end when that was unreadable, reads it back, and reports
+its own range set), it puts back the range the field had before the call, reads
+it back, and reports
 `range_restored: true|false`. Restoring the range does not undo the focus move
 itself. When the restore did not hold (`range_restored: false`), the field may
 still hold a selection the driver made, which the next keystroke or a keyboard
@@ -202,8 +211,9 @@ content never reports `confirmed`. This is the route the pixel form
 
 The foreground step fronts the window and focuses the addressed field. When
 focusing turned the range into one covering the whole nonempty value and it
-did not cover it before, the driver restores the pre-focus range (or a caret at
-the end) before any keystroke or accessibility write, and refuses with
+did not cover it before, the driver restores the range before the call (see
+"The range before the call" above: a caret at the end for a field that was not
+focused) before any keystroke or accessibility write, and refuses with
 `BACKGROUND_TEXT_FOCUS_SELECTED_VALUE` when the restore does not hold. The
 long-text accessibility fallback no longer sets the whole `AXValue` for a
 selection the driver's focus step created. When the long-text `AXSelectedText`
@@ -248,8 +258,8 @@ existing selection replacement, and refusal to replace implicit or newly
 focus-created selections; each such refusal must report `range_restored: true`.
 NSTextField, NSSearchField, NSComboBox and SwiftUI TextField select all on
 first focus; NSTextView keeps a collapsed caret. Five more rows type into each
-fresh control with `delivery_mode: "foreground"` and require the typed text to
-join `Original` rather than replace it.
+fresh control with `delivery_mode: "foreground"` and require `Original!`: the
+value kept, with the text after it.
 
 ## Other platforms inspected
 

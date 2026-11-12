@@ -237,11 +237,12 @@ fn transact(
     };
     let prior_range = control.range();
     let focused_first = control.focused() == Some(false);
+    let prior_caret = caret_before_focus(control);
     // A refusal after the driver moved the range (its focus step or a range
     // set) puts back the range the field had before this call, or a caret at
     // the end when that was unreadable, so no later call or keystroke can
     // replace a selection the driver created.
-    let restore_to = prior_range.unwrap_or(TextRange {
+    let restore_to = prior_caret.unwrap_or(TextRange {
         location: before.encode_utf16().count(),
         length: 0,
     });
@@ -425,6 +426,19 @@ fn transact(
     Plan::Reported(result)
 }
 
+/// The range to put back after the driver focuses a field. An unfocused field
+/// has no caret: the collapsed range it reports (commonly `{0,0}`) is not
+/// where a person's typing would go, so it is `None` and the caret goes to
+/// the end of the text, where a click after it would put it. A focused
+/// field's caret, and any nonempty selection, are kept.
+fn caret_before_focus(control: &impl TextControl) -> Option<TextRange> {
+    let range = control.range();
+    if control.focused() == Some(false) && range.is_some_and(|r| r.length == 0) {
+        return None;
+    }
+    range
+}
+
 /// After the driver's own focus step: when focusing turned the range into one
 /// covering the whole non-empty value and it did not cover it before, put the
 /// pre-focus range back (or a caret at the end when it was unreadable) and read
@@ -487,7 +501,7 @@ pub(super) fn foreground_focus(
     reapply_after: std::time::Duration,
     settle: std::time::Duration,
 ) -> Result<ForegroundFocus, ()> {
-    let before_focus = control.range();
+    let before_focus = caret_before_focus(control);
     let _ = control.focus();
     if !is_focused() {
         std::thread::sleep(reapply_after);
@@ -1377,7 +1391,7 @@ mod tests {
         assert_eq!(
             c.range.get(),
             Some(TextRange {
-                location: 0,
+                location: 8,
                 length: 0
             })
         );
@@ -1414,7 +1428,7 @@ mod tests {
         assert_eq!(
             c.range.get(),
             Some(TextRange {
-                location: 0,
+                location: 8,
                 length: 0
             }),
             "keystrokes would replace a whole-value selection left by focus"
@@ -1643,5 +1657,70 @@ mod tests {
             !native,
             "an unreadable ancestor walk must not count as native"
         );
+    }
+    #[test]
+    fn an_unfocused_field_gets_its_caret_back_at_the_end() {
+        let zero = std::time::Duration::ZERO;
+        let all = TextRange {
+            location: 0,
+            length: 8,
+        };
+        let end = TextRange {
+            location: 8,
+            length: 0,
+        };
+        // An unfocused field reports {0,0}: that is no caret. The undo after
+        // focus puts the caret where a click after the text would.
+        let unfocused = || {
+            let c = control(true, false);
+            c.focused.set(Some(false));
+            c.focus_range.set(Some(all));
+            c
+        };
+        let c = unfocused();
+        foreground_focus(&c, || true, zero, zero).expect("restorable");
+        assert_eq!(c.range.get(), Some(end), "foreground undo");
+        // The background refusal's restore does the same.
+        let c = unfocused();
+        let s = state(transact_result(&c, InsertAt::Caret, "!", true));
+        assert_eq!(s["code"], "BACKGROUND_TEXT_FOCUS_SELECTED_VALUE");
+        assert_eq!(s["range_restored"], true, "{s}");
+        assert_eq!(c.range.get(), Some(end), "background restore");
+        // A whole-value selection there before the call stays the person's.
+        let c = unfocused();
+        c.range.set(Some(all));
+        assert_eq!(undo_focus_select_all(&c, caret_before_focus(&c)), Ok(false));
+        assert_eq!(c.range.get(), Some(all));
+    }
+    #[test]
+    fn a_focused_field_keeps_its_own_caret_and_range() {
+        let zero = std::time::Duration::ZERO;
+        for kept in [
+            TextRange {
+                location: 3,
+                length: 0,
+            },
+            TextRange {
+                location: 0,
+                length: 0,
+            },
+        ] {
+            // Focusing it again selects everything; the undo puts its real
+            // caret back.
+            let c = control(true, false);
+            c.range.set(Some(kept));
+            c.focus_range.set(Some(TextRange {
+                location: 0,
+                length: 8,
+            }));
+            foreground_focus(&c, || true, zero, zero).expect("restorable");
+            assert_eq!(c.range.get(), Some(kept), "foreground undo");
+            // A refusal after the driver moved the range restores it too.
+            let c = control(true, false);
+            c.range.set(Some(kept));
+            let s = state(transact_with_edit(&c, InsertAt::End, "!"));
+            assert_eq!(s["range_restored"], true, "{s}");
+            assert_eq!(c.range.get(), Some(kept), "background restore");
+        }
     }
 }
