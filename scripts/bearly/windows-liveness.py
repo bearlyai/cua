@@ -1023,9 +1023,15 @@ try:
                 notes.append(f'activated {structured.get("activated")!r}; foreground_restored {structured.get("foreground_restored")!r}')
                 ok &= check_mode(rec, notes, 'foreground')
                 ok &= check(rec['foreground_after'] == 'target', f'foreground ended on {rec["foreground_after"]}', notes)
-                foreign = [smp for smp in rec['foreground_samples'] if smp[1] == 'sentinel'
+                # The provider closes the spare while it is in front, so Windows activates the next window before the
+                # provider's own steal lands (its first SetForegroundWindow fails for that reason). A window sampled in
+                # front before the target is the fixture's doing. After the target has come forward nothing else may:
+                # that would be the driver putting a window over it.
+                names = [smp[1] for smp in rec['foreground_samples']]
+                after_target = rec['foreground_samples'][names.index('target') + 1:] if 'target' in names else rec['foreground_samples']
+                foreign = [smp for smp in after_target if smp[1] == 'sentinel'
                            or (smp[1].startswith('0x') and unknown_windows.get(int(smp[1], 16), {}).get('owner') != 'target fixture')]
-                ok &= check(not foreign, f'a window other than the target was activated: {foreign}', notes)
+                ok &= check(not foreign, f'a window other than the target was activated after the target came forward: {foreign}', notes)
             else:
                 behind = stays_behind(rec, [])
                 notes.append(f'foreground ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}, '
