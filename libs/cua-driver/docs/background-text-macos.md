@@ -405,9 +405,12 @@ activation-assist key):
 }
 ```
 
-Every other failure inside that transaction has the same shape with
-`code: "foreground_unavailable"`: focus not confirmed, the fallback focus
-click refused as off-screen, or the fallback focus click returning an error.
+Every other failure while establishing focus on the element after activation
+has the same shape with `code: "foreground_unavailable"`: focus not confirmed,
+the fallback focus click refused as off-screen, or the fallback focus click
+returning an error. A later failure in the same transaction, such as the
+window losing the foreground after focus was established or an error from
+the key or text sender, is reported as an ordinary error, as before.
 `focus_click` says what became of that click: `"not_sent"`, `"sent"`, or
 `"uncertain"` when the click returned an error, because part or all of its
 mouse input may have gone out (and a completed click may have moved the
