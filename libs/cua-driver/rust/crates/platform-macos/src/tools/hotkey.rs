@@ -308,37 +308,33 @@ impl Tool for HotkeyTool {
         // ladder for web areas. The request remains snapshot-bound AX
         // targeting; only the focus transport falls back through a hit-test
         // and, on the explicit foreground rung, a real click when required.
-        let web_ax_focus_xy = if let (Some(guard), Some(wid), Some(index)) =
-            (element_guard.clone(), window_id, element_index)
-        {
-            let web_guard = guard.clone();
-            let is_web = tokio::task::spawn_blocking(move || {
-                super::type_text::target_in_web_area(
-                    pid,
-                    Some((web_guard.as_ptr(), Some(index))),
-                    Some(wid),
-                )
-            })
-            .await
-            .unwrap_or(true);
-            if is_web {
-                tokio::task::spawn_blocking(move || unsafe {
-                    let (screen_x, screen_y) = crate::ax::bindings::element_screen_center(
-                        guard.as_ptr() as crate::ax::bindings::AXUIElementRef,
-                    )?;
-                    let frame = super::px_frame::resolve_window_px_frame(wid).ok()?;
-                    Some((
-                        (screen_x - frame.bounds.x) * frame.scale,
-                        (screen_y - frame.bounds.y) * frame.scale,
-                    ))
-                })
-                .await
-                .unwrap_or(None)
-            } else {
-                None
+        // A foreground request addressed by a token is checked live first, so
+        // a control the app removed after the read gets no focus click and no
+        // chord.
+        let pixel = px.zip(py);
+        let plan_guard = element_guard.clone();
+        let plan = tokio::task::spawn_blocking(move || {
+            plan_hotkey_focus(
+                fg,
+                pixel,
+                plan_guard.is_some(),
+                || {
+                    plan_guard
+                        .as_ref()
+                        .map_or(super::element_liveness::Liveness::Alive, |guard| {
+                            super::element_liveness::read_liveness(guard.as_ptr())
+                        })
+                },
+                || web_focus_center(pid, plan_guard.as_ref(), window_id, element_index),
+            )
+        })
+        .await;
+        let focus = match plan {
+            Ok(Ok(focus)) => focus,
+            Ok(Err(super::element_liveness::DeadElement)) => {
+                return self.state.snapshots.dead_element_refusal(pid)
             }
-        } else {
-            None
+            Err(error) => return ToolResult::error(format!("Task error: {error}")),
         };
 
         // PX form, plus the web-content AX fallback above: focus the field
@@ -346,12 +342,7 @@ impl Tool for HotkeyTool {
         // the target for the chord itself because the focus helper restores
         // the previous app before returning.
         let coordinate_focus = {
-            let focus_xy = match ((px, py), web_ax_focus_xy) {
-                ((Some(cx), Some(cy)), _) => Some((cx, cy)),
-                ((None, None), Some(center)) => Some(center),
-                _ => None,
-            };
-            if let Some((cx, cy)) = focus_xy {
+            if let Some((cx, cy)) = focus.point() {
                 let from_zoom = args
                     .get("from_zoom")
                     .and_then(|v| v.as_bool())
@@ -442,20 +433,15 @@ impl Tool for HotkeyTool {
                         // requirement as the px form. Activate the exact window,
                         // establish and confirm the requested child focus after
                         // activation, then use the guarded global HID queue.
-                        // A chord addressed to a control the app has since
-                        // removed is refused before the window is fronted.
+                        // `plan_hotkey_focus` already refused a control the
+                        // app removed after the read, before this point.
                         (true, false, Some(wid), Some(ptr)) => {
-                            super::element_liveness::require_live(
-                                || super::element_liveness::read_liveness(ptr),
+                            crate::input::skylight::with_foreground_hid_activation(
+                                pid as libc::pid_t,
+                                wid,
                                 || {
-                                    crate::input::skylight::with_foreground_hid_activation(
-                                        pid as libc::pid_t,
-                                        wid,
-                                        || {
-                                            focus_hotkey_element(pid, ptr)?;
-                                            crate::input::keyboard::press_key_bare_global(&key, &m)
-                                        },
-                                    )
+                                    focus_hotkey_element(pid, ptr)?;
+                                    crate::input::keyboard::press_key_bare_global(&key, &m)
                                 },
                             )?;
                             Ok(())
@@ -530,18 +516,135 @@ impl Tool for HotkeyTool {
                 ))
                 .with_structured(structured)
             }
-            Ok(Err(e)) if super::element_liveness::is_dead_element(&e) => {
-                self.state.snapshots.dead_element_refusal(pid)
-            }
             Ok(Err(e)) => ToolResult::error(format!("hotkey failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
 }
 
+/// How a hotkey reaches its target before the chord is sent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HotkeyFocus {
+    /// No focus click: the chord goes to the window, or through the exact
+    /// child focus route for a token.
+    None,
+    /// A focus click at the caller's x,y.
+    Pixel((f64, f64)),
+    /// A web-content element addressed by a token, focused by a click at its
+    /// centre. The request is still addressed by the token.
+    WebElement((f64, f64)),
+}
+
+impl HotkeyFocus {
+    fn point(self) -> Option<(f64, f64)> {
+        match self {
+            Self::None => None,
+            Self::Pixel(point) | Self::WebElement(point) => Some(point),
+        }
+    }
+}
+
+/// Decide the focus step. A foreground request addressed by a token is
+/// checked live before anything else, so a control the app removed after the
+/// read is refused before the web hit-test, the focus click or the chord. The
+/// background gate covers background requests, so they are not probed here.
+fn plan_hotkey_focus(
+    foreground: bool,
+    pixel: Option<(f64, f64)>,
+    token: bool,
+    liveness: impl FnOnce() -> super::element_liveness::Liveness,
+    web_center: impl FnOnce() -> Option<(f64, f64)>,
+) -> Result<HotkeyFocus, super::element_liveness::DeadElement> {
+    if let Some(point) = pixel {
+        return Ok(HotkeyFocus::Pixel(point));
+    }
+    if !token {
+        return Ok(HotkeyFocus::None);
+    }
+    if foreground && liveness() == super::element_liveness::Liveness::Dead {
+        return Err(super::element_liveness::DeadElement);
+    }
+    Ok(web_center().map_or(HotkeyFocus::None, HotkeyFocus::WebElement))
+}
+
+/// The window-local screenshot point of a token's element when it sits in web
+/// content, for the pixel focus ladder; `None` for native controls.
+fn web_focus_center(
+    pid: i32,
+    guard: Option<&crate::ax::snapshot::RetainedElement>,
+    window_id: Option<u32>,
+    element_index: Option<usize>,
+) -> Option<(f64, f64)> {
+    let (guard, wid, index) = (guard?, window_id?, element_index?);
+    let is_web =
+        super::type_text::target_in_web_area(pid, Some((guard.as_ptr(), Some(index))), Some(wid));
+    if !is_web {
+        return None;
+    }
+    unsafe {
+        let (screen_x, screen_y) = crate::ax::bindings::element_screen_center(
+            guard.as_ptr() as crate::ax::bindings::AXUIElementRef
+        )?;
+        let frame = super::px_frame::resolve_window_px_frame(wid).ok()?;
+        Some((
+            (screen_x - frame.bounds.x) * frame.scale,
+            (screen_y - frame.bounds.y) * frame.scale,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A foreground hotkey addressed by a token whose control is gone is
+    /// refused before the web hit-test, so no focus click and no chord follow;
+    /// the plan is the only source of the focus point the dispatcher clicks.
+    #[test]
+    fn a_dead_token_hotkey_is_refused_before_the_focus_click() {
+        use super::super::element_liveness::Liveness;
+        let mut web_probed = false;
+        let plan = plan_hotkey_focus(
+            true,
+            None,
+            true,
+            || Liveness::Dead,
+            || {
+                web_probed = true;
+                Some((5.0, 6.0))
+            },
+        );
+        assert!(plan.is_err(), "{plan:?}");
+        assert!(
+            !web_probed,
+            "the web focus point was resolved for a dead control"
+        );
+    }
+
+    /// A live web element keeps its token route through the focus click; a
+    /// live native element goes to the exact child route; background and
+    /// pixel requests are not probed.
+    #[test]
+    fn hotkey_focus_plan_keeps_live_and_background_routes() {
+        use super::super::element_liveness::Liveness;
+        assert_eq!(
+            plan_hotkey_focus(true, None, true, || Liveness::Alive, || Some((5.0, 6.0))).unwrap(),
+            HotkeyFocus::WebElement((5.0, 6.0))
+        );
+        assert_eq!(
+            plan_hotkey_focus(true, None, true, || Liveness::Alive, || None).unwrap(),
+            HotkeyFocus::None
+        );
+        let never = || -> Liveness { panic!("probed a request that needs no probe") };
+        assert_eq!(
+            plan_hotkey_focus(false, None, true, never, || Some((5.0, 6.0))).unwrap(),
+            HotkeyFocus::WebElement((5.0, 6.0))
+        );
+        assert_eq!(
+            plan_hotkey_focus(true, Some((1.0, 2.0)), false, never, || None).unwrap(),
+            HotkeyFocus::Pixel((1.0, 2.0))
+        );
+    }
 
     #[test]
     fn hotkey_contract_accepts_snapshot_bound_ax_targets() {
