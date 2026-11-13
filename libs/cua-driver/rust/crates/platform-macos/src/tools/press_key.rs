@@ -437,19 +437,30 @@ impl Tool for PressKeyTool {
                             )
                         })?;
                         return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
-                                wid,
+                            // A key addressed to a control the app has since
+                            // removed is refused before the window is fronted.
+                            super::element_liveness::require_live(
+                                || match pre_focus_ptr {
+                                    Some(ptr) => super::element_liveness::read_liveness(ptr),
+                                    None => super::element_liveness::Liveness::Alive,
+                                },
                                 || {
-                                    // Activation can change the first responder, so
-                                    // repeat the best-effort AX focus write inside
-                                    // the guarded foreground interval immediately
-                                    // before the physical key transition.
-                                    if let Some(element_ptr) = pre_focus_ptr {
-                                        let _ =
-                                            crate::input::ax_actions::focus_element(element_ptr);
-                                    }
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    crate::input::skylight::with_foreground_hid_activation(
+                                        pid as libc::pid_t,
+                                        wid,
+                                        || {
+                                            // Activation can change the first responder, so
+                                            // repeat the best-effort AX focus write inside
+                                            // the guarded foreground interval immediately
+                                            // before the physical key transition.
+                                            if let Some(element_ptr) = pre_focus_ptr {
+                                                let _ = crate::input::ax_actions::focus_element(
+                                                    element_ptr,
+                                                );
+                                            }
+                                            crate::input::keyboard::press_key_bare_global(&key, &m)
+                                        },
+                                    )
                                 },
                             )
                         });
@@ -493,6 +504,11 @@ impl Tool for PressKeyTool {
                 ))
                 .with_structured(structured)
                 .with_action_record(action_record(confirmed, fg))
+            }
+            PressKeyDeliveryOutcome::Failed(error)
+                if super::element_liveness::is_dead_element(&error) =>
+            {
+                self.state.snapshots.dead_element_refusal(pid)
             }
             PressKeyDeliveryOutcome::Failed(error) => delivery_failed(error),
         }

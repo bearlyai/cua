@@ -79,15 +79,28 @@ fn screenshot_context_refusal(pid: Option<i32>, window_id: Option<u64>) -> ToolR
     }))
 }
 
+/// Why a token the store still holds is refused: the app removed or replaced
+/// its element after the read, found by a live check before a foreground step.
+const DEAD_ELEMENT_DETAIL: &str =
+    "the element could not be found live in the app, so nothing was activated or sent";
+
 fn stale_token_refusal<S>(pid: i32, lane: &[Snapshot<S>]) -> ToolResult {
+    stale_refusal(pid, lane, None)
+}
+
+fn stale_refusal<S>(pid: i32, lane: &[Snapshot<S>], detail: Option<&str>) -> ToolResult {
     let current: Vec<_> = lane
         .iter()
         .map(|snapshot| (format_snapshot_id(snapshot.id), snapshot.window_id))
         .collect();
+    let lead = match detail {
+        Some(detail) => format!("{STALE_TOKEN_ERROR}; {detail}"),
+        None => STALE_TOKEN_ERROR.to_owned(),
+    };
     let message = match current.as_slice() {
-        [] => format!("{STALE_TOKEN_ERROR}; pid {pid} has no current snapshot"),
+        [] => format!("{lead}; pid {pid} has no current snapshot"),
         current => format!(
-            "{STALE_TOKEN_ERROR}; current snapshots for pid {pid}: {}",
+            "{lead}; current snapshots for pid {pid}: {}",
             current
                 .iter()
                 .map(|(snapshot_id, window_id)| format!("{snapshot_id} (window {window_id})"))
@@ -418,6 +431,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         })
     }
 
+    /// The refusal for a token [`Self::resolve`] accepted whose element a
+    /// live check found gone before a foreground step. It has the same code
+    /// and envelope as a token the store no longer accepts, so callers handle
+    /// both the same way: nothing was activated or sent, read the window again.
+    pub fn dead_element_refusal(&self, pid: i32) -> ToolResult {
+        let inner = self.inner.lock().unwrap();
+        let lane = inner.get(&pid).map(Vec::as_slice).unwrap_or_default();
+        stale_refusal(pid, lane, Some(DEAD_ELEMENT_DETAIL))
+    }
+
     pub fn remove(&self, pid: i32, window_id: u64) -> Option<u32> {
         let retired = {
             let mut inner = self.inner.lock().unwrap();
@@ -634,6 +657,35 @@ mod tests {
             structured["current_snapshots"],
             serde_json::json!([{ "snapshot_id": format_snapshot_id(current), "window_id": 555 }])
         );
+    }
+
+    #[test]
+    fn a_dead_element_is_refused_like_a_stale_token() {
+        let cache = SnapshotStore::new();
+        let current = cache.publish(1, 555, Payload(vec![0]));
+        let stale = token_refusal(&cache, 1, &token_for(0xdead, 0));
+        let dead = cache.dead_element_refusal(1);
+        assert_eq!(dead.is_error, Some(true));
+        let structured = dead.structured_content.unwrap();
+        assert_eq!(structured["status"], stale["status"]);
+        assert_eq!(structured["refusal"]["code"], "stale_element_token");
+        assert_eq!(structured["current_snapshots"], stale["current_snapshots"]);
+        let message = structured["refusal"]["message"].as_str().unwrap();
+        assert!(message.starts_with(STALE_TOKEN_ERROR), "{message}");
+        assert!(message.contains("could not be found live"), "{message}");
+        assert!(
+            message.ends_with(&format!(
+                "current snapshots for pid 1: {} (window 555)",
+                format_snapshot_id(current)
+            )),
+            "{message}"
+        );
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&structured), keys(&stale));
     }
 
     #[test]

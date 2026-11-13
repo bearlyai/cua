@@ -233,28 +233,87 @@ fn foreground_element_click_dispatch(
     }
 }
 
+/// The three activations a foreground element click can use. Production goes
+/// through the skylight helpers; tests record which one ran.
+trait ForegroundActivation {
+    fn pointer(
+        &mut self,
+        pid: libc::pid_t,
+        wid: u32,
+        point: (f64, f64),
+        action: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>;
+    fn hid(
+        &mut self,
+        pid: libc::pid_t,
+        wid: u32,
+        action: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>;
+    fn assist(
+        &mut self,
+        pid: libc::pid_t,
+        wid: u32,
+        action: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool>;
+}
+
+struct SkylightActivation;
+
+impl ForegroundActivation for SkylightActivation {
+    fn pointer(
+        &mut self,
+        pid: libc::pid_t,
+        wid: u32,
+        point: (f64, f64),
+        action: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        crate::input::skylight::with_foreground_pointer_activation(pid, wid, &[point], action)
+    }
+
+    fn hid(
+        &mut self,
+        pid: libc::pid_t,
+        wid: u32,
+        action: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        crate::input::skylight::with_foreground_hid_activation(pid, wid, action)
+    }
+
+    fn assist(
+        &mut self,
+        pid: libc::pid_t,
+        wid: u32,
+        action: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        crate::input::skylight::with_foreground_assist(pid, wid, action)
+    }
+}
+
+/// Every dispatch first confirms the element still exists: activation would
+/// otherwise bring the window forward before the press fails on a control
+/// the app removed after the read.
 fn run_foreground_element_click(
     has_modifiers: bool,
     selection_point: Option<(f64, f64)>,
-    pid: libc::pid_t,
-    wid: u32,
+    (pid, wid): (libc::pid_t, u32),
+    liveness: impl FnOnce() -> super::element_liveness::Liveness,
+    activation: &mut impl ForegroundActivation,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    match foreground_element_click_dispatch(has_modifiers, selection_point.is_some()) {
+    let dispatch = foreground_element_click_dispatch(has_modifiers, selection_point.is_some());
+    super::element_liveness::require_live(liveness, || match dispatch {
         ForegroundElementClickDispatch::Pointer => {
             let point = selection_point
                 .ok_or_else(|| anyhow::anyhow!("modifier click has no proven element point"))?;
-            crate::input::skylight::with_foreground_pointer_activation(pid, wid, &[point], action)?;
+            activation.pointer(pid, wid, point, action)?;
             Ok(true)
         }
         ForegroundElementClickDispatch::Hid => {
-            crate::input::skylight::with_foreground_hid_activation(pid, wid, action)?;
+            activation.hid(pid, wid, action)?;
             Ok(true)
         }
-        ForegroundElementClickDispatch::Assist => {
-            crate::input::skylight::with_foreground_assist(pid, wid, action)
-        }
-    }
+        ForegroundElementClickDispatch::Assist => activation.assist(pid, wid, action),
+    })
 }
 
 fn pixel_activation_policy(
@@ -679,6 +738,19 @@ impl Tool for ClickTool {
             // close, autoscroll, etc.). If we can't resolve a center, error rather
             // than silently degrade to AXPress.
             if button_str == "middle" {
+                // The foreground arm activates the window and moves the real
+                // pointer; confirm the element still exists first.
+                if delivery_mode.is_foreground() {
+                    let probe = element_guard.clone();
+                    let liveness = tokio::task::spawn_blocking(move || {
+                        super::element_liveness::read_liveness(probe.as_ptr())
+                    })
+                    .await
+                    .unwrap_or(super::element_liveness::Liveness::Alive);
+                    if liveness == super::element_liveness::Liveness::Dead {
+                        return self.state.snapshots.dead_element_refusal(pid);
+                    }
+                }
                 let (cx, cy) = match center {
                     Some(c) => c,
                     None => {
@@ -857,8 +929,9 @@ impl Tool for ClickTool {
                             let fronted = run_foreground_element_click(
                                 has_modifiers,
                                 selection_pixel.map(|point| (point.screen_x, point.screen_y)),
-                                pid as libc::pid_t,
-                                wid,
+                                (pid as libc::pid_t, wid),
+                                || super::element_liveness::read_liveness(element_ptr),
+                                &mut SkylightActivation,
                                 action,
                             )?;
                             let outcome = outcome.ok_or_else(|| {
@@ -944,6 +1017,9 @@ impl Tool for ClickTool {
                         });
                     }
                     ToolResult::text(msg).with_structured(structured)
+                }
+                Ok(Err(e)) if super::element_liveness::is_dead_element(&e) => {
+                    self.state.snapshots.dead_element_refusal(pid)
                 }
                 Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1894,5 +1970,111 @@ mod tests {
             foreground_element_click_dispatch(false, false),
             ForegroundElementClickDispatch::Assist
         );
+    }
+
+    /// Records which activation ran; never touches a real window.
+    #[derive(Default)]
+    struct RecordingActivation {
+        activated: Vec<&'static str>,
+    }
+
+    impl ForegroundActivation for RecordingActivation {
+        fn pointer(
+            &mut self,
+            _pid: libc::pid_t,
+            _wid: u32,
+            _point: (f64, f64),
+            action: impl FnOnce() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.activated.push("pointer");
+            action()
+        }
+
+        fn hid(
+            &mut self,
+            _pid: libc::pid_t,
+            _wid: u32,
+            action: impl FnOnce() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.activated.push("hid");
+            action()
+        }
+
+        fn assist(
+            &mut self,
+            _pid: libc::pid_t,
+            _wid: u32,
+            action: impl FnOnce() -> anyhow::Result<()>,
+        ) -> anyhow::Result<bool> {
+            self.activated.push("assist");
+            action()?;
+            Ok(true)
+        }
+    }
+
+    /// (has_modifiers, selection point, the activation that dispatch uses).
+    const FOREGROUND_ELEMENT_DISPATCHES: [(bool, Option<(f64, f64)>, &str); 3] = [
+        (true, Some((10.0, 20.0)), "pointer"),
+        (true, None, "hid"),
+        (false, None, "assist"),
+    ];
+
+    /// A control the app removed after the read is refused as a stale token
+    /// on every foreground element dispatch, before any activation and
+    /// without pressing anything.
+    #[test]
+    fn a_dead_element_is_refused_before_any_foreground_activation() {
+        use super::super::element_liveness::{is_dead_element, liveness_from_ax_error};
+        for (has_modifiers, point, arm) in FOREGROUND_ELEMENT_DISPATCHES {
+            let mut activation = RecordingActivation::default();
+            let mut pressed = false;
+            let result = run_foreground_element_click(
+                has_modifiers,
+                point,
+                (1, 2),
+                || liveness_from_ax_error(-25202),
+                &mut activation,
+                || {
+                    pressed = true;
+                    Ok(())
+                },
+            );
+            assert!(
+                activation.activated.is_empty(),
+                "{arm}: activated {:?}",
+                activation.activated
+            );
+            assert!(!pressed, "{arm}: pressed a dead element");
+            let error = result.expect_err("a dead element must be refused");
+            assert!(is_dead_element(&error), "{arm}: {error}");
+        }
+    }
+
+    /// A liveness read that fails for any other reason says nothing about the
+    /// control, so each dispatch activates and presses exactly as before.
+    #[test]
+    fn an_unclear_liveness_read_dispatches_as_before() {
+        use super::super::element_liveness::liveness_from_ax_error;
+        for (has_modifiers, point, arm) in FOREGROUND_ELEMENT_DISPATCHES {
+            for error in [0, -25204, -25205, -25212] {
+                let mut activation = RecordingActivation::default();
+                let mut pressed = false;
+                let fronted = run_foreground_element_click(
+                    has_modifiers,
+                    point,
+                    (1, 2),
+                    || liveness_from_ax_error(error),
+                    &mut activation,
+                    || {
+                        pressed = true;
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{arm} {error}: {e}"));
+                assert_eq!(activation.activated, vec![arm], "{error}");
+                assert!(pressed, "{arm} {error}: not pressed");
+                assert!(fronted, "{arm} {error}");
+            }
+        }
     }
 }

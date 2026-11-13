@@ -527,6 +527,9 @@ impl Tool for TypeTextTool {
                 );
             }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
+            Ok(Err(error)) if super::element_liveness::is_dead_element(&error) => {
+                return self.state.snapshots.dead_element_refusal(pid);
+            }
             Ok(Err(error)) => Ok(Err(error)),
             Err(error) => Err(error),
         };
@@ -1889,6 +1892,18 @@ fn type_text_blocking(
         }
     }
     let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
+
+    // Both foreground routes below front the window before they focus the
+    // field. Refuse text addressed to a control the app has since removed
+    // before either one runs.
+    if delivery_mode.is_foreground() {
+        if let Some((element_ptr, _)) = element_ptr_and_idx {
+            super::element_liveness::require_live(
+                || super::element_liveness::read_liveness(element_ptr),
+                || Ok(()),
+            )?;
+        }
+    }
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() && !foreground_typing::is_input_forwarder(pid) {

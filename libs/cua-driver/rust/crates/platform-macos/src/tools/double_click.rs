@@ -142,6 +142,9 @@ impl Tool for DoubleClickTool {
 
             return match result {
                 Ok(Ok(msg)) => ToolResult::text(msg),
+                Ok(Err(e)) if super::element_liveness::is_dead_element(&e) => {
+                    self.state.snapshots.dead_element_refusal(pid)
+                }
                 Ok(Err(e)) => ToolResult::error(format!("double_click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -315,6 +318,15 @@ fn ax_double_click(
     foreground: bool,
 ) -> anyhow::Result<String> {
     let element = element_ptr as AXUIElementRef;
+
+    // The foreground route clicks the element's centre; refuse a control the
+    // app has since removed before AXOpen or the click.
+    if foreground {
+        super::element_liveness::require_live(
+            || super::element_liveness::read_liveness(element_ptr),
+            || Ok(()),
+        )?;
+    }
 
     // Try AXOpen first (Finder items, openable list rows, document cells).
     if has_ax_open {

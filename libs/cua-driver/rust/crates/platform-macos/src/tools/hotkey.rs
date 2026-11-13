@@ -442,13 +442,20 @@ impl Tool for HotkeyTool {
                         // requirement as the px form. Activate the exact window,
                         // establish and confirm the requested child focus after
                         // activation, then use the guarded global HID queue.
+                        // A chord addressed to a control the app has since
+                        // removed is refused before the window is fronted.
                         (true, false, Some(wid), Some(ptr)) => {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
-                                wid,
+                            super::element_liveness::require_live(
+                                || super::element_liveness::read_liveness(ptr),
                                 || {
-                                    focus_hotkey_element(pid, ptr)?;
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    crate::input::skylight::with_foreground_hid_activation(
+                                        pid as libc::pid_t,
+                                        wid,
+                                        || {
+                                            focus_hotkey_element(pid, ptr)?;
+                                            crate::input::keyboard::press_key_bare_global(&key, &m)
+                                        },
+                                    )
                                 },
                             )?;
                             Ok(())
@@ -522,6 +529,9 @@ impl Tool for HotkeyTool {
                     changes.result_suffix()
                 ))
                 .with_structured(structured)
+            }
+            Ok(Err(e)) if super::element_liveness::is_dead_element(&e) => {
+                self.state.snapshots.dead_element_refusal(pid)
             }
             Ok(Err(e)) => ToolResult::error(format!("hotkey failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),

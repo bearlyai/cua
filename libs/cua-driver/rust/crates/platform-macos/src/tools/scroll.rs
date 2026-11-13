@@ -257,6 +257,23 @@ impl Tool for ScrollTool {
         };
         let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
 
+        // Every foreground element route below fronts the window, and when the
+        // element yields no wheel point the keystroke fallback sends keys to
+        // whatever is focused. Refuse a control the app has since removed
+        // before any of them.
+        if delivery_mode.is_foreground() {
+            if let Some(guard) = pre_focus_guard.clone() {
+                let liveness = tokio::task::spawn_blocking(move || {
+                    super::element_liveness::read_liveness(guard.as_ptr())
+                })
+                .await
+                .unwrap_or(super::element_liveness::Liveness::Alive);
+                if liveness == super::element_liveness::Liveness::Dead {
+                    return self.state.snapshots.dead_element_refusal(pid);
+                }
+            }
+        }
+
         let mut _mutation_lease: Option<super::BackgroundMutationLease> = None;
 
         // AppKit exposes vertical scroll-bar buttons beneath the text area's

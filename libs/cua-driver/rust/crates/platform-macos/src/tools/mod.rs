@@ -7,6 +7,7 @@ mod click;
 mod clipboard;
 mod double_click;
 mod drag;
+mod element_liveness;
 mod foreground_typing;
 mod get_window_state;
 mod hotkey;
