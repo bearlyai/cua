@@ -1016,8 +1016,11 @@ try:
                     return 'INFO'
                 ok &= succeeded(rec, notes)
                 ok &= check(moved == 3, f'moved {moved}', notes)
-                ok &= check(structured.get('activated') is True, f'activated {structured.get("activated")!r}', notes)
-                ok &= check(structured.get('foreground_restored') is False, f'foreground_restored {structured.get("foreground_restored")!r}', notes)
+                # A success reaches a client as the public action result, which keeps the delivery mode and the
+                # text but not `activated` or `foreground_restored`; those are recorded when present.
+                clause = 'the window came to the front and the earlier window could not be put back'
+                ok &= check(clause in (rec['reply'].get('text') or ''), 'the reply text does not say the window was left in front', notes)
+                notes.append(f'activated {structured.get("activated")!r}; foreground_restored {structured.get("foreground_restored")!r}')
                 ok &= check_mode(rec, notes, 'foreground')
                 ok &= check(rec['foreground_after'] == 'target', f'foreground ended on {rec["foreground_after"]}', notes)
                 foreign = [smp for smp in rec['foreground_samples'] if smp[1] == 'sentinel'
