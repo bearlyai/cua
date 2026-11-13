@@ -245,7 +245,8 @@ pub(crate) fn semantic_scroll_from(result: Result<(), (u32, String)>) -> Semanti
 
 /// The element's own scroll stopped part-way: some steps already moved the
 /// content, so this is neither the no-effects stale refusal nor a reason to
-/// send the wheel on top of what moved.
+/// send the wheel on top of what moved. Its effect is `partial`, with the
+/// completed steps as `delivery.delivered_count`.
 #[derive(Debug)]
 pub(crate) struct ScrollIncomplete {
     pub hwnd: u64,
@@ -276,8 +277,9 @@ impl ScrollIncomplete {
     fn result(&self) -> ToolResult {
         ToolResult::error(self.to_string()).with_structured(serde_json::json!({
             "code": SCROLL_INCOMPLETE,
-            "effect": "failed",
+            "effect": "partial",
             "path": "uia",
+            "delivery": { "delivered_count": self.completed },
             "completed_steps": self.completed,
             "amount": self.amount,
             "wheel_sent": false,
@@ -1138,10 +1140,10 @@ mod tests {
     }
 
     /// The element's own scroll moved one step, then failed, and the element
-    /// is gone: no wheel on top of what moved, and an honest failure that
-    /// says so, never the no-effects stale refusal.
+    /// is gone: no wheel on top of what moved, and a `partial` result that
+    /// counts the step, never the no-effects stale refusal.
     #[test]
-    fn a_partly_completed_element_scroll_is_an_honest_failure_not_stale() {
+    fn a_partly_completed_element_scroll_is_reported_partial_not_stale() {
         for pixel in [None, Some((7, 8))] {
             let mut target = FakeScroll::new(
                 LiveBounds::Rect((300, 400, 360, 420)),
@@ -1158,7 +1160,11 @@ mod tests {
             assert_eq!(result.is_error, Some(true));
             let structured = result.structured_content.unwrap();
             assert_eq!(structured["code"], SCROLL_INCOMPLETE, "{structured}");
-            assert_eq!(structured["effect"], "failed");
+            assert_eq!(structured["effect"], "partial");
+            assert_eq!(
+                structured["delivery"],
+                serde_json::json!({ "delivered_count": 1 })
+            );
             assert_eq!(structured["completed_steps"], 1);
             assert_eq!(structured["amount"], 3);
             assert_eq!(structured["wheel_sent"], false);

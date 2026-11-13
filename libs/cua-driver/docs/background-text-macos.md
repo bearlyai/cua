@@ -424,7 +424,8 @@ returns:
   "content": [{"type": "text", "text": "scroll_incomplete: UIA element [N] in HWND 0x… scrolled 1 of 3 step(s), then its UIA scroll failed (UIA scroll failed: …); no wheel was sent. Read the window again before acting."}],
   "isError": true,
   "structuredContent": {
-    "code": "scroll_incomplete", "effect": "failed", "path": "uia",
+    "code": "scroll_incomplete", "effect": "partial", "path": "uia",
+    "delivery": {"delivered_count": 1},
     "completed_steps": 1, "amount": 3, "wheel_sent": false,
     "window_id": 0, "element_index": 0, "retryable": false,
     "escalation": {"recommended": "verify_state", "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more."}
@@ -432,8 +433,11 @@ returns:
 }
 ```
 
-It appears only after at least one step succeeded; it is never
-`status: "refused"`.
+It appears only after at least one step succeeded, so its effect is
+`partial` with the completed steps as `delivery.delivered_count`, as the
+[action result contract](action-result-contract.md) requires; it is never
+`status: "refused"`. The post-activation keyboard failures above stay
+`effect: "failed"`, because none of the requested keys or text was sent.
 
 Exceptions that never take the foreground and so have no foreground check:
 `right_click` by element on macOS (`AXShowMenu`, or a click posted to the
