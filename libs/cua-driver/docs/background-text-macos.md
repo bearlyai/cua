@@ -395,6 +395,10 @@ Which foreground routes check, before they act:
   front, the scroll is still a success, and the reply says so:
   `Scrolled {direction} {amount} ticks via UIA; the window came to the front and the earlier window could not be put back (delivery_mode:foreground).`
   with `{"path": "uia", "verified": false, "delivery_mode": "foreground", "activated": true, "foreground_restored": false}`.
+  A client receives a success as the public action result, which keeps the
+  mode (`"delivery": {"mode": "foreground"}`) and the text but not
+  `activated` or `foreground_restored`; on a success, the mode and the text
+  are what say the window was left in front.
   `scroll_incomplete` and `scroll_uncertain` (below) carry the same
   `delivery_mode`, and in that case `activated: true`,
   `foreground_restored: false` and the same clause in their text.
