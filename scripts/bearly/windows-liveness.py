@@ -65,7 +65,16 @@ LEVELS = {0x1000: 'Low', 0x2000: 'Medium', 0x2100: 'Medium Plus', 0x3000: 'High'
 # and 0xE8 (its input-drain marker). Counted apart from requested keys.
 ASSIST_KEYS = {0xFC, 0xE8}
 # Fixture notes that are not input: activation, focus and provider calls.
-NOTES = {'activated', 'deactivated', 'gotfocus', 'scrollcall-ui', 'scrollcall-other'}
+NOTE_KINDS = ('activated', 'deactivated', 'gotfocus', 'scrollcall', 'getpattern', 'percent')
+
+
+class _Notes:
+    def __contains__(self, kind):
+        return kind.startswith(NOTE_KINDS)
+
+
+NOTES = _Notes()
+B9 = 0xB9
 TARGET_HOME = (160, 140, 520, 420)
 SENTINEL_HOME = (100, 100, 700, 520)
 SENTINEL_ASIDE = (760, 560, 260, 160)
@@ -97,6 +106,17 @@ def integrity(pid=None):
 
 def foreground():
     return int(user.GetForegroundWindow() or 0)
+
+
+_qpf = ctypes.c_int64()
+kernel.QueryPerformanceFrequency(ctypes.byref(_qpf))
+
+
+def now_ms():
+    """The machine-wide performance counter in ms, the fixtures' event clock."""
+    counter = ctypes.c_int64()
+    kernel.QueryPerformanceCounter(ctypes.byref(counter))
+    return counter.value // (_qpf.value // 1000)
 
 
 def cursor():
@@ -318,6 +338,24 @@ def summarise(events):
     return counts, totals
 
 
+def timeline(rec, start_q):
+    """Everything on one clock, ms from the call start: the reply, foreground
+    changes, fixture notes (activation, focus, provider calls) and input."""
+    items = [[0, 'proof', 'call start', None], [rec['reply_clock_ms'], 'proof', 'reply', None]]
+    items += [[ms, 'foreground', name, None] for ms, name in rec['foreground_samples']]
+    for name in ('Target', 'Sentinel'):
+        for t, control, kind, value in rec['received'][name]['events']:
+            items.append([t - start_q, name.lower(), f'{control} {kind}', value])
+    items.sort(key=lambda item: item[0])
+    stray = []
+    for index, (t, source, what, value) in enumerate(items):
+        if source in ('target', 'sentinel') and what.endswith(' keyup') and value == B9:
+            earlier = [item for item in items[:index] if item[1] == 'target' and any(k in item[2] for k in ('scrollcall', 'getpattern', 'percent'))]
+            stray.append({'at_ms': t, 'window': source, 'after_provider_call': earlier[-1] if earlier else None,
+                          'after': items[index - 1] if index else None})
+    return items, stray
+
+
 def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), arm=(), aside=False,
             tail=1.0, post=None, token=None, keep=False, mode='foreground'):
     rec = {'id': rid, 'group': group, 'desc': desc, 'tool': tool, 'label': label, 'aside': aside,
@@ -355,6 +393,8 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
         rec['target_before'], rec['sentinel_before'] = target_before, sentinel_before
         samples, stopped = [], threading.Event()
         start = time.monotonic()
+        start_q = now_ms()
+        rec['call_start_clock_ms'] = start_q
 
         def observe():
             last = fg_before
@@ -370,6 +410,7 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
         try:
             rec['reply'] = raw(tool, values)
             rec['reply_ms'] = round((time.monotonic() - start) * 1000)
+            rec['reply_clock_ms'] = now_ms() - start_q
             rec['window_under_reported_point'] = under(reported_point(rec))
             if post:
                 post(rec)
@@ -393,6 +434,7 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
             received[name] = {'events': new, 'counts': counts, 'totals': totals}
         rec['received'] = received
         rec['before_read_state_events'] = len(before_read['events'])
+        rec['timeline'], rec['stray_b9_keyups'] = timeline(rec, start_q)
     except Exception:
         rec.setdefault('harness_error', traceback.format_exc())
     if expect and 'harness_error' not in rec:
@@ -587,6 +629,22 @@ def expect_after_activation(code, focus_click, clicked=None):
     return evaluate
 
 
+def stays_behind(rec, notes, settle_ms=500):
+    """Foreground UIA scroll: the sentinel is in front at the end and has been
+    since shortly after the reply. Brief changes during the call are recorded."""
+    samples = rec['foreground_samples']
+    ok = check(rec['foreground_after'] == 'sentinel', f'foreground ended on {rec["foreground_after"]}: {samples}', notes)
+    late = [s for s in samples if s[0] > rec['reply_ms'] + settle_ms]
+    ok &= check(not late, f'foreground changed after the reply: {late}', notes)
+    notes.append(f'foreground during call: {samples or "unchanged"}; target activations '
+                 f'{rec["target_after"]["activations"] - rec["target_before"]["activations"] if rec["target_after"]["activations"] >= rec["target_before"]["activations"] else "reset"}')
+    if rec['stray_b9_keyups']:
+        notes.append(f'stray 0xB9 key-up: {rec["stray_b9_keyups"]}')
+    else:
+        notes.append('no stray 0xB9 key-up')
+    return ok
+
+
 def reported_point(rec):
     match = re.search(r'at screen \((-?\d+),(-?\d+)\)', rec['reply'].get('text') or '')
     return (int(match.group(1)), int(match.group(2))) if match else None
@@ -623,6 +681,9 @@ def scroll_consistency(control, value_key):
         text = rec['reply'].get('text') or ''
         notes.append(f'{control} {value_key} {before.get(value_key)} -> {after.get(value_key)}; calls {after.get("calls")}; '
                       f'wheel target={wheel_target} sentinel={wheel_sentinel}; reply: {text[:200]}')
+        behind = stays_behind(rec, [])
+        notes.append(f'foreground: ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}, '
+                     f'stray 0xB9={rec["stray_b9_keyups"] or "none"}')
         if structured.get('code') == 'scroll_incomplete':
             ok = check(structured.get('effect') == 'partial', 'partial result without effect partial', notes)
             ok &= check(structured.get('wheel_sent') is False and wheel_target + wheel_sentinel == 0, 'wheel sent on a partial scroll', notes)
@@ -750,13 +811,14 @@ try:
         before, after = control_state(rec, 'before', 'Fixture list'), control_state(rec, 'after', 'Fixture list')
         ok &= check(after['top'] > before['top'], f'list top {before["top"]} -> {after["top"]}', notes)
         ok &= check(totals(rec, 'Target')['wheel'] + totals(rec, 'Sentinel')['wheel'] == 0, 'a wheel event was received', notes)
-        notes.append(f'list top {before["top"]} -> {after["top"]}; activated={rec["target_activated"]} fg_after={rec["foreground_after"]} '
-                     f'reply delivery={sc(rec).get("delivery")}')
+        ok &= stays_behind(rec, notes)
+        notes.append(f'list top {before["top"]} -> {after["top"]}; reply delivery={sc(rec).get("delivery")}')
         return verdict(ok)
-    run_row('scroll-uia', 'scroll', 'scroll a list with ScrollPattern: UIA, no wheel', 'scroll', 'Fixture list', ARGS['scroll'], uia_scroll, aside=True)
-    run_row('scroll-uia-covered', 'scroll', 'same, target covered', 'scroll', 'Fixture list', ARGS['scroll'], uia_scroll)
+    run_row('scroll-uia', 'scroll', 'scroll a list with ScrollPattern: UIA, no wheel, target stays behind', 'scroll', 'Fixture list',
+            ARGS['scroll'], uia_scroll, aside=True, tail=3.0)
+    run_row('scroll-uia-covered', 'scroll', 'same, target covered', 'scroll', 'Fixture list', ARGS['scroll'], uia_scroll, tail=3.0)
     run_row('scroll-uia-background', 'scroll', 'contrast: background UIA scroll of the same list', 'scroll', 'Fixture list', ARGS['scroll'],
-            uia_scroll, mode='background')
+            uia_scroll, mode='background', tail=3.0)
     pad = run_row('scroll-wheel-live-centre', 'scroll', 'scroll a control with no ScrollPattern: wheel at its live centre', 'scroll', 'Wheel pad',
                   ARGS['scroll'], expect_wheel_at('Wheel pad'), aside=True)
 
@@ -800,55 +862,83 @@ try:
             'Wheel pad', ARGS['scroll'], occluded)
     # 9. A real provider at its limits (target covered, so a wheel cannot move the target list).
     run_row('real-list-top-up', 'real provider', 'list at top, scroll up 1', 'scroll', 'Fixture list', {'direction': 'up', 'amount': 1},
-            scroll_consistency('Fixture list', 'top'))
+            scroll_consistency('Fixture list', 'top'), tail=3.0)
     run_row('real-list-bottom-down', 'real provider', 'list at bottom, scroll down 1', 'scroll', 'Fixture list', {'direction': 'down', 'amount': 1},
-            scroll_consistency('Fixture list', 'top'), arm=[('listtop', 199, 'Fixture list')])
+            scroll_consistency('Fixture list', 'top'), tail=3.0, arm=[('listtop', 199, 'Fixture list')])
     run_row('real-list-near-bottom-down3', 'real provider', 'list a few rows from the bottom, scroll down 3', 'scroll', 'Fixture list',
-            ARGS['scroll'], scroll_consistency('Fixture list', 'top'), arm=[('listtop', 186, 'Fixture list')])
-    # 10. Stretch: a custom UIA provider whose Scroll fails on purpose (target covered).
+            ARGS['scroll'], scroll_consistency('Fixture list', 'top'), tail=3.0, arm=[('listtop', 186, 'Fixture list')])
+    # 10. Stretch: a custom UIA provider whose Scroll fails on purpose. Its scroll
+    # percents move with its content (50 at the start) unless a mode makes the
+    # percent getters fail.
 
-    def custom(mode, completed, axis='vpos', wheel=False):
+    def custom(kind, completed=0, axis='vpos'):
+        """kind: ok | partial | wheel (uncovered, pass/fail) | wheel-covered (INFO) | info."""
         def evaluate(rec, notes):
             structured = sc(rec)
             before = control_state(rec, 'before', 'Custom scroller')
             after = control_state(rec, 'after', 'Custom scroller') or {}
             moved = (after.get(axis, before[axis]) or 0) - (before[axis] or 0)
             text = rec['reply'].get('text') or ''
-            calls = [e for e in rec['received']['Target']['events'] if e[2].startswith('scrollcall')]
-            notes.append(f'{axis} {before[axis]} -> {after.get(axis)} calls {after.get("calls")} exists={bool(after)}; provider calls {calls}; '
-                         f'under wheel point {rec.get("window_under_reported_point")}; reply: {text[:200]}')
+            calls = [[e[0] - rec['call_start_clock_ms'], e[2], e[3]] for e in rec['received']['Target']['events']
+                     if e[1] == 'Custom scroller' and e[2] in NOTES and e[2] != 'gotfocus']
+            wheels = {name: {c: v for c, v in rec['received'][name]['counts'].items() if v.get('wheel') or v.get('hwheel')}
+                      for name in ('Target', 'Sentinel')}
+            notes.append(f'{axis} {before[axis]} -> {after.get(axis)} (moved {moved}); calls {after.get("calls")} exists={bool(after)}; '
+                         f'provider calls (ms, kind, value) {calls}; wheel received {wheels}; '
+                         f'under wheel point {rec.get("window_under_reported_point")}; reply: {text[:220]}')
             ok = check('status' not in structured and 'refusal' not in structured, 'reply is a refusal', notes)
-            if mode == 'ok':
-                ok &= succeeded(rec, notes) and check(structured.get('route') == 'accessibility' and moved == 3, 'uia scroll did not complete', notes)
-                ok &= check(totals(rec, 'Sentinel')['wheel'] + totals(rec, 'Target')['wheel'] == 0, 'wheel sent', notes)
-            elif wheel:
-                ok &= check('SendInput wheel' in text, 'no wheel fallback', notes)
-                ok &= check(totals(rec, 'Sentinel')['wheel'] + totals(rec, 'Target')['wheel'] >= 1, 'no wheel event observed', notes)
-                rect = before['screen']
-                ok &= check(inside(reported_point(rec), rect), f'wheel point {reported_point(rec)} not inside {rect}', notes)
-                if moved:
-                    notes.append(f'COUNTEREXAMPLE: provider moved {moved} before its error, and the driver also sent the wheel')
-                    ok = False
-            else:
+            wheel_total = totals(rec, 'Sentinel')['wheel'] + totals(rec, 'Target')['wheel']
+            if kind == 'ok':
+                ok &= succeeded(rec, notes)
+                ok &= check(structured.get('route') == 'accessibility' and moved == 3, 'uia scroll did not complete', notes)
+                ok &= check(wheel_total == 0, 'wheel sent', notes)
+                ok &= stays_behind(rec, notes)
+            elif kind == 'partial':
                 ok &= check(structured.get('code') == 'scroll_incomplete', f'code {structured.get("code")!r}', notes)
                 ok &= check(structured.get('effect') == 'partial', f'effect {structured.get("effect")!r}', notes)
-                ok &= check((structured.get('delivery') or {}).get('delivered_count') == completed, f'delivered_count {(structured.get("delivery") or {}).get("delivered_count")}', notes)
+                ok &= check((structured.get('delivery') or {}).get('delivered_count') == completed,
+                            f'delivered_count {(structured.get("delivery") or {}).get("delivered_count")}', notes)
                 ok &= check(structured.get('completed_steps') == completed, f'completed_steps {structured.get("completed_steps")}', notes)
                 ok &= check(structured.get('wheel_sent') is False, 'wheel_sent is not false', notes)
-                ok &= check(totals(rec, 'Sentinel')['wheel'] + totals(rec, 'Target')['wheel'] == 0, 'wheel sent', notes)
+                ok &= check(wheel_total == 0, 'wheel sent', notes)
                 if after:
                     ok &= check(moved == completed, f'moved {moved}, reported {completed}', notes)
+                ok &= stays_behind(rec, notes)
+            elif kind == 'wheel':
+                ok &= check('SendInput wheel' in text, 'no wheel fallback', notes)
+                ok &= check(moved == 0, f'provider moved {moved} and the wheel was also sent', notes)
+                got = counts(rec, 'Target', 'Custom scroller')
+                ok &= check(got.get('wheel', 0) >= 1, 'Custom scroller received no wheel', notes)
+                ok &= only_on(rec, notes, 'Custom scroller', {'wheel', 'hwheel'})
+                ok &= check(inside(reported_point(rec), before['screen']), f'wheel point {reported_point(rec)} not inside {before["screen"]}', notes)
+                behind = stays_behind(rec, [])
+                notes.append(f'foreground ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}')
+            else:
+                behind = stays_behind(rec, [])
+                notes.append(f'foreground ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}, '
+                             f'stray 0xB9={rec["stray_b9_keyups"] or "none"}')
+                if kind == 'wheel-covered':
+                    notes.append('covered: the target stays behind, so the wheel goes to whatever is on top at that point (documented limit)')
+                return 'INFO'
             return verdict(ok)
         return evaluate
-    stretch = [('ok', 'down', 3, 'vpos', False), ('fail-first', 'down', 0, 'vpos', True), ('move-then-fail', 'down', 0, 'vpos', True),
-               ('fail-after-1', 'down', 1, 'vpos', False), ('fail-after-2', 'down', 2, 'vpos', False),
-               ('remove-after-1', 'down', 1, 'vpos', False), ('fail-after-1', 'right', 1, 'hpos', False)]
-    for mode, direction, completed, axis, wheel in stretch:
-        run_row(f'custom-{mode}-{direction}', 'custom provider', f'custom ScrollPattern {mode}, scroll {direction} 3', 'scroll',
-                'Custom scroller', {'direction': direction, 'amount': 3}, custom(mode, completed, axis, wheel), arm=[('scroller', mode)])
-    for mode in ('fail-first', 'move-then-fail'):
-        run_row(f'custom-{mode}-down-uncovered', 'custom provider', f'custom ScrollPattern {mode}, scroll down 3, target uncovered', 'scroll',
-                'Custom scroller', {'direction': 'down', 'amount': 3}, custom(mode, 0, 'vpos', True), arm=[('scroller', mode)], aside=True)
+    stretch = [
+        # id, mode, direction, kind, completed, axis, aside
+        ('custom-ok-down', 'ok', 'down', 'ok', 3, 'vpos', False),
+        ('custom-fail-first-down', 'fail-first', 'down', 'wheel-covered', 0, 'vpos', False),
+        ('custom-move-then-fail-down', 'move-then-fail', 'down', 'partial', 1, 'vpos', False),
+        ('custom-fail-after-1-down', 'fail-after-1', 'down', 'partial', 1, 'vpos', False),
+        ('custom-fail-after-2-down', 'fail-after-2', 'down', 'partial', 2, 'vpos', False),
+        ('custom-remove-after-1-down', 'remove-after-1', 'down', 'partial', 1, 'vpos', False),
+        ('custom-fail-after-1-right', 'fail-after-1', 'right', 'partial', 1, 'hpos', False),
+        ('custom-fail-first-down-uncovered', 'fail-first', 'down', 'wheel', 0, 'vpos', True),
+        ('custom-move-then-fail-down-uncovered', 'move-then-fail', 'down', 'partial', 1, 'vpos', True),
+        ('custom-move-then-fail-nopercent-down-uncovered', 'move-then-fail-nopercent', 'down', 'info', 1, 'vpos', True),
+    ]
+    for rid, mode, direction, kind, completed, axis, aside in stretch:
+        run_row(rid, 'custom provider', f'custom ScrollPattern {mode}, scroll {direction} 3' + (', target uncovered' if aside else ''),
+                'scroll', 'Custom scroller', {'direction': direction, 'amount': 3}, custom(kind, completed, axis),
+                arm=[('scroller', mode)], aside=aside, tail=3.0)
     # 11. Stretch: the fallback focus click returns an error (it completed with another window in front).
     for tool in ('type_text', 'press_key', 'hotkey'):
         run_row(f'focus-click-uncertain-{tool}', 'focus click error', f'{tool}: focus click completes with another window in front',

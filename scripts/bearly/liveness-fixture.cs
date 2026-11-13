@@ -126,6 +126,12 @@ namespace BearlyLiveness
         public string LastError = "";
         public Action OnGone;
         public Action<string, long> OnCall;
+        public bool PercentFails { get { return Mode.EndsWith("-nopercent"); } }
+
+        public void Mark(string kind, long value)
+        {
+            if (OnCall != null) OnCall(kind, value);
+        }
         public int UiThread;
         ScrollerProvider provider;
 
@@ -178,7 +184,7 @@ namespace BearlyLiveness
                         LastError = "rejected first call";
                         throw new InvalidOperationException("fixture: first scroll rejected, nothing moved");
                     }
-                    if (Mode == "move-then-fail" && Calls == 1)
+                    if (Mode.StartsWith("move-then-fail") && Calls == 1)
                     {
                         VPos += dv;
                         HPos += dh;
@@ -245,6 +251,7 @@ namespace BearlyLiveness
 
         public object GetPatternProvider(int patternId)
         {
+            owner.Mark("getpattern", patternId);
             if (owner.Gone) throw new ElementNotAvailableException();
             if (patternId == ScrollPatternIdentifiers.Pattern.Id) return this;
             return null;
@@ -266,8 +273,21 @@ namespace BearlyLiveness
         }
 
         public void SetScrollPercent(double horizontalPercent, double verticalPercent) { }
-        public double HorizontalScrollPercent { get { return Math.Max(0, Math.Min(100, 50 + owner.HPos)); } }
-        public double VerticalScrollPercent { get { return Math.Max(0, Math.Min(100, 50 + owner.VPos)); } }
+        // Percents really move with the content (50 is the start), unless the mode
+        // makes the getters themselves fail.
+        double Percent(string axis, int pos)
+        {
+            if (owner.PercentFails)
+            {
+                owner.Mark("percent-fail-" + axis, pos);
+                throw new InvalidOperationException("fixture: scroll percent unreadable");
+            }
+            owner.Mark("percent-" + axis, pos);
+            return Math.Max(0, Math.Min(100, 50 + pos));
+        }
+
+        public double HorizontalScrollPercent { get { return Percent("h", owner.HPos); } }
+        public double VerticalScrollPercent { get { return Percent("v", owner.VPos); } }
         public double HorizontalViewSize { get { return 10; } }
         public double VerticalViewSize { get { return 10; } }
         public bool HorizontallyScrollable { get { return true; } }
@@ -286,13 +306,12 @@ namespace BearlyLiveness
         readonly Dictionary<string, int> clicks = new Dictionary<string, int>();
         readonly List<string> removed = new List<string>();
         readonly List<string> events = new List<string>();
-        readonly int started = Environment.TickCount;
         int ack = 0;
         string cmdError = "";
         int activations = 0;
         int deactivations = 0;
         bool armLose = false;
-        int loseRemovedAt = -1;
+        long loseRemovedAt = -1;
         int writeErrors = 0;
         int dropped = 0;
         IntPtr awayTo = IntPtr.Zero;
@@ -348,9 +367,16 @@ namespace BearlyLiveness
             };
         }
 
-        int Elapsed()
+        // Milliseconds on the machine-wide performance counter, the clock the proof
+        // and the other fixture use too, so their timelines line up.
+        public static long Now()
         {
-            return unchecked(Environment.TickCount - started);
+            return System.Diagnostics.Stopwatch.GetTimestamp() / (System.Diagnostics.Stopwatch.Frequency / 1000);
+        }
+
+        long Elapsed()
+        {
+            return Now();
         }
 
         public void Record(IntPtr hwnd, string kind, long value)
