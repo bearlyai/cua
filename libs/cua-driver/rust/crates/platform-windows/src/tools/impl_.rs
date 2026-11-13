@@ -4633,14 +4633,20 @@ impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
             .unwrap_or(super::foreground_focus::LiveBounds::Unknown)
     }
 
-    fn semantic_scroll(&mut self) -> bool {
-        self.admitted
-            .as_ref()
-            .filter(|retained| retained.is_uia())
-            .is_some_and(|retained| unsafe {
-                crate::uia::scroll::scroll_element(retained.as_ptr(), &self.direction, self.amount)
-                    .is_ok()
-            })
+    fn semantic_scroll(&mut self) -> super::foreground_focus::SemanticScroll {
+        let Some(retained) = self.admitted.as_ref().filter(|retained| retained.is_uia()) else {
+            return super::foreground_focus::SemanticScroll::NotDispatched;
+        };
+        let steps = unsafe {
+            crate::uia::scroll::scroll_element_steps(
+                retained.as_ptr(),
+                &self.direction,
+                self.amount,
+            )
+        };
+        super::foreground_focus::semantic_scroll_from(
+            steps.map_err(|stopped| (stopped.completed, stopped.error.to_string())),
+        )
     }
 
     fn onscreen_point(&mut self, (cx, cy): (i32, i32)) -> Result<(i32, i32), ToolResult> {
@@ -6441,10 +6447,11 @@ impl Tool for ScrollTool {
         }
         // Foreground scroll addressed by an element: see
         // `foreground_focus::foreground_element_scroll`. The element is read
-        // live before its own UIA scroll; if that scroll fails, the wheel goes
-        // to the centre of the element's live rectangle (or the caller's x,y),
-        // never the window centre, and an element that can't be located live
-        // gets no wheel. Background element scrolls continue below unchanged.
+        // live before its own UIA scroll. If that scroll stops part-way, the
+        // reply is `scroll_incomplete` and no wheel is sent. If it dispatched
+        // nothing, the element must be located live again before the wheel,
+        // which goes to the caller's x,y or else the live centre, never the
+        // window centre. Background element scrolls continue below unchanged.
         if let Some(idx) = elem_idx.filter(|_| delivery == DeliveryMode::Foreground) {
             let (horizontal, sign) = match direction.as_str() {
                 "up" => (false, 1),
@@ -6477,7 +6484,13 @@ impl Tool for ScrollTool {
                 horizontal,
             };
             let result = tokio::task::spawn_blocking(move || {
-                super::foreground_focus::foreground_element_scroll(&mut target, pixel)
+                super::foreground_focus::foreground_element_scroll(
+                    &mut target,
+                    pixel,
+                    hwnd,
+                    idx,
+                    amount,
+                )
             })
             .await;
             return match result {

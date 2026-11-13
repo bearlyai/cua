@@ -131,34 +131,75 @@ pub unsafe fn scroll_element(
     direction: &str,
     amount: u32,
 ) -> anyhow::Result<()> {
+    scroll_element_steps(element_ptr, direction, amount).map_err(|partial| partial.error)
+}
+
+/// A [`scroll_element_steps`] that stopped on an error.
+#[derive(Debug)]
+pub struct ScrollStepsError {
+    /// `ScrollPattern::Scroll` calls that returned success before the error.
+    /// Zero when the route was unavailable before the first call (null or
+    /// non-scrollable element, failed cast, unknown direction) or the first
+    /// call itself failed.
+    pub completed: u32,
+    pub error: anyhow::Error,
+}
+
+/// [`scroll_element`], reporting how many of its `amount.max(1)` separate
+/// `ScrollPattern::Scroll` calls succeeded before an error. Each call is a
+/// synchronous request the provider either applies or rejects with an error
+/// HRESULT, so a failed call is taken as not applied.
+///
+/// # Safety
+/// `element_ptr` must be a live `IUIAutomationElement` that the caller keeps
+/// alive (a `RetainedElement`); it is borrowed, never released here.
+pub unsafe fn scroll_element_steps(
+    element_ptr: usize,
+    direction: &str,
+    amount: u32,
+) -> Result<(), ScrollStepsError> {
+    let not_dispatched = |error| ScrollStepsError {
+        completed: 0,
+        error,
+    };
     if element_ptr == 0 {
-        anyhow::bail!("cached UIA scroll element is null");
+        return Err(not_dispatched(anyhow::anyhow!(
+            "cached UIA scroll element is null"
+        )));
     }
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let elem: IUIAutomationElement = IUIAutomationElement::from_raw(element_ptr as *mut _);
+    // Borrowed: every exit, including the errors below, leaves the cache's
+    // reference alone.
+    let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     let pattern = elem
         .GetCurrentPattern(UIA_ScrollPatternId)
-        .map_err(|e| anyhow::anyhow!("UIA ScrollPattern unavailable: {e}"))?;
+        .map_err(|e| not_dispatched(anyhow::anyhow!("UIA ScrollPattern unavailable: {e}")))?;
     let scroll = pattern
         .cast::<IUIAutomationScrollPattern>()
-        .map_err(|e| anyhow::anyhow!("UIA ScrollPattern cast failed: {e}"))?;
+        .map_err(|e| not_dispatched(anyhow::anyhow!("UIA ScrollPattern cast failed: {e}")))?;
     let vertical = match direction {
         "up" => ScrollAmount_LargeDecrement,
         "down" => ScrollAmount_LargeIncrement,
         "left" => ScrollAmount_LargeDecrement,
         "right" => ScrollAmount_LargeIncrement,
-        other => anyhow::bail!("unknown scroll direction {other:?}"),
+        other => {
+            return Err(not_dispatched(anyhow::anyhow!(
+                "unknown scroll direction {other:?}"
+            )))
+        }
     };
     let horizontal = matches!(direction, "left" | "right");
-    for _ in 0..amount.max(1) {
+    for completed in 0..amount.max(1) {
         let result = if horizontal {
             scroll.Scroll(vertical, ScrollAmount_NoAmount)
         } else {
             scroll.Scroll(ScrollAmount_NoAmount, vertical)
         };
-        result.map_err(|e| anyhow::anyhow!("UIA scroll failed: {e}"))?;
+        result.map_err(|e| ScrollStepsError {
+            completed,
+            error: anyhow::anyhow!("UIA scroll failed: {e}"),
+        })?;
     }
-    std::mem::forget(elem);
     Ok(())
 }
 

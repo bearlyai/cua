@@ -194,12 +194,88 @@ pub(crate) fn cached_point_preflight(
     }
 }
 
+/// What the element's own UIA scroll did. It is `amount` separate
+/// `ScrollPattern::Scroll` calls, so it can stop part-way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SemanticScroll {
+    /// Every step scrolled.
+    Done,
+    /// Nothing scrolled: the route was unavailable before any `Scroll` call
+    /// (not a UIA element, no `ScrollPattern`, failed cast, unknown direction),
+    /// or the first call failed. A first-call error counts as not dispatched
+    /// because the call is synchronous and its error HRESULT is the provider
+    /// rejecting it; a real Windows run has to confirm that providers apply
+    /// nothing when they return one.
+    NotDispatched,
+    /// `completed` steps (at least one) scrolled, then a later one failed.
+    Partial { completed: u32, error: String },
+}
+
+/// Classify the element's own scroll from the number of `Scroll` calls that
+/// succeeded before an error (`Err(0)`: none).
+pub(crate) fn semantic_scroll_from(result: Result<(), (u32, String)>) -> SemanticScroll {
+    match result {
+        Ok(()) => SemanticScroll::Done,
+        Err((0, _)) => SemanticScroll::NotDispatched,
+        Err((completed, error)) => SemanticScroll::Partial { completed, error },
+    }
+}
+
+/// The element's own scroll stopped part-way: some steps already moved the
+/// content, so this is neither the no-effects stale refusal nor a reason to
+/// send the wheel on top of what moved.
+#[derive(Debug)]
+pub(crate) struct ScrollIncomplete {
+    pub hwnd: u64,
+    pub element_index: usize,
+    pub completed: u32,
+    pub amount: u32,
+    pub error: String,
+}
+
+/// The code of a [`ScrollIncomplete`].
+pub(crate) const SCROLL_INCOMPLETE: &str = "scroll_incomplete";
+
+impl std::fmt::Display for ScrollIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{SCROLL_INCOMPLETE}: UIA element [{}] in HWND 0x{:x} scrolled {} of {} step(s), \
+             then its UIA scroll failed ({}); no wheel was sent. Read the window again \
+             before acting.",
+            self.element_index, self.hwnd, self.completed, self.amount, self.error
+        )
+    }
+}
+
+impl std::error::Error for ScrollIncomplete {}
+
+impl ScrollIncomplete {
+    fn result(&self) -> ToolResult {
+        ToolResult::error(self.to_string()).with_structured(serde_json::json!({
+            "code": SCROLL_INCOMPLETE,
+            "effect": "failed",
+            "path": "uia",
+            "completed_steps": self.completed,
+            "amount": self.amount,
+            "wheel_sent": false,
+            "window_id": self.hwnd,
+            "element_index": self.element_index,
+            "retryable": false,
+            "escalation": {
+                "recommended": "verify_state",
+                "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more.",
+            },
+        }))
+    }
+}
+
 /// What a foreground scroll addressed by an element needs from Windows.
 pub(crate) trait ScrollTarget {
     /// Read the element's rectangle live.
     fn live_bounds(&mut self) -> LiveBounds;
-    /// The element's own UIA scroll; `true` when it scrolled.
-    fn semantic_scroll(&mut self) -> bool;
+    /// The element's own UIA scroll.
+    fn semantic_scroll(&mut self) -> SemanticScroll;
     /// The on-screen check (and scroll into view) for the wheel point.
     fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult>;
     /// Send the wheel at a screen point.
@@ -216,26 +292,42 @@ pub(crate) enum ElementScroll {
 }
 
 /// A foreground scroll addressed by an element. A control UIA reports as gone
-/// is refused as stale before its own scroll is tried. When that scroll fails,
-/// the wheel goes to the centre of the element's live rectangle after the
-/// on-screen check, or to the caller's `pixel` when one was given; an element
-/// that can't be located live is refused, never sent to the window centre.
+/// is refused as stale before its own scroll is tried. When that scroll
+/// stops part-way, the result is [`ScrollIncomplete`] and no wheel is sent.
+/// When it dispatched nothing, the element must still be located live (a
+/// non-empty live rectangle) before any wheel: one that can't be is refused,
+/// never sent to the window centre, even with a caller `pixel`. The wheel then
+/// goes to the caller's `pixel` exactly as given, or else to the live centre
+/// after the on-screen check.
 pub(crate) fn foreground_element_scroll(
     target: &mut impl ScrollTarget,
     pixel: Option<(i32, i32)>,
+    hwnd: u64,
+    element_index: usize,
+    amount: u32,
 ) -> anyhow::Result<ElementScroll> {
     require_live(target.live_bounds())?;
-    if target.semantic_scroll() {
-        return Ok(ElementScroll::Semantic);
+    match target.semantic_scroll() {
+        SemanticScroll::Done => return Ok(ElementScroll::Semantic),
+        SemanticScroll::Partial { completed, error } => {
+            return Err(ScrollIncomplete {
+                hwnd,
+                element_index,
+                completed,
+                amount,
+                error,
+            }
+            .into())
+        }
+        SemanticScroll::NotDispatched => {}
     }
+    // Nothing has been sent yet, so a refusal here is still true.
+    let rect = live_target_rect(target.live_bounds())?;
     let point = match pixel {
         Some(point) => point,
-        None => {
-            let rect = live_target_rect(target.live_bounds())?;
-            target
-                .onscreen_point(live_center(rect))
-                .map_err(FocusRefused)?
-        }
+        None => target
+            .onscreen_point(live_center(rect))
+            .map_err(FocusRefused)?,
     };
     target.wheel(point)?;
     Ok(ElementScroll::Wheel(point))
@@ -259,6 +351,9 @@ pub(crate) fn error_result(error: anyhow::Error, stale: impl FnOnce() -> ToolRes
     }
     if let Some(failed) = error.downcast_ref::<FailedAfterActivation>() {
         return failed.result();
+    }
+    if let Some(incomplete) = error.downcast_ref::<ScrollIncomplete>() {
+        return incomplete.result();
     }
     match error.downcast::<FocusRefused>() {
         Ok(FocusRefused(result)) => result,
@@ -815,21 +910,56 @@ mod tests {
             .is::<DeadElement>());
     }
 
-    /// Records a foreground element scroll.
+    /// Records a foreground element scroll, including what the element's own
+    /// scroll moved before it returned.
     struct FakeScroll {
         live: LiveBounds,
-        semantic_ok: bool,
+        /// What every live read after the first returns, when it changes.
+        live_later: Option<LiveBounds>,
+        live_reads: usize,
+        semantic: SemanticScroll,
+        /// `Scroll` steps the element's own scroll applied.
+        scrolled_steps: u32,
         events: Vec<String>,
+    }
+
+    impl FakeScroll {
+        fn new(live: LiveBounds, semantic: SemanticScroll) -> Self {
+            Self {
+                live,
+                live_later: None,
+                live_reads: 0,
+                semantic,
+                scrolled_steps: 0,
+                events: Vec::new(),
+            }
+        }
+
+        fn wheels(&self) -> usize {
+            self.events
+                .iter()
+                .filter(|e| e.starts_with("wheel"))
+                .count()
+        }
     }
 
     impl ScrollTarget for FakeScroll {
         fn live_bounds(&mut self) -> LiveBounds {
             self.events.push("live".into());
-            self.live
+            self.live_reads += 1;
+            match self.live_later {
+                Some(later) if self.live_reads > 1 => later,
+                _ => self.live,
+            }
         }
-        fn semantic_scroll(&mut self) -> bool {
+        fn semantic_scroll(&mut self) -> SemanticScroll {
             self.events.push("semantic".into());
-            self.semantic_ok
+            self.scrolled_steps += match &self.semantic {
+                SemanticScroll::Done => 3,
+                SemanticScroll::NotDispatched => 0,
+                SemanticScroll::Partial { completed, .. } => *completed,
+            };
+            self.semantic.clone()
         }
         fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult> {
             self.events.push("onscreen".into());
@@ -841,39 +971,128 @@ mod tests {
         }
     }
 
+    fn scroll(target: &mut FakeScroll, pixel: Option<(i32, i32)>) -> anyhow::Result<ElementScroll> {
+        foreground_element_scroll(target, pixel, 0x10, 3, 3)
+    }
+
     /// A dead element is refused before its own scroll; a live one whose own
-    /// scroll fails gets the wheel at its live centre, never the window
-    /// centre; one that can't be located live gets no wheel.
+    /// scroll dispatched nothing gets the wheel at its live centre, never the
+    /// window centre; one that can't be located live gets no wheel.
     #[test]
     fn a_foreground_element_scroll_wheels_only_at_the_live_element() {
-        let scroll = |live, semantic_ok, pixel| {
-            let mut target = FakeScroll {
-                live,
-                semantic_ok,
-                events: Vec::new(),
-            };
-            let outcome = foreground_element_scroll(&mut target, pixel);
-            (outcome, target.events)
-        };
-        let (outcome, events) = scroll(LiveBounds::NotAvailable, true, None);
-        assert!(outcome.unwrap_err().is::<DeadElement>());
-        assert_eq!(events, vec!["live"]);
+        use SemanticScroll::{Done, NotDispatched};
+        let mut target = FakeScroll::new(LiveBounds::NotAvailable, Done);
+        assert!(scroll(&mut target, None).unwrap_err().is::<DeadElement>());
+        assert_eq!(target.events, vec!["live"]);
         let moved = LiveBounds::Rect((300, 400, 360, 420));
-        let (outcome, events) = scroll(moved, false, None);
-        assert_eq!(outcome.unwrap(), ElementScroll::Wheel((330, 410)));
+        let mut target = FakeScroll::new(moved, NotDispatched);
         assert_eq!(
-            events,
+            scroll(&mut target, None).unwrap(),
+            ElementScroll::Wheel((330, 410))
+        );
+        assert_eq!(
+            target.events,
             vec!["live", "semantic", "live", "onscreen", "wheel 330,410"]
         );
-        let (outcome, _) = scroll(moved, true, None);
-        assert_eq!(outcome.unwrap(), ElementScroll::Semantic);
+        let mut target = FakeScroll::new(moved, Done);
+        assert_eq!(scroll(&mut target, None).unwrap(), ElementScroll::Semantic);
+        assert_eq!(target.wheels(), 0);
         for unlocatable in [LiveBounds::Unknown, LiveBounds::Rect((5, 5, 5, 9))] {
-            let (outcome, events) = scroll(unlocatable, false, None);
-            assert!(outcome.unwrap_err().is::<DeadElement>(), "{unlocatable:?}");
-            assert!(!events.iter().any(|e| e.starts_with("wheel")), "{events:?}");
+            let mut target = FakeScroll::new(unlocatable, NotDispatched);
+            let error = scroll(&mut target, None).unwrap_err();
+            assert!(error.is::<DeadElement>(), "{unlocatable:?}");
+            assert_eq!(target.wheels(), 0, "{:?}", target.events);
         }
-        let (outcome, _) = scroll(moved, false, Some((7, 8)));
-        assert_eq!(outcome.unwrap(), ElementScroll::Wheel((7, 8)));
+        // A live element with the caller's x,y: the wheel goes there exactly,
+        // without an on-screen check of that point.
+        let mut target = FakeScroll::new(moved, NotDispatched);
+        assert_eq!(
+            scroll(&mut target, Some((7, 8))).unwrap(),
+            ElementScroll::Wheel((7, 8))
+        );
+        assert_eq!(target.events, vec!["live", "semantic", "live", "wheel 7,8"]);
+    }
+
+    /// The caller's x,y picks where the wheel goes but doesn't exempt the
+    /// element from being located live: unreadable, empty, or gone after its
+    /// own scroll dispatched nothing, it gets no wheel and the stale refusal.
+    #[test]
+    fn scroll_coordinates_do_not_skip_the_live_element() {
+        let mut gone_later = FakeScroll::new(
+            LiveBounds::Rect((300, 400, 360, 420)),
+            SemanticScroll::NotDispatched,
+        );
+        gone_later.live_later = Some(LiveBounds::NotAvailable);
+        for mut target in [
+            FakeScroll::new(LiveBounds::Unknown, SemanticScroll::NotDispatched),
+            FakeScroll::new(
+                LiveBounds::Rect((5, 5, 5, 9)),
+                SemanticScroll::NotDispatched,
+            ),
+            gone_later,
+        ] {
+            let error = scroll(&mut target, Some((7, 8))).unwrap_err();
+            assert_eq!(target.wheels(), 0, "{:?}", target.events);
+            let result = error_result(error, stale);
+            assert_eq!(
+                result.structured_content.unwrap()["refusal"]["code"],
+                "stale_element_token",
+                "{:?}",
+                target.events
+            );
+        }
+    }
+
+    /// The element's own scroll moved one step, then failed, and the element
+    /// is gone: no wheel on top of what moved, and an honest failure that
+    /// says so, never the no-effects stale refusal.
+    #[test]
+    fn a_partly_completed_element_scroll_is_an_honest_failure_not_stale() {
+        for pixel in [None, Some((7, 8))] {
+            let mut target = FakeScroll::new(
+                LiveBounds::Rect((300, 400, 360, 420)),
+                SemanticScroll::Partial {
+                    completed: 1,
+                    error: "UIA scroll failed: 0x80040201".into(),
+                },
+            );
+            target.live_later = Some(LiveBounds::NotAvailable);
+            let error = scroll(&mut target, pixel).unwrap_err();
+            assert_eq!(target.scrolled_steps, 1);
+            assert_eq!(target.wheels(), 0, "{pixel:?}: {:?}", target.events);
+            let result = error_result(error, || panic!("{pixel:?}: mapped to the stale refusal"));
+            assert_eq!(result.is_error, Some(true));
+            let structured = result.structured_content.unwrap();
+            assert_eq!(structured["code"], SCROLL_INCOMPLETE, "{structured}");
+            assert_eq!(structured["effect"], "failed");
+            assert_eq!(structured["completed_steps"], 1);
+            assert_eq!(structured["amount"], 3);
+            assert_eq!(structured["wheel_sent"], false);
+            assert_eq!(structured["retryable"], false);
+            assert_eq!(structured["escalation"]["recommended"], "verify_state");
+            assert!(structured.get("status").is_none(), "{structured}");
+            assert!(structured.get("refusal").is_none(), "{structured}");
+        }
+    }
+
+    /// Zero completed `Scroll` calls is not dispatched; one or more before an
+    /// error is partial.
+    #[test]
+    fn an_element_scroll_is_partial_only_after_a_step_succeeded() {
+        assert_eq!(semantic_scroll_from(Ok(())), SemanticScroll::Done);
+        assert_eq!(
+            semantic_scroll_from(Err((0, "UIA ScrollPattern unavailable".into()))),
+            SemanticScroll::NotDispatched
+        );
+        for completed in [1, 2] {
+            assert_eq!(
+                semantic_scroll_from(Err((completed, "UIA scroll failed".into()))),
+                SemanticScroll::Partial {
+                    completed,
+                    error: "UIA scroll failed".into()
+                }
+            );
+        }
     }
 
     /// A SetFocus that succeeds needs no click and no live read.
