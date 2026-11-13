@@ -485,6 +485,7 @@ impl ActionExecutionRecord {
         record.delivered_count = structured
             .get("delivered_chars")
             .or_else(|| structured.pointer("/refusal/detail/delivered_chars"))
+            .or_else(|| structured.pointer("/delivery/delivered_count"))
             .and_then(serde_json::Value::as_u64)
             .and_then(|count| u32::try_from(count).ok());
 
@@ -1867,6 +1868,50 @@ mod tests {
             Some(2)
         );
         assert!(partial.escalation.is_none());
+    }
+
+    /// A Windows foreground element scroll that stopped part-way reports its
+    /// completed steps as `delivery.delivered_count`; the record keeps them.
+    #[test]
+    fn a_part_way_element_scroll_records_its_delivered_count() {
+        let record = ActionExecutionRecord::from_legacy(
+            "scroll",
+            &serde_json::json!({
+                "direction": "down",
+                "amount": 3,
+                "pid": 7064,
+                "element_token": "s0000002d:215",
+                "delivery_mode": "foreground"
+            }),
+            &serde_json::json!({
+                "amount": 3,
+                "code": "scroll_incomplete",
+                "completed_steps": 1,
+                "delivery": {"delivered_count": 1},
+                "effect": "partial",
+                "element_index": 215,
+                "escalation": {
+                    "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more.",
+                    "recommended": "verify_state"
+                },
+                "path": "uia",
+                "retryable": false,
+                "wheel_sent": false,
+                "window_id": 393232
+            }),
+        )
+        .expect("a part-way scroll should normalize");
+        assert_eq!(record.effect, ActionEffect::Partial);
+        assert_eq!(record.delivered_count, Some(1));
+        let public = record.public_result().expect("partial should project");
+        assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
+        assert_eq!(
+            public
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.delivered_count),
+            Some(1)
+        );
     }
 
     #[test]
