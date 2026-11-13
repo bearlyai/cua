@@ -25,6 +25,11 @@ namespace BearlyLiveness
         [DllImport("user32.dll")] public static extern IntPtr GetFocus();
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint attach, uint to, bool on);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool MoveFileEx(string from, string to, int flags);
     }
@@ -127,6 +132,11 @@ namespace BearlyLiveness
         public Action OnGone;
         public Action<string, long> OnCall;
         public bool PercentFails { get { return Mode.EndsWith("-nopercent"); } }
+        public bool HPercentFails { get { return Mode.EndsWith("-nohpercent"); } }
+        public bool VMinusOne { get { return Mode.StartsWith("vminus1"); } }
+        // Takes the foreground from inside Scroll; the argument closes the spare
+        // window first. Returns how the foreground was taken (0 = it was not).
+        public Func<bool, long> Steal;
 
         public void Mark(string kind, long value)
         {
@@ -170,6 +180,7 @@ namespace BearlyLiveness
         public void ScrollCall(ScrollAmount horizontal, ScrollAmount vertical)
         {
             bool remove = false;
+            bool steal = false;
             try
             {
                 lock (this)
@@ -200,6 +211,15 @@ namespace BearlyLiveness
                             throw new InvalidOperationException("fixture: scroll failed after " + n + " step(s)");
                         }
                     }
+                    if (Mode == "move-then-remove" && Calls == 1)
+                    {
+                        VPos += dv;
+                        HPos += dh;
+                        Gone = true;
+                        remove = true;
+                        LastError = "moved, then removed";
+                        throw new ElementNotAvailableException();
+                    }
                     if (Mode.StartsWith("remove-after-"))
                     {
                         int n = int.Parse(Mode.Substring(13));
@@ -213,6 +233,12 @@ namespace BearlyLiveness
                     }
                     VPos += dv;
                     HPos += dh;
+                    steal = Mode.StartsWith("steal") && Calls == 1;
+                }
+                // Outside the lock: closing the spare window runs on the UI thread.
+                if (steal && Steal != null)
+                {
+                    Mark("steal", Steal(Mode == "steal-close-spare"));
                 }
             }
             finally
@@ -277,7 +303,17 @@ namespace BearlyLiveness
         // makes the getters themselves fail.
         double Percent(string axis, int pos)
         {
-            if (owner.PercentFails)
+            if (owner.Gone)
+            {
+                owner.Mark("percent-gone-" + axis, pos);
+                throw new ElementNotAvailableException();
+            }
+            if (axis == "v" && owner.VMinusOne)
+            {
+                owner.Mark("percent-minus1-v", pos);
+                return -1;
+            }
+            if (owner.PercentFails || (axis == "h" && owner.HPercentFails))
             {
                 owner.Mark("percent-fail-" + axis, pos);
                 throw new InvalidOperationException("fixture: scroll percent unreadable");
@@ -291,7 +327,7 @@ namespace BearlyLiveness
         public double HorizontalViewSize { get { return 10; } }
         public double VerticalViewSize { get { return 10; } }
         public bool HorizontallyScrollable { get { return true; } }
-        public bool VerticallyScrollable { get { return true; } }
+        public bool VerticallyScrollable { get { return !owner.VMinusOne; } }
     }
 
     public class Fixture
@@ -317,6 +353,7 @@ namespace BearlyLiveness
         IntPtr awayTo = IntPtr.Zero;
         Form spare;
         long spareHwnd = 0;
+        IntPtr formHwnd = IntPtr.Zero;
 
         public static void Run(string folder, string name, int left, int top, int width, int height, int red, int green, int blue)
         {
@@ -474,6 +511,7 @@ namespace BearlyLiveness
             if (form.WindowState != FormWindowState.Normal) form.WindowState = FormWindowState.Normal;
             form.Bounds = home;
             lock (names) names[form.Handle] = "form";
+            formHwnd = form.Handle;
 
             Button sink = Add(new Button(), "Focus sink", 260, 330, 120, 28);
             sink.Text = "Focus sink";
@@ -494,6 +532,7 @@ namespace BearlyLiveness
             Add(scroller, "Custom scroller", 260, 130, 230, 60);
             scroller.OnGone = delegate { if (controls.ContainsKey("Custom scroller")) Remove("Custom scroller"); };
             scroller.UiThread = System.Threading.Thread.CurrentThread.ManagedThreadId;
+            scroller.Steal = StealForeground;
             scroller.OnCall = delegate(string kind, long call) { Note("Custom scroller", kind, call); };
             List("Fixture list", "Item", 260, 200, 230, 120);
 
@@ -503,6 +542,37 @@ namespace BearlyLiveness
                 if (text != null) text.Select(5, 0);
             }
             form.ActiveControl = sink;
+        }
+
+        // Runs on a UI Automation provider thread, inside Scroll.
+        long StealForeground(bool closeSpare)
+        {
+            if (closeSpare)
+            {
+                form.Invoke(new MethodInvoker(delegate
+                {
+                    if (spare != null)
+                    {
+                        spare.Close();
+                        spare.Dispose();
+                        spare = null;
+                    }
+                }));
+            }
+            IntPtr hwnd = formHwnd;
+            if (Native.GetForegroundWindow() == hwnd) return 4;
+            if (Native.SetForegroundWindow(hwnd) && Native.GetForegroundWindow() == hwnd) return 1;
+            Native.keybd_event(0x12, 0, 0, UIntPtr.Zero);
+            Native.keybd_event(0x12, 0, 2, UIntPtr.Zero);
+            if (Native.SetForegroundWindow(hwnd) && Native.GetForegroundWindow() == hwnd) return 2;
+            uint pid;
+            uint other = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
+            uint mine = Native.GetCurrentThreadId();
+            bool attached = other != 0 && Native.AttachThreadInput(mine, other, true);
+            Native.SetForegroundWindow(hwnd);
+            Native.BringWindowToTop(hwnd);
+            if (attached) Native.AttachThreadInput(mine, other, false);
+            return Native.GetForegroundWindow() == hwnd ? 3 : 0;
         }
 
         void Remove(string label)

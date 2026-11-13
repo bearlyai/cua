@@ -65,7 +65,7 @@ LEVELS = {0x1000: 'Low', 0x2000: 'Medium', 0x2100: 'Medium Plus', 0x3000: 'High'
 # and 0xE8 (its input-drain marker). Counted apart from requested keys.
 ASSIST_KEYS = {0xFC, 0xE8}
 # Fixture notes that are not input: activation, focus and provider calls.
-NOTE_KINDS = ('activated', 'deactivated', 'gotfocus', 'scrollcall', 'getpattern', 'percent')
+NOTE_KINDS = ('activated', 'deactivated', 'gotfocus', 'scrollcall', 'getpattern', 'percent', 'steal')
 
 
 class _Notes:
@@ -357,7 +357,7 @@ def timeline(rec, start_q):
 
 
 def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), arm=(), aside=False,
-            tail=1.0, post=None, token=None, keep=False, mode='foreground', window_only=False, window=None, setup=()):
+            tail=1.0, post=None, token=None, keep=False, mode='foreground', window_only=False, window=None, setup=(), front_window=None):
     rec = {'id': rid, 'group': group, 'desc': desc, 'tool': tool, 'label': label, 'aside': aside,
            'mutate': [list(m) for m in mutate], 'arm': [list(a) for a in arm]}
     try:
@@ -368,7 +368,11 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
             command('Sentinel', 'bounds', *SENTINEL_ASIDE)
         for step in setup:
             command('Target', *step)
-        rec['sentinel_in_front_before'] = front(sentinel['hwnd'])
+        if front_window:
+            rec['front_window'] = front_window()
+            rec['front_window_in_front_before'] = front(rec['front_window'])
+        else:
+            rec['sentinel_in_front_before'] = front(sentinel['hwnd'])
         time.sleep(0.25)
         for step in arm:
             command('Target', *step)
@@ -654,6 +658,52 @@ def stays_behind(rec, notes, settle_ms=500):
     return ok
 
 
+def reply_modes(rec):
+    """Every delivery mode the reply states: the explicit field, the envelope's, the text's."""
+    structured = sc(rec)
+    modes = {}
+    if structured.get('delivery_mode'):
+        modes['delivery_mode'] = structured['delivery_mode']
+    delivery = structured.get('delivery')
+    if isinstance(delivery, dict) and delivery.get('mode'):
+        modes['delivery.mode'] = delivery['mode']
+    match = re.search(r'delivery_mode:(\w+)', rec['reply'].get('text') or '')
+    if match:
+        modes['text'] = match.group(1)
+    return modes
+
+
+def check_mode(rec, notes, expected):
+    modes = reply_modes(rec)
+    structured = sc(rec)
+    extra = {k: structured[k] for k in ('activated', 'foreground_restored') if k in structured}
+    notes.append(f'reply delivery modes {modes or "none"}' + (f' {extra}' if extra else ''))
+    return check(all(mode == expected for mode in modes.values()), f'delivery mode {modes}, expected {expected!r}', notes)
+
+
+def scroll_calls(rec):
+    return [e for e in rec['received']['Target']['events'] if e[1] == 'Custom scroller' and e[2].startswith('scrollcall')]
+
+
+def steal_codes(rec):
+    return [e[3] for e in rec['received']['Target']['events'] if e[1] == 'Custom scroller' and e[2] == 'steal']
+
+
+def is_uncertain(rec, notes, amount=3):
+    structured = sc(rec)
+    ok = check(structured.get('code') == 'scroll_uncertain', f'code {structured.get("code")!r}: {rec["reply"].get("text", "")[:240]}', notes)
+    ok &= check(structured.get('effect') == 'unverifiable', f'effect {structured.get("effect")!r}', notes)
+    ok &= check(structured.get('path') == 'uia', f'path {structured.get("path")!r}', notes)
+    ok &= check('delivery_mode' in structured, 'no delivery_mode', notes)
+    ok &= check(structured.get('amount') == amount, f'amount {structured.get("amount")!r}', notes)
+    ok &= check(structured.get('wheel_sent') is False, 'wheel_sent is not false', notes)
+    ok &= check(structured.get('retryable') is False, 'retryable is not false', notes)
+    ok &= check((structured.get('escalation') or {}).get('recommended') == 'verify_state', f'escalation {structured.get("escalation")}', notes)
+    ok &= check('delivery' not in structured and 'completed_steps' not in structured, 'carries delivery or completed_steps', notes)
+    ok &= check(rec['reply'].get('isError') is True, 'isError is not true', notes)
+    return ok
+
+
 def reported_point(rec):
     match = re.search(r'at screen \((-?\d+),(-?\d+)\)', rec['reply'].get('text') or '')
     return (int(match.group(1)), int(match.group(2))) if match else None
@@ -674,6 +724,7 @@ def expect_wheel_at(control, point_control=None):
         point = reported_point(rec)
         ok &= check(inside(point, rect), f'wheel point {point} not inside {rect}', notes)
         notes.append(f'wheel point {point}, {point_control or control} live rect {rect}, events {got}')
+        ok &= check_mode(rec, notes, 'foreground')
         return verdict(ok)
     return evaluate
 
@@ -692,7 +743,7 @@ def scroll_consistency(control, value_key):
                       f'wheel target={wheel_target} sentinel={wheel_sentinel}; reply: {text[:200]}')
         behind = stays_behind(rec, [])
         notes.append(f'foreground: ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}, '
-                     f'stray 0xB9={rec["stray_b9_keyups"] or "none"}')
+                     f'stray 0xB9={rec["stray_b9_keyups"] or "none"}; reply delivery modes {reply_modes(rec) or "none"}')
         if structured.get('code') == 'scroll_incomplete':
             ok = check(structured.get('effect') == 'partial', 'partial result without effect partial', notes)
             ok &= check(structured.get('wheel_sent') is False and wheel_target + wheel_sentinel == 0, 'wheel sent on a partial scroll', notes)
@@ -821,7 +872,8 @@ try:
         ok &= check(after['top'] > before['top'], f'list top {before["top"]} -> {after["top"]}', notes)
         ok &= check(totals(rec, 'Target')['wheel'] + totals(rec, 'Sentinel')['wheel'] == 0, 'a wheel event was received', notes)
         ok &= stays_behind(rec, notes)
-        notes.append(f'list top {before["top"]} -> {after["top"]}; reply delivery={sc(rec).get("delivery")}')
+        ok &= check_mode(rec, notes, 'background')
+        notes.append(f'list top {before["top"]} -> {after["top"]}')
         return verdict(ok)
     run_row('scroll-uia', 'scroll', 'scroll a list with ScrollPattern: UIA, no wheel, target stays behind', 'scroll', 'Fixture list',
             ARGS['scroll'], uia_scroll, aside=True, tail=3.0)
@@ -881,7 +933,7 @@ try:
     # percent getters fail.
 
     def custom(kind, completed=0, axis='vpos'):
-        """kind: ok | partial | wheel (uncovered, pass/fail) | wheel-covered (INFO) | info."""
+        """kind: ok | partial | uncertain | either | minus1-wheel | steal | steal-close-spare | wheel-covered | info."""
         def evaluate(rec, notes):
             structured = sc(rec)
             before = control_state(rec, 'before', 'Custom scroller')
@@ -892,7 +944,8 @@ try:
                      if e[1] == 'Custom scroller' and e[2] in NOTES and e[2] != 'gotfocus']
             wheels = {name: {c: v for c, v in rec['received'][name]['counts'].items() if v.get('wheel') or v.get('hwheel')}
                       for name in ('Target', 'Sentinel')}
-            notes.append(f'{axis} {before[axis]} -> {after.get(axis)} (moved {moved}); calls {after.get("calls")} exists={bool(after)}; '
+            n_calls = len(scroll_calls(rec))
+            notes.append(f'{axis} {before[axis]} -> {after.get(axis)} (moved {moved}); Scroll calls {n_calls}; exists={bool(after)}; '
                          f'provider calls (ms, kind, value) {calls}; wheel received {wheels}; '
                          f'under wheel point {rec.get("window_under_reported_point")}; reply: {text[:220]}')
             ok = check('status' not in structured and 'refusal' not in structured, 'reply is a refusal', notes)
@@ -900,8 +953,10 @@ try:
             if kind == 'ok':
                 ok &= succeeded(rec, notes)
                 ok &= check(structured.get('route') == 'accessibility' and moved == 3, 'uia scroll did not complete', notes)
+                ok &= check(n_calls == 3, f'{n_calls} Scroll calls, expected 3', notes)
                 ok &= check(wheel_total == 0, 'wheel sent', notes)
                 ok &= stays_behind(rec, notes)
+                ok &= check_mode(rec, notes, 'background')
             elif kind == 'partial':
                 ok &= check(structured.get('code') == 'scroll_incomplete', f'code {structured.get("code")!r}', notes)
                 ok &= check(structured.get('effect') == 'partial', f'effect {structured.get("effect")!r}', notes)
@@ -913,41 +968,97 @@ try:
                 if after:
                     ok &= check(moved == completed, f'moved {moved}, reported {completed}', notes)
                 ok &= stays_behind(rec, notes)
-            elif kind == 'wheel':
+                ok &= check_mode(rec, notes, 'background')
+            elif kind == 'uncertain':
+                ok &= is_uncertain(rec, notes)
+                ok &= check(n_calls == 1, f'{n_calls} Scroll calls, expected 1', notes)
+                ok &= check(wheel_total == 0, 'wheel sent', notes)
+                ok &= stays_behind(rec, notes)
+                ok &= check_mode(rec, notes, 'background')
+            elif kind == 'either':
+                code = structured.get('code')
+                ok &= check(code in ('scroll_incomplete', 'scroll_uncertain'), f'code {code!r}', notes)
+                if code == 'scroll_incomplete':
+                    ok &= check((structured.get('delivery') or {}).get('delivered_count') == 1, 'delivered_count is not 1', notes)
+                    ok &= check(structured.get('wheel_sent') is False, 'wheel_sent is not false', notes)
+                elif code == 'scroll_uncertain':
+                    ok &= is_uncertain(rec, notes)
+                ok &= check(n_calls == 1, f'{n_calls} Scroll calls, expected 1', notes)
+                ok &= check(wheel_total == 0, 'wheel sent', notes)
+                ok &= check_mode(rec, notes, 'background')
+            elif kind == 'minus1-wheel':
+                ok &= succeeded(rec, notes)
+                ok &= check(n_calls == 0, f'{n_calls} Scroll calls on an axis reading -1', notes)
                 ok &= check('SendInput wheel' in text, 'no wheel fallback', notes)
-                ok &= check(moved == 0, f'provider moved {moved} and the wheel was also sent', notes)
-                got = counts(rec, 'Target', 'Custom scroller')
-                ok &= check(got.get('wheel', 0) >= 1, 'Custom scroller received no wheel', notes)
+                ok &= check(counts(rec, 'Target', 'Custom scroller').get('wheel', 0) >= 1, 'Custom scroller received no wheel', notes)
                 ok &= only_on(rec, notes, 'Custom scroller', {'wheel', 'hwheel'})
                 ok &= check(inside(reported_point(rec), before['screen']), f'wheel point {reported_point(rec)} not inside {before["screen"]}', notes)
-                behind = stays_behind(rec, [])
-                notes.append(f'foreground ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}')
+                ok &= check_mode(rec, notes, 'foreground')
+            elif kind == 'steal':
+                codes = steal_codes(rec)
+                took = any(code in (1, 2, 3, 4) for code in codes) or rec['target_activated']
+                notes.append(f'provider steal results {codes} (1 direct, 2 after Alt, 3 attached input, 4 already in front, 0 failed); '
+                             f'target activated={rec["target_activated"]}; samples {rec["foreground_samples"]}')
+                if not took:
+                    notes.append('the provider could not take the foreground on this runner')
+                    return 'INFO'
+                ok &= succeeded(rec, notes)
+                ok &= check(moved == 3, f'moved {moved}', notes)
+                ok &= stays_behind(rec, notes)
+                ok &= check_mode(rec, notes, 'background')
+            elif kind == 'steal-close-spare':
+                codes = steal_codes(rec)
+                spare_front = rec.get('front_window_in_front_before')
+                notes.append(f'spare in front before: {spare_front}; spare closed: {not rec["target_after"].get("spare_open")}; '
+                             f'provider steal results {codes}; samples {rec["foreground_samples"]}')
+                if not spare_front or not any(code in (1, 2, 3, 4) for code in codes):
+                    notes.append('setup not produced: the spare was not in front, or the provider did not take the foreground')
+                    return 'INFO'
+                ok &= succeeded(rec, notes)
+                ok &= check(moved == 3, f'moved {moved}', notes)
+                ok &= check(structured.get('activated') is True, f'activated {structured.get("activated")!r}', notes)
+                ok &= check(structured.get('foreground_restored') is False, f'foreground_restored {structured.get("foreground_restored")!r}', notes)
+                ok &= check_mode(rec, notes, 'foreground')
+                ok &= check(rec['foreground_after'] == 'target', f'foreground ended on {rec["foreground_after"]}', notes)
+                foreign = [smp for smp in rec['foreground_samples'] if smp[1] == 'sentinel'
+                           or (smp[1].startswith('0x') and unknown_windows.get(int(smp[1], 16), {}).get('owner') != 'target fixture')]
+                ok &= check(not foreign, f'a window other than the target was activated: {foreign}', notes)
             else:
                 behind = stays_behind(rec, [])
                 notes.append(f'foreground ended on {rec["foreground_after"]}, samples {rec["foreground_samples"]}, stays behind={behind}, '
-                             f'stray 0xB9={rec["stray_b9_keyups"] or "none"}')
+                             f'stray 0xB9={rec["stray_b9_keyups"] or "none"}; reply delivery modes {reply_modes(rec) or "none"}')
                 if kind == 'wheel-covered':
                     notes.append('covered: the target stays behind, so the wheel goes to whatever is on top at that point (documented limit)')
                 return 'INFO'
             return verdict(ok)
         return evaluate
+    spare_window = lambda: state('Target')['spare_hwnd']
     stretch = [
         # id, mode, direction, kind, completed, axis, aside
         ('custom-ok-down', 'ok', 'down', 'ok', 3, 'vpos', False),
-        ('custom-fail-first-down', 'fail-first', 'down', 'wheel-covered', 0, 'vpos', False),
+        ('custom-fail-first-down', 'fail-first', 'down', 'uncertain', 0, 'vpos', False),
         ('custom-move-then-fail-down', 'move-then-fail', 'down', 'partial', 1, 'vpos', False),
         ('custom-fail-after-1-down', 'fail-after-1', 'down', 'partial', 1, 'vpos', False),
         ('custom-fail-after-2-down', 'fail-after-2', 'down', 'partial', 2, 'vpos', False),
         ('custom-remove-after-1-down', 'remove-after-1', 'down', 'partial', 1, 'vpos', False),
         ('custom-fail-after-1-right', 'fail-after-1', 'right', 'partial', 1, 'hpos', False),
-        ('custom-fail-first-down-uncovered', 'fail-first', 'down', 'wheel', 0, 'vpos', True),
+        ('custom-fail-first-down-uncovered', 'fail-first', 'down', 'uncertain', 0, 'vpos', True),
         ('custom-move-then-fail-down-uncovered', 'move-then-fail', 'down', 'partial', 1, 'vpos', True),
-        ('custom-move-then-fail-nopercent-down-uncovered', 'move-then-fail-nopercent', 'down', 'info', 1, 'vpos', True),
+        ('custom-move-then-fail-nopercent-down-uncovered', 'move-then-fail-nopercent', 'down', 'uncertain', 0, 'vpos', True),
+        ('custom-move-then-fail-nohpercent-down-uncovered', 'move-then-fail-nohpercent', 'down', 'partial', 1, 'vpos', True),
+        ('custom-vminus1-down-uncovered', 'vminus1', 'down', 'minus1-wheel', 0, 'vpos', True),
+        ('custom-vminus1-right-uncovered', 'vminus1', 'right', 'ok', 3, 'hpos', True),
+        ('custom-move-then-remove-down-uncovered', 'move-then-remove', 'down', 'either', 1, 'vpos', True),
+        ('custom-steal-down', 'steal', 'down', 'steal', 3, 'vpos', False),
     ]
     for rid, mode, direction, kind, completed, axis, aside in stretch:
         run_row(rid, 'custom provider', f'custom ScrollPattern {mode}, scroll {direction} 3' + (', target uncovered' if aside else ''),
                 'scroll', 'Custom scroller', {'direction': direction, 'amount': 3}, custom(kind, completed, axis),
                 arm=[('scroller', mode)], aside=aside, tail=3.0)
+    run_row('custom-steal-close-spare-down', 'custom provider',
+            'the spare window is in front; Scroll closes it and takes the foreground, so nothing can be restored', 'scroll',
+            'Custom scroller', ARGS['scroll'], custom('steal-close-spare', 3), setup=[('spare-open',)], front_window=spare_window,
+            arm=[('scroller', 'steal-close-spare')], tail=3.0)
     # 11. Keys addressed to the window, no control named.
 
     def window_key(vk, text_change):
@@ -973,15 +1084,46 @@ try:
         index = one_insertion(before['text'], after['text'], 'q')
         return check(index == before['caret'], f'not one q at caret {before["caret"]}: {before["text"]!r} -> {after["text"]!r}', notes)
 
-    def selected_all(before, after, notes):
-        ok = check(after['text'] == before['text'], f'text changed: {after["text"]!r}', notes)
-        ok &= check(after['selection'] == len(after['text']), f'selection {after["selection"]} of {len(after["text"])}', notes)
-        return ok
+    KEY_KINDS = ('keydown', 'keyup', 'char', 'syskeydown', 'syskeyup', 'syschar')
+    CTRL_A = [['keydown', 0x11], ['keydown', 0x41], ['char', 0x01], ['keyup', 0x41], ['keyup', 0x11]]
+    SHIFT_HOME = [['keydown', 0x10], ['keydown', 0x24], ['keyup', 0x24], ['keyup', 0x10]]
+
+    def key_delivery(expected, selection=None):
+        """Exactly `expected` (kind, code) in order on Filled edit, text unchanged, nothing elsewhere.
+        `selection` is the (start, length) required afterwards; None records it only."""
+        def evaluate(rec, notes):
+            ok = succeeded(rec, notes)
+            seq = [[e[2], e[3]] for e in rec['received']['Target']['events']
+                   if e[1] == 'Filled edit' and e[2] in KEY_KINDS and not (e[2] != 'char' and e[3] in ASSIST_KEYS)]
+            ok &= check(seq == expected, f'Filled edit keys {seq}, expected {expected}', notes)
+            for other, per in rec['received']['Target']['counts'].items():
+                if other != 'Filled edit' and any(per.get(k) for k in KEY_KINDS):
+                    ok &= check(False, f'Target/{other} received keys {per}', notes)
+            ok &= check(totals(rec, 'Sentinel')['keys'] == 0 and totals(rec, 'Sentinel')['text'] == 0,
+                        f'sentinel received keys/text {rec["received"]["Sentinel"]["counts"]}', notes)
+            before, after = control_state(rec, 'before', 'Filled edit'), control_state(rec, 'after', 'Filled edit')
+            ok &= check(after['text'] == before['text'], f'text changed: {before["text"]!r} -> {after["text"]!r}', notes)
+            got = (after['caret'], after['selection'])
+            if selection is not None:
+                ok &= check(got == selection, f'selection (start, length) {got}, expected {selection}', notes)
+            notes.append(f'selection (start, length) {(before["caret"], before["selection"])} -> {got}; '
+                         f'activated={rec["target_activated"]} fg_after={rec["foreground_after"]} samples {rec["foreground_samples"]}; '
+                         f'reply delivery modes {reply_modes(rec) or "none"}')
+            return verdict(ok)
+        return evaluate
     focus_field = [('focus', 'Filled edit')]
     run_row('window-press_key', 'window keys', 'press_key q, no token, target behind the sentinel', 'press_key', None,
             {'key': 'q'}, window_key(0x51, inserted_q), arm=focus_field, window_only=True, tail=3.0)
+    # The plain (unstyled) single-line edit ignores Ctrl+A, so ctrl+a is judged on delivery
+    # and its selection is recorded; shift+home is a chord that edit honours.
     run_row('window-hotkey', 'window keys', 'hotkey ctrl+a, no token, target behind the sentinel', 'hotkey', None,
-            {'keys': ['ctrl', 'a']}, window_key(0x41, selected_all), arm=focus_field, window_only=True, tail=3.0)
+            {'keys': ['ctrl', 'a']}, key_delivery(CTRL_A), arm=focus_field, window_only=True, tail=3.0)
+    run_row('window-hotkey-shift-home', 'window keys', 'hotkey shift+home from caret 5, no token, target behind the sentinel', 'hotkey', None,
+            {'keys': ['shift', 'home']}, key_delivery(SHIFT_HOME, (0, 5)), arm=focus_field, window_only=True, tail=3.0)
+    run_row('element-hotkey-ctrl-a', 'window keys', 'comparison: hotkey ctrl+a by element token on Filled edit', 'hotkey', 'Filled edit',
+            {'keys': ['ctrl', 'a']}, key_delivery(CTRL_A), tail=3.0)
+    run_row('element-hotkey-shift-home', 'window keys', 'comparison: hotkey shift+home by element token on Filled edit', 'hotkey', 'Filled edit',
+            {'keys': ['shift', 'home']}, key_delivery(SHIFT_HOME, (0, 5)), tail=3.0)
 
     def closed_refused(rec, notes):
         ok = check(rec['reply'].get('isError') is True, f'not an error: {observed(rec)} {rec["reply"].get("text", "")[:300]}', notes)
