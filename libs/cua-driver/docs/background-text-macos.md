@@ -354,18 +354,34 @@ Which foreground routes check, before they act:
   (invalid element) counts as gone; any other error lets the step run as
   before.
 - Windows: typing, `press_key` and `hotkey` read the element's current
-  rectangle before the window is activated. Clicks, double-clicks and
-  right-clicks by element, and the wheel fallback of `scroll` by element, send
-  their input at the centre of the live rectangle (UIA, or MSAA `accLocation`)
-  after the on-screen check, never at the point cached at read time; the
-  cached point is no longer checked on foreground requests, only on background
-  ones. `UIA_E_ELEMENTNOTAVAILABLE` counts as gone. A click or wheel is also
-  refused this way when the live rectangle can't be read or is empty. A
-  refused click doesn't start the restore of the earlier foreground window.
+  rectangle through UIA before the window is activated. That read is UIA
+  only: an MSAA element reads as unknown, so it is never refused as gone
+  there, typing skips its on-screen check, and keyboard focus on it stays
+  unsupported: it gets no fallback click, its focus can't be confirmed, and
+  no keys or text are sent.
+- Windows clicks, double-clicks and right-clicks by element, and the wheel
+  fallback of `scroll` by element, send their input inside the element's live
+  rectangle (UIA, or MSAA `accLocation`), never at the point cached at read
+  time; the cached point is no longer checked on foreground requests, only on
+  background ones. UIA clicks, double-clicks, right-clicks and the wheel's
+  live-centre point use the live centre after the on-screen check. MSAA
+  clicks are the exceptions: a normal MSAA click uses the live centre with no
+  on-screen check, as before, and an MSAA split-button dropdown click uses the
+  dropdown half (4 px inside the right edge). `UIA_E_ELEMENTNOTAVAILABLE` counts as gone. A click or
+  wheel is also refused this way when the live rectangle can't be read or is
+  empty. A refused click doesn't start the restore of the earlier foreground
+  window.
 - **Changed:** a foreground Windows `scroll` by element whose own UIA scroll
-  fails now sends the wheel at the element's live centre (or the caller's x,y),
-  not at the window centre. The wheel doesn't bring the window forward, so a
-  window on top of the element can still take it.
+  sent nothing now sends the wheel at the element's live centre, not at the
+  window centre. A caller's x,y picks where the wheel goes instead, exactly as
+  given; the point itself is not checked for visibility, and it does not
+  exempt the element from being located live first. The wheel doesn't bring
+  the window forward, so a window on top of the element can still take it.
+- The element's own UIA scroll is one `ScrollPattern::Scroll` call per step.
+  If the first call fails, nothing is taken to have scrolled and the wheel
+  fallback above applies. If a later call fails, some steps already moved the
+  content, so no wheel is sent and the reply is `scroll_incomplete` (below),
+  never the stale refusal.
 
 The check is a probe, not atomic with the action. A control that the app
 removes after the check but before the input lands is not caught. Ordinary
@@ -382,20 +398,42 @@ activation-assist key):
   "isError": true,
   "structuredContent": {
     "code": "foreground_element_lost", "effect": "failed", "activated": true,
-    "keystrokes_sent": false, "focus_click_sent": false,
+    "keystrokes_sent": false, "focus_click": "not_sent",
     "window_id": 0, "element_index": 0, "retryable": false,
     "escalation": {"recommended": "verify_state", "reason": "The window was brought to the front and no keys or text were sent; read the window again before acting."}
   }
 }
 ```
 
-The other failures inside that transaction (focus not confirmed, or the
-fallback focus click refused as off-screen) now have the same shape with
-`code: "foreground_unavailable"`; `focus_click_sent` says whether the fallback
-click was sent. None is `status: "refused"`.
+Every other failure inside that transaction has the same shape with
+`code: "foreground_unavailable"`: focus not confirmed, the fallback focus
+click refused as off-screen, or the fallback focus click returning an error.
+`focus_click` says what became of that click: `"not_sent"`, `"sent"`, or
+`"uncertain"` when the click returned an error, because part or all of its
+mouse input may have gone out (and a completed click may have moved the
+foreground). None is `status: "refused"`.
 
 MSAA elements get no focus-fallback click on Windows keys and text: keyboard
 focus can't be confirmed on them, so a click could only disturb the window.
+
+A foreground Windows `scroll` by element whose own UIA scroll stopped part-way
+returns:
+
+```json
+{
+  "content": [{"type": "text", "text": "scroll_incomplete: UIA element [N] in HWND 0x… scrolled 1 of 3 step(s), then its UIA scroll failed (UIA scroll failed: …); no wheel was sent. Read the window again before acting."}],
+  "isError": true,
+  "structuredContent": {
+    "code": "scroll_incomplete", "effect": "failed", "path": "uia",
+    "completed_steps": 1, "amount": 3, "wheel_sent": false,
+    "window_id": 0, "element_index": 0, "retryable": false,
+    "escalation": {"recommended": "verify_state", "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more."}
+  }
+}
+```
+
+It appears only after at least one step succeeded; it is never
+`status: "refused"`.
 
 Exceptions that never take the foreground and so have no foreground check:
 `right_click` by element on macOS (`AXShowMenu`, or a click posted to the
