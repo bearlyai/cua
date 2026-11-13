@@ -220,47 +220,132 @@ pub(crate) fn cached_point_preflight(
 /// `ScrollPattern::Scroll` calls, so it can stop part-way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SemanticScroll {
-    /// Every step scrolled.
+    /// Every `Scroll` call was accepted.
     Done,
-    /// Nothing scrolled: the route was unavailable before any `Scroll` call
-    /// (not a UIA element, no `ScrollPattern`, failed cast, unknown direction),
-    /// or the first call failed and the pattern's scroll position shows no
-    /// move (see [`steps_after_first_call_error`]). When the position can't be
-    /// read, a first-call error is still taken as not applied.
+    /// No `Scroll` call was made: not a UIA element, no `ScrollPattern`, a
+    /// failed cast, an unknown direction, or the requested axis reads as
+    /// unscrollable (see [`axis_cannot_scroll`]).
     NotDispatched,
-    /// `completed` steps (at least one) scrolled, then a later one failed.
+    /// `completed` steps (at least one) count as applied: calls the provider
+    /// accepted before a later one errored, or a first call that errored after
+    /// the scroll position changed. An accepted call at an end of the range
+    /// may move nothing.
     Partial { completed: u32, error: String },
+    /// The first `Scroll` call errored and the scroll position doesn't show
+    /// whether it moved (unchanged, or unreadable). It may have scrolled, so
+    /// no wheel may follow and no stale refusal may replace it.
+    Uncertain { error: String },
 }
 
-/// Classify the element's own scroll from the number of `Scroll` calls that
-/// succeeded before an error (`Err(0)`: none).
-pub(crate) fn semantic_scroll_from(result: Result<(), (u32, String)>) -> SemanticScroll {
+/// Where a run of `ScrollPattern::Scroll` calls stopped on an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollStop {
+    /// Before any `Scroll` call: nothing was sent.
+    BeforeScroll,
+    /// The first `Scroll` call returned an error. `moved` when the scroll
+    /// position read before it and after the error differs on either axis.
+    FirstCall { moved: bool },
+    /// A later call returned an error after `completed` accepted calls.
+    Later { completed: u32 },
+}
+
+/// Classify the element's own scroll from where its `Scroll` calls stopped.
+pub(crate) fn semantic_scroll_from(result: Result<(), (ScrollStop, String)>) -> SemanticScroll {
     match result {
         Ok(()) => SemanticScroll::Done,
-        Err((0, _)) => SemanticScroll::NotDispatched,
-        Err((completed, error)) => SemanticScroll::Partial { completed, error },
+        Err((ScrollStop::BeforeScroll, _)) => SemanticScroll::NotDispatched,
+        Err((ScrollStop::FirstCall { moved: true }, error)) => SemanticScroll::Partial {
+            completed: 1,
+            error,
+        },
+        Err((ScrollStop::FirstCall { moved: false }, error)) => SemanticScroll::Uncertain { error },
+        Err((ScrollStop::Later { completed }, error)) => {
+            SemanticScroll::Partial { completed, error }
+        }
     }
 }
 
-/// Steps to count for a first `Scroll` call that returned an error:
-/// 1 when both readings exist and differ on either axis, else 0.
-///
-/// A reading is the pattern's `(horizontal, vertical)` scroll percent, `None`
-/// when either getter failed or returned NaN. `-1.0` is UIA's "no scroll on
-/// this axis" and compares like any other value.
-pub(crate) fn steps_after_first_call_error(
-    before: Option<(f64, f64)>,
-    after: Option<(f64, f64)>,
-) -> u32 {
-    match (before, after) {
-        (Some(before), Some(after)) if before.0 != after.0 || before.1 != after.1 => 1,
-        _ => 0,
-    }
+/// A `ScrollPattern`'s scroll position, `(horizontal, vertical)` percent. An
+/// axis is `None` when its getter failed or returned a non-finite value.
+pub(crate) type ScrollReading = (Option<f64>, Option<f64>);
+
+/// UIA's `UIA_ScrollPatternNoScroll`: the axis does not scroll.
+pub(crate) const UIA_SCROLL_PATTERN_NO_SCROLL: f64 = -1.0;
+
+/// A [`ScrollReading`] from the two getters' values; NaN and infinity count
+/// as unreadable.
+pub(crate) fn scroll_reading(horizontal: Option<f64>, vertical: Option<f64>) -> ScrollReading {
+    let finite = |value: Option<f64>| value.filter(|value| value.is_finite());
+    (finite(horizontal), finite(vertical))
 }
 
-/// The element's own scroll stopped part-way: some steps already moved the
-/// content, so this is neither the no-effects stale refusal nor a reason to
-/// send the wheel on top of what moved. Its effect is `partial`, with the
+/// Whether two readings show movement: either axis has both readings and
+/// they differ. An unreadable axis says nothing, and hides nothing on the
+/// other axis. `-1.0` compares like any other value.
+pub(crate) fn movement_seen(before: ScrollReading, after: ScrollReading) -> bool {
+    let changed = |before: Option<f64>, after: Option<f64>| matches!((before, after), (Some(before), Some(after)) if before != after);
+    changed(before.0, after.0) || changed(before.1, after.1)
+}
+
+/// Whether the requested axis reads as UIA's "no scroll on this axis". Then
+/// no `Scroll` call is made (providers reject it with an error), so the route
+/// is "not sent" and the wheel fallback stays open. An unreadable axis is not
+/// taken as unscrollable.
+pub(crate) fn axis_cannot_scroll(reading: ScrollReading, horizontal: bool) -> bool {
+    let axis = if horizontal { reading.0 } else { reading.1 };
+    axis == Some(UIA_SCROLL_PATTERN_NO_SCROLL)
+}
+
+/// The `ScrollPattern` calls one element scroll makes, supplied by
+/// `uia::scroll` on Windows.
+pub(crate) trait ScrollPatternCalls {
+    /// Read the horizontal and vertical scroll percent; an axis is `None`
+    /// when its getter failed.
+    fn read_percent(&mut self) -> (Option<f64>, Option<f64>);
+    /// One `Scroll` call in the requested direction.
+    fn scroll_once(&mut self) -> anyhow::Result<()>;
+}
+
+/// `amount.max(1)` `Scroll` calls, stopping at the first error. The position
+/// is read before the first call: when the requested axis reads as
+/// unscrollable, nothing is called ([`ScrollStop::BeforeScroll`]). It is read
+/// again only when the first call errors, to tell whether that call moved
+/// anything ([`ScrollStop::FirstCall`]).
+pub(crate) fn run_scroll_steps(
+    calls: &mut impl ScrollPatternCalls,
+    horizontal: bool,
+    amount: u32,
+) -> Result<(), (ScrollStop, anyhow::Error)> {
+    let mut read = || {
+        let (horizontal, vertical) = calls.read_percent();
+        scroll_reading(horizontal, vertical)
+    };
+    let before = read();
+    if axis_cannot_scroll(before, horizontal) {
+        return Err((
+            ScrollStop::BeforeScroll,
+            anyhow::anyhow!("UIA element does not scroll on this axis"),
+        ));
+    }
+    for completed in 0..amount.max(1) {
+        if let Err(error) = calls.scroll_once() {
+            let stop = if completed == 0 {
+                let (horizontal, vertical) = calls.read_percent();
+                ScrollStop::FirstCall {
+                    moved: movement_seen(before, scroll_reading(horizontal, vertical)),
+                }
+            } else {
+                ScrollStop::Later { completed }
+            };
+            return Err((stop, error));
+        }
+    }
+    Ok(())
+}
+
+/// The element's own scroll stopped part-way: some steps count as applied
+/// (see [`SemanticScroll::Partial`]), so this is neither the no-effects stale
+/// refusal nor a reason to send the wheel on top of them. Its effect is `partial`, with the
 /// completed steps as `delivery.delivered_count`.
 #[derive(Debug)]
 pub(crate) struct ScrollIncomplete {
@@ -309,6 +394,54 @@ impl ScrollIncomplete {
     }
 }
 
+/// The element's first UIA `Scroll` call returned an error and its position
+/// doesn't show whether it moved. It may have scrolled, so no wheel is sent
+/// and no count is claimed. Its effect is `unverifiable`.
+#[derive(Debug)]
+pub(crate) struct ScrollUncertain {
+    pub hwnd: u64,
+    pub element_index: usize,
+    pub amount: u32,
+    pub error: String,
+}
+
+/// The code of a [`ScrollUncertain`].
+pub(crate) const SCROLL_UNCERTAIN: &str = "scroll_uncertain";
+
+impl std::fmt::Display for ScrollUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{SCROLL_UNCERTAIN}: UIA element [{}] in HWND 0x{:x} returned an error from its \
+             first UIA scroll call ({}) and its position does not show whether it moved; no \
+             wheel was sent. Read the window again before acting.",
+            self.element_index, self.hwnd, self.error
+        )
+    }
+}
+
+impl std::error::Error for ScrollUncertain {}
+
+impl ScrollUncertain {
+    fn result(&self) -> ToolResult {
+        ToolResult::error(self.to_string()).with_structured(serde_json::json!({
+            "code": SCROLL_UNCERTAIN,
+            "effect": "unverifiable",
+            "path": "uia",
+            "delivery_mode": "background",
+            "amount": self.amount,
+            "wheel_sent": false,
+            "window_id": self.hwnd,
+            "element_index": self.element_index,
+            "retryable": false,
+            "escalation": {
+                "recommended": "verify_state",
+                "reason": "The element's UIA scroll returned an error and its position does not show whether it moved; no wheel was sent. Read the window again before scrolling more.",
+            },
+        }))
+    }
+}
+
 /// What a foreground scroll addressed by an element needs from Windows.
 pub(crate) trait ScrollTarget {
     /// Read the element's rectangle live.
@@ -332,8 +465,10 @@ pub(crate) enum ElementScroll {
 
 /// A foreground scroll addressed by an element. A control UIA reports as gone
 /// is refused as stale before its own scroll is tried. When that scroll
-/// stops part-way, the result is [`ScrollIncomplete`] and no wheel is sent.
-/// When it dispatched nothing, the element must still be located live (a
+/// stops part-way, the result is [`ScrollIncomplete`]; when its first call
+/// errored without showing whether it moved, [`ScrollUncertain`]. Neither
+/// sends a wheel or reads the element again, so a control removed during the
+/// call can't turn into a stale refusal. When it dispatched nothing, the element must still be located live (a
 /// non-empty live rectangle) before any wheel: one that can't be is refused,
 /// never sent to the window centre, even with a caller `pixel`. The wheel then
 /// goes to the caller's `pixel` exactly as given, or else to the live centre
@@ -353,6 +488,15 @@ pub(crate) fn foreground_element_scroll(
                 hwnd,
                 element_index,
                 completed,
+                amount,
+                error,
+            }
+            .into())
+        }
+        SemanticScroll::Uncertain { error } => {
+            return Err(ScrollUncertain {
+                hwnd,
+                element_index,
                 amount,
                 error,
             }
@@ -393,6 +537,9 @@ pub(crate) fn error_result(error: anyhow::Error, stale: impl FnOnce() -> ToolRes
     }
     if let Some(incomplete) = error.downcast_ref::<ScrollIncomplete>() {
         return incomplete.result();
+    }
+    if let Some(uncertain) = error.downcast_ref::<ScrollUncertain>() {
+        return uncertain.result();
     }
     match error.downcast::<FocusRefused>() {
         Ok(FocusRefused(result)) => result,
@@ -1067,7 +1214,7 @@ mod tests {
             self.events.push("semantic".into());
             self.scrolled_steps += match &self.semantic {
                 SemanticScroll::Done => 3,
-                SemanticScroll::NotDispatched => 0,
+                SemanticScroll::NotDispatched | SemanticScroll::Uncertain { .. } => 0,
                 SemanticScroll::Partial { completed, .. } => *completed,
             };
             self.semantic.clone()
@@ -1190,72 +1337,282 @@ mod tests {
         }
     }
 
-    /// Zero completed `Scroll` calls is not dispatched; one or more before an
-    /// error is partial.
+    /// Not sent is `NotDispatched`; a first-call error is one known step when
+    /// the position moved and `Uncertain` when it doesn't show; a later error
+    /// keeps the accepted calls.
     #[test]
-    fn an_element_scroll_is_partial_only_after_a_step_succeeded() {
+    fn semantic_scroll_from_tells_not_sent_known_steps_and_uncertain_apart() {
+        let error = || "UIA scroll failed".to_string();
         assert_eq!(semantic_scroll_from(Ok(())), SemanticScroll::Done);
         assert_eq!(
-            semantic_scroll_from(Err((0, "UIA ScrollPattern unavailable".into()))),
+            semantic_scroll_from(Err((ScrollStop::BeforeScroll, error()))),
             SemanticScroll::NotDispatched
+        );
+        assert_eq!(
+            semantic_scroll_from(Err((ScrollStop::FirstCall { moved: true }, error()))),
+            SemanticScroll::Partial {
+                completed: 1,
+                error: error()
+            }
+        );
+        assert_eq!(
+            semantic_scroll_from(Err((ScrollStop::FirstCall { moved: false }, error()))),
+            SemanticScroll::Uncertain { error: error() }
         );
         for completed in [1, 2] {
             assert_eq!(
-                semantic_scroll_from(Err((completed, "UIA scroll failed".into()))),
+                semantic_scroll_from(Err((ScrollStop::Later { completed }, error()))),
                 SemanticScroll::Partial {
                     completed,
-                    error: "UIA scroll failed".into()
+                    error: error()
                 }
             );
         }
     }
 
-    /// A first `Scroll` call that errored after the position moved counts as
-    /// one step, on either axis.
+    /// A scripted `ScrollPattern`: the readings it returns in order, and the
+    /// result of each `Scroll` call. Records every call.
+    struct FakePattern {
+        readings: Vec<(Option<f64>, Option<f64>)>,
+        scrolls: Vec<bool>,
+        events: Vec<&'static str>,
+    }
+
+    impl FakePattern {
+        fn new(readings: Vec<(Option<f64>, Option<f64>)>, scrolls: Vec<bool>) -> Self {
+            Self {
+                readings,
+                scrolls,
+                events: Vec::new(),
+            }
+        }
+
+        fn scroll_calls(&self) -> usize {
+            self.events.iter().filter(|e| **e == "scroll").count()
+        }
+    }
+
+    impl ScrollPatternCalls for FakePattern {
+        fn read_percent(&mut self) -> (Option<f64>, Option<f64>) {
+            self.events.push("read");
+            self.readings.remove(0)
+        }
+        fn scroll_once(&mut self) -> anyhow::Result<()> {
+            self.events.push("scroll");
+            if self.scrolls.remove(0) {
+                Ok(())
+            } else {
+                anyhow::bail!("UIA scroll failed: 0x80040201")
+            }
+        }
+    }
+
+    /// The element's own scroll through the pure step loop, classified.
+    fn steps(pattern: &mut FakePattern, horizontal: bool, amount: u32) -> SemanticScroll {
+        semantic_scroll_from(
+            run_scroll_steps(pattern, horizontal, amount)
+                .map_err(|(stop, error)| (stop, error.to_string())),
+        )
+    }
+
+    /// The first call errored after the vertical position moved, and the
+    /// horizontal getter then failed: the readable axis still shows the move,
+    /// so it is one known step.
     #[test]
-    fn a_first_scroll_error_after_a_vertical_move_counts_one_step() {
+    fn a_move_on_one_axis_shows_through_an_unreadable_other_axis() {
+        assert!(movement_seen((Some(0.0), Some(40.0)), (None, Some(55.0))));
+        assert!(movement_seen((Some(10.0), None), (Some(25.0), Some(40.0))));
+        let mut pattern = FakePattern::new(
+            vec![(Some(0.0), Some(40.0)), (None, Some(55.0))],
+            vec![false],
+        );
         assert_eq!(
-            steps_after_first_call_error(Some((-1.0, 40.0)), Some((-1.0, 55.0))),
-            1
+            steps(&mut pattern, false, 3),
+            SemanticScroll::Partial {
+                completed: 1,
+                error: "UIA scroll failed: 0x80040201".into()
+            }
         );
     }
 
+    /// The `-1` axis value compares like any other, on either axis.
     #[test]
-    fn a_first_scroll_error_after_a_horizontal_move_counts_one_step() {
+    fn a_move_on_either_axis_is_movement_and_an_unchanged_one_is_not() {
+        assert!(movement_seen(
+            (Some(-1.0), Some(40.0)),
+            (Some(-1.0), Some(55.0))
+        ));
+        assert!(movement_seen(
+            (Some(10.0), Some(-1.0)),
+            (Some(25.0), Some(-1.0))
+        ));
+        assert!(!movement_seen(
+            (Some(-1.0), Some(40.0)),
+            (Some(-1.0), Some(40.0))
+        ));
+        assert!(!movement_seen((None, None), (Some(0.0), Some(40.0))));
+    }
+
+    /// NaN and infinity are unreadable, never a position.
+    #[test]
+    fn non_finite_scroll_readings_count_as_unreadable() {
         assert_eq!(
-            steps_after_first_call_error(Some((10.0, -1.0)), Some((25.0, -1.0))),
-            1
+            scroll_reading(Some(f64::NAN), Some(f64::INFINITY)),
+            (None, None)
         );
-    }
-
-    /// An unchanged position is no step, including `-1` ("no scroll on this
-    /// axis") on one axis.
-    #[test]
-    fn a_first_scroll_error_with_the_position_unchanged_counts_no_step() {
         assert_eq!(
-            steps_after_first_call_error(Some((0.0, 40.0)), Some((0.0, 40.0))),
-            0
+            scroll_reading(Some(f64::NEG_INFINITY), Some(40.0)),
+            (None, Some(40.0))
         );
-    }
-
-    #[test]
-    fn a_first_scroll_error_with_an_unscrollable_axis_unchanged_counts_no_step() {
         assert_eq!(
-            steps_after_first_call_error(Some((-1.0, 40.0)), Some((-1.0, 40.0))),
-            0
+            scroll_reading(Some(-1.0), Some(100.0)),
+            (Some(-1.0), Some(100.0))
         );
+        // A getter that went from a number to infinity shows no move.
+        let mut pattern = FakePattern::new(
+            vec![(Some(0.0), Some(40.0)), (Some(0.0), Some(f64::INFINITY))],
+            vec![false],
+        );
+        assert!(matches!(
+            steps(&mut pattern, false, 3),
+            SemanticScroll::Uncertain { .. }
+        ));
     }
 
-    /// Without both readings the move can't be shown, so the error is taken
-    /// as not applied.
-    #[test]
-    fn a_first_scroll_error_without_a_reading_before_counts_no_step() {
-        assert_eq!(steps_after_first_call_error(None, Some((-1.0, 55.0))), 0);
+    /// The scroll reply a foreground element scroll gets for `semantic`,
+    /// with the element removed during the call.
+    fn reply_after_removal(
+        semantic: SemanticScroll,
+        pixel: Option<(i32, i32)>,
+    ) -> (ToolResult, FakeScroll) {
+        let mut target = FakeScroll::new(LiveBounds::Rect((300, 400, 360, 420)), semantic);
+        target.live_later = Some(LiveBounds::NotAvailable);
+        let error = scroll(&mut target, pixel).unwrap_err();
+        let result = error_result(error, || panic!("{pixel:?}: mapped to the stale refusal"));
+        (result, target)
     }
 
+    fn assert_scroll_uncertain(result: &ToolResult) {
+        assert_eq!(result.is_error, Some(true));
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("returned an error from its first UIA scroll call"),
+            "{text}"
+        );
+        assert!(text.contains("no wheel was sent"), "{text}");
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["code"], SCROLL_UNCERTAIN, "{structured}");
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["path"], "uia");
+        assert_eq!(structured["delivery_mode"], "background");
+        assert_eq!(structured["amount"], 3);
+        assert_eq!(structured["wheel_sent"], false);
+        assert_eq!(structured["window_id"], 0x10);
+        assert_eq!(structured["element_index"], 3);
+        assert_eq!(structured["retryable"], false);
+        assert_eq!(structured["escalation"]["recommended"], "verify_state");
+        for absent in ["delivery", "completed_steps", "status", "refusal"] {
+            assert!(structured.get(absent).is_none(), "{absent}: {structured}");
+        }
+    }
+
+    /// The first call errored and both after-readings are unreadable (the
+    /// control may have been removed by the call): uncertain, no wheel, and
+    /// the element is not read again, so it can't become a stale refusal.
     #[test]
-    fn a_first_scroll_error_without_a_reading_after_counts_no_step() {
-        assert_eq!(steps_after_first_call_error(Some((-1.0, 40.0)), None), 0);
+    fn a_first_call_error_with_no_reading_after_is_uncertain_and_never_stale() {
+        let mut pattern =
+            FakePattern::new(vec![(Some(0.0), Some(40.0)), (None, None)], vec![false]);
+        let semantic = steps(&mut pattern, false, 3);
+        assert_eq!(pattern.scroll_calls(), 1);
+        assert_eq!(
+            semantic,
+            SemanticScroll::Uncertain {
+                error: "UIA scroll failed: 0x80040201".into()
+            }
+        );
+        for pixel in [None, Some((7, 8))] {
+            let (result, target) = reply_after_removal(semantic.clone(), pixel);
+            assert_scroll_uncertain(&result);
+            assert_eq!(target.events, vec!["live", "semantic"], "{pixel:?}");
+            assert_eq!(target.wheels(), 0);
+        }
+    }
+
+    /// The first call errored and the position reads back unchanged: the
+    /// provider may update it late, so it is uncertain, and no wheel follows.
+    #[test]
+    fn a_first_call_error_with_the_position_unchanged_is_uncertain_with_no_wheel() {
+        for before in [(Some(0.0), Some(40.0)), (Some(-1.0), Some(40.0))] {
+            let mut pattern = FakePattern::new(vec![before, before], vec![false]);
+            let semantic = steps(&mut pattern, false, 3);
+            assert!(
+                matches!(semantic, SemanticScroll::Uncertain { .. }),
+                "{before:?}: {semantic:?}"
+            );
+            let mut target = FakeScroll::new(LiveBounds::Rect((300, 400, 360, 420)), semantic);
+            let error = scroll(&mut target, None).unwrap_err();
+            assert_eq!(target.wheels(), 0, "{:?}", target.events);
+            assert_scroll_uncertain(&error_result(error, || panic!("stale")));
+        }
+    }
+
+    /// The requested axis reads `-1` ("no scroll on this axis"): no `Scroll`
+    /// call, so nothing was sent and the wheel may follow. `-1` on the other
+    /// axis, or an unreadable requested axis, still calls `Scroll`.
+    #[test]
+    fn an_unscrollable_requested_axis_sends_no_scroll_and_allows_the_wheel() {
+        assert!(axis_cannot_scroll((Some(-1.0), Some(40.0)), true));
+        assert!(axis_cannot_scroll((Some(0.0), Some(-1.0)), false));
+        assert!(!axis_cannot_scroll((Some(-1.0), Some(40.0)), false));
+        assert!(!axis_cannot_scroll((Some(0.0), Some(-1.0)), true));
+        assert!(!axis_cannot_scroll((None, None), true));
+
+        for (reading, horizontal) in [
+            ((Some(-1.0), Some(40.0)), true),
+            ((Some(0.0), Some(-1.0)), false),
+        ] {
+            let mut pattern = FakePattern::new(vec![reading], vec![]);
+            let semantic = steps(&mut pattern, horizontal, 3);
+            assert_eq!(pattern.scroll_calls(), 0, "{reading:?}");
+            assert_eq!(semantic, SemanticScroll::NotDispatched, "{reading:?}");
+            let mut target = FakeScroll::new(LiveBounds::Rect((300, 400, 360, 420)), semantic);
+            assert_eq!(
+                scroll(&mut target, None).unwrap(),
+                ElementScroll::Wheel((330, 410))
+            );
+            assert_eq!(target.wheels(), 1);
+        }
+
+        for (reading, horizontal) in [
+            ((Some(-1.0), Some(40.0)), false),
+            ((Some(0.0), Some(-1.0)), true),
+            ((None, None), true),
+            ((None, None), false),
+        ] {
+            let mut pattern = FakePattern::new(vec![reading], vec![true, true, true]);
+            assert_eq!(
+                steps(&mut pattern, horizontal, 3),
+                SemanticScroll::Done,
+                "{reading:?} {horizontal}"
+            );
+            assert_eq!(pattern.scroll_calls(), 3, "{reading:?} {horizontal}");
+        }
+    }
+
+    /// A later call's error keeps the accepted calls, without reading the
+    /// position again.
+    #[test]
+    fn a_later_scroll_error_counts_the_accepted_calls() {
+        let mut pattern = FakePattern::new(vec![(Some(0.0), Some(40.0))], vec![true, true, false]);
+        assert_eq!(
+            steps(&mut pattern, false, 3),
+            SemanticScroll::Partial {
+                completed: 2,
+                error: "UIA scroll failed: 0x80040201".into()
+            }
+        );
+        assert_eq!(pattern.events, vec!["read", "scroll", "scroll", "scroll"]);
     }
 
     /// A SetFocus that succeeds needs no click and no live read.

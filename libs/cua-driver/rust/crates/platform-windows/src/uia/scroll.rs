@@ -137,24 +137,22 @@ pub unsafe fn scroll_element(
 /// A [`scroll_element_steps`] that stopped on an error.
 #[derive(Debug)]
 pub struct ScrollStepsError {
-    /// `ScrollPattern::Scroll` calls that returned success before the error.
-    /// Zero when the route was unavailable before the first call (null or
-    /// non-scrollable element, failed cast, unknown direction) or the first
-    /// call itself failed, unless the pattern's scroll position, read before
-    /// and after that call, shows it moved: then one. When the position can't
-    /// be read, a failed first call is still taken as not applied.
-    pub completed: u32,
+    /// Where it stopped: before any `ScrollPattern::Scroll` call (null or
+    /// non-scrollable element, failed cast, unknown direction, or the
+    /// requested axis reads as unscrollable), at the first call (and whether
+    /// the scroll position shows that call moved anything), or at a later
+    /// call after some were accepted.
+    pub(crate) stop: crate::tools::foreground_focus::ScrollStop,
     pub error: anyhow::Error,
 }
 
-/// [`scroll_element`], reporting how many of its `amount.max(1)` separate
-/// `ScrollPattern::Scroll` calls succeeded before an error. Each call is a
-/// synchronous request the provider either applies or rejects with an error
-/// HRESULT, so a failed call is taken as not applied, with one check: when
-/// the first call fails, the pattern's horizontal and vertical scroll percent
-/// read before it and after the error decide, and a position that moved
-/// counts that call as one step. When the position can't be read, the failed
-/// first call is still taken as not applied.
+/// [`scroll_element`], reporting where its `amount.max(1)` separate
+/// `ScrollPattern::Scroll` calls stopped on an error; see
+/// [`crate::tools::foreground_focus::run_scroll_steps`]. The pattern's
+/// horizontal and vertical scroll percent is read before the first call: a
+/// requested axis that reads as `-1` ("no scroll on this axis") gets no call.
+/// It is read again only when the first call errors, to tell a call that
+/// moved the position from one whose effect is unknown.
 ///
 /// # Safety
 /// `element_ptr` must be a live `IUIAutomationElement` that the caller keeps
@@ -164,12 +162,13 @@ pub unsafe fn scroll_element_steps(
     direction: &str,
     amount: u32,
 ) -> Result<(), ScrollStepsError> {
-    let not_dispatched = |error| ScrollStepsError {
-        completed: 0,
+    use crate::tools::foreground_focus::ScrollStop;
+    let before_scroll = |error| ScrollStepsError {
+        stop: ScrollStop::BeforeScroll,
         error,
     };
     if element_ptr == 0 {
-        return Err(not_dispatched(anyhow::anyhow!(
+        return Err(before_scroll(anyhow::anyhow!(
             "cached UIA scroll element is null"
         )));
     }
@@ -179,48 +178,58 @@ pub unsafe fn scroll_element_steps(
     let elem = std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     let pattern = elem
         .GetCurrentPattern(UIA_ScrollPatternId)
-        .map_err(|e| not_dispatched(anyhow::anyhow!("UIA ScrollPattern unavailable: {e}")))?;
+        .map_err(|e| before_scroll(anyhow::anyhow!("UIA ScrollPattern unavailable: {e}")))?;
     let scroll = pattern
         .cast::<IUIAutomationScrollPattern>()
-        .map_err(|e| not_dispatched(anyhow::anyhow!("UIA ScrollPattern cast failed: {e}")))?;
-    let vertical = match direction {
+        .map_err(|e| before_scroll(anyhow::anyhow!("UIA ScrollPattern cast failed: {e}")))?;
+    let step = match direction {
         "up" => ScrollAmount_LargeDecrement,
         "down" => ScrollAmount_LargeIncrement,
         "left" => ScrollAmount_LargeDecrement,
         "right" => ScrollAmount_LargeIncrement,
         other => {
-            return Err(not_dispatched(anyhow::anyhow!(
+            return Err(before_scroll(anyhow::anyhow!(
                 "unknown scroll direction {other:?}"
             )))
         }
     };
     let horizontal = matches!(direction, "left" | "right");
-    // `(horizontal, vertical)` scroll percent; `None` when either can't be read.
-    let position = || -> Option<(f64, f64)> {
-        let h = scroll.CurrentHorizontalScrollPercent().ok()?;
-        let v = scroll.CurrentVerticalScrollPercent().ok()?;
-        (!h.is_nan() && !v.is_nan()).then_some((h, v))
+    let mut calls = PatternCalls {
+        scroll: &scroll,
+        step,
+        horizontal,
     };
-    let before = position();
-    for completed in 0..amount.max(1) {
-        let result = if horizontal {
-            scroll.Scroll(vertical, ScrollAmount_NoAmount)
-        } else {
-            scroll.Scroll(ScrollAmount_NoAmount, vertical)
-        };
-        if let Err(e) = result {
-            let completed = if completed == 0 {
-                crate::tools::foreground_focus::steps_after_first_call_error(before, position())
-            } else {
-                completed
-            };
-            return Err(ScrollStepsError {
-                completed,
-                error: anyhow::anyhow!("UIA scroll failed: {e}"),
-            });
+    crate::tools::foreground_focus::run_scroll_steps(&mut calls, horizontal, amount)
+        .map_err(|(stop, error)| ScrollStepsError { stop, error })
+}
+
+/// The live `ScrollPattern` behind [`scroll_element_steps`].
+struct PatternCalls<'a> {
+    scroll: &'a IUIAutomationScrollPattern,
+    step: windows::Win32::UI::Accessibility::ScrollAmount,
+    horizontal: bool,
+}
+
+impl crate::tools::foreground_focus::ScrollPatternCalls for PatternCalls<'_> {
+    fn read_percent(&mut self) -> (Option<f64>, Option<f64>) {
+        unsafe {
+            (
+                self.scroll.CurrentHorizontalScrollPercent().ok(),
+                self.scroll.CurrentVerticalScrollPercent().ok(),
+            )
         }
     }
-    Ok(())
+
+    fn scroll_once(&mut self) -> anyhow::Result<()> {
+        let result = unsafe {
+            if self.horizontal {
+                self.scroll.Scroll(self.step, ScrollAmount_NoAmount)
+            } else {
+                self.scroll.Scroll(ScrollAmount_NoAmount, self.step)
+            }
+        };
+        result.map_err(|e| anyhow::anyhow!("UIA scroll failed: {e}"))
+    }
 }
 
 /// Strategy 1: `ScrollItemPattern::ScrollIntoView` on the element itself.

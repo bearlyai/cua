@@ -382,15 +382,24 @@ Which foreground routes check, before they act:
   no-activate during the calls and for 50 ms after them, and if the control
   takes the foreground anyway, the window that was in front before is put
   back. Its success reply says `delivery_mode: background`.
-- If the first call fails, the pattern's horizontal and vertical scroll
-  position, read before the call and after the error, decide what happened.
-  A position that moved means that call scrolled: no wheel is sent and the
-  reply is `scroll_incomplete` (below) with one delivered step. A position
-  that did not move means nothing scrolled, and the wheel fallback above
-  applies. When the position can't be read, a first-call error is still
-  taken as nothing scrolled, and the wheel may follow. If a later call fails,
-  some steps already moved the content, so no wheel is sent and the reply is
-  `scroll_incomplete`, never the stale refusal.
+- Before the first call, the pattern's horizontal and vertical scroll
+  percent is read, each axis on its own. An axis whose getter fails or
+  returns NaN or infinity is unreadable. If the requested axis reads `-1`
+  (UIA's "no scroll on this axis"), no `Scroll` call is made: nothing was
+  sent, and the wheel fallback above applies. If that axis is unreadable,
+  the calls go ahead.
+- If the first call returns an error, the position is read again. Either
+  axis readable both times with a different value shows that the call
+  moved something: no wheel is sent and the reply is `scroll_incomplete`
+  (below) with one delivered step. Otherwise (unchanged, or unreadable,
+  for example because the call removed the control) the call may still have
+  scrolled, so no wheel is sent, the element is not read again, and the
+  reply is `scroll_uncertain` (below), never the stale refusal. If a later
+  call fails, no wheel is sent and the reply is `scroll_incomplete`, never
+  the stale refusal.
+- The wheel fallback and the stale refusal after the element's own scroll
+  are reached only when no `Scroll` call was made: not a UIA element, no
+  `ScrollPattern`, a failed cast, or the requested axis reading `-1`.
 
 The check is a probe, not atomic with the action. A control that the app
 removes after the check but before the input lands is not caught. Ordinary
@@ -445,12 +454,33 @@ returns:
 }
 ```
 
-It appears only after at least one step moved the content (a call that
-succeeded, or a first call whose error came after the position moved), so
-its effect is `partial` with the completed steps as
-`delivery.delivered_count`, as the
+Its count is the `Scroll` calls the provider accepted before the error, or
+one for a first call that errored after the position was seen to change. An
+accepted call at an end of the scroll range may move nothing, so the count
+is of accepted calls, not of steps proven to have moved the content. Its
+effect is `partial` with that count as `delivery.delivered_count`, as the
 [action result contract](action-result-contract.md) requires; it is never
-`status: "refused"`. The post-activation keyboard failures above stay
+`status: "refused"`.
+
+A first call that returned an error, where the position doesn't show
+whether it moved, returns:
+
+```json
+{
+  "content": [{"type": "text", "text": "scroll_uncertain: UIA element [N] in HWND 0x… returned an error from its first UIA scroll call (UIA scroll failed: …) and its position does not show whether it moved; no wheel was sent. Read the window again before acting."}],
+  "isError": true,
+  "structuredContent": {
+    "code": "scroll_uncertain", "effect": "unverifiable", "path": "uia",
+    "delivery_mode": "background",
+    "amount": 3, "wheel_sent": false,
+    "window_id": 0, "element_index": 0, "retryable": false,
+    "escalation": {"recommended": "verify_state", "reason": "The element's UIA scroll returned an error and its position does not show whether it moved; no wheel was sent. Read the window again before scrolling more."}
+  }
+}
+```
+
+It has no `delivery` count and no `completed_steps`: whether anything moved
+is unknown. Its effect is `unverifiable`, and it is never `status: "refused"`. The post-activation keyboard failures above stay
 `effect: "failed"`, because none of the requested keys or text was sent.
 
 Exceptions that never take the foreground and so have no foreground check:

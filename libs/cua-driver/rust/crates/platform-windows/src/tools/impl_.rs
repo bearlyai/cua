@@ -4645,7 +4645,7 @@ impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
             )
         });
         super::foreground_focus::semantic_scroll_from(
-            steps.map_err(|stopped| (stopped.completed, stopped.error.to_string())),
+            steps.map_err(|stopped| (stopped.stop, stopped.error.to_string())),
         )
     }
 
@@ -6481,10 +6481,12 @@ impl Tool for ScrollTool {
         // Foreground scroll addressed by an element: see
         // `foreground_focus::foreground_element_scroll`. The element is read
         // live before its own UIA scroll. If that scroll stops part-way, the
-        // reply is `scroll_incomplete` and no wheel is sent. If it dispatched
-        // nothing, the element must be located live again before the wheel,
-        // which goes to the caller's x,y or else the live centre, never the
-        // window centre. Background element scrolls continue below unchanged.
+        // reply is `scroll_incomplete`; if its first call errored without
+        // showing whether it moved, `scroll_uncertain`. Neither sends a wheel.
+        // If it dispatched nothing, the element must be located live again
+        // before the wheel, which goes to the caller's x,y or else the live
+        // centre, never the window centre. Background element scrolls continue
+        // below unchanged.
         if let Some(idx) = elem_idx.filter(|_| delivery == DeliveryMode::Foreground) {
             let (horizontal, sign) = match direction.as_str() {
                 "up" => (false, 1),
