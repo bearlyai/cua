@@ -3642,6 +3642,8 @@ impl Tool for ClickTool {
                         count,
                         button: btn_fg,
                         modifiers: mods_owned,
+                        prev_fg_addr,
+                        runtime: tokio::runtime::Handle::current(),
                     };
                     let pick = if want_expand {
                         super::foreground_focus::dropdown_half
@@ -3650,7 +3652,7 @@ impl Tool for ClickTool {
                     };
                     run_foreground_tap(tap, pick).await
                 } else {
-                    tokio::task::spawn_blocking({
+                    let sent = tokio::task::spawn_blocking({
                         let admitted = admitted.clone();
                         move || {
                             let _admission = &admitted;
@@ -3663,9 +3665,10 @@ impl Tool for ClickTool {
                         }
                     })
                     .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task error: {e}")))
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task error: {e}")));
+                    tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
+                    sent
                 };
-                tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 let half = if want_expand { "dropdown" } else { "press" };
                 return match send_result {
                     Ok((tx, ty)) => ToolResult::text(format!(
@@ -3800,13 +3803,14 @@ impl Tool for ClickTool {
                     count,
                     button: btn.clone(),
                     modifiers: modifiers.clone(),
-                };
-                let prev_fg_addr = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
+                    // Restored by the tap only once it was dispatched.
+                    prev_fg_addr: unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
+                    },
+                    runtime: tokio::runtime::Handle::current(),
                 };
                 let send_result =
                     run_foreground_tap(tap, super::foreground_focus::live_center).await;
-                tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
                     Ok((cx, cy)) => ToolResult::text(format!(
                         "✅ Performed SendInput click on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
@@ -4453,6 +4457,7 @@ struct CachedElementFocus<'a> {
     admitted: &'a Option<crate::uia::snapshot::RetainedElement>,
     hwnd: u64,
     element_index: usize,
+    action_verb: &'static str,
 }
 
 impl super::foreground_focus::FocusTarget for CachedElementFocus<'_> {
@@ -4490,7 +4495,7 @@ impl super::foreground_focus::FocusTarget for CachedElementFocus<'_> {
             self.element_index,
             cx,
             cy,
-            "the focus click",
+            self.action_verb,
         )
     }
 
@@ -4499,25 +4504,33 @@ impl super::foreground_focus::FocusTarget for CachedElementFocus<'_> {
     }
 }
 
-/// Establish exact UIA child focus after the owning top-level HWND is already
-/// confirmed foreground; see [`super::foreground_focus::focus_for_foreground`].
-/// A failed `SetFocus` falls back to a click at the element's live centre,
-/// never the centre cached at read time, and an element UIA reports as gone
-/// gets no click at all.
-fn focus_cached_element_for_foreground(
+/// A foreground keyboard route (typing, `press_key`, `hotkey`): with an
+/// element, [`super::foreground_focus::foreground_element_keys`] reads it live
+/// before `transaction` activates the window and then establishes focus inside
+/// it; without one, the transaction runs with no focus step.
+fn run_foreground_keys(
     admitted: &Option<crate::uia::snapshot::RetainedElement>,
     hwnd: u64,
-    element_index: usize,
+    element_index: Option<usize>,
+    check_visible: bool,
+    action_verb: &'static str,
+    transaction: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    super::foreground_focus::focus_for_foreground(
-        &mut CachedElementFocus {
-            admitted,
+    match element_index {
+        Some(element_index) => super::foreground_focus::foreground_element_keys(
+            &mut CachedElementFocus {
+                admitted,
+                hwnd,
+                element_index,
+                action_verb,
+            },
             hwnd,
             element_index,
-        },
-        hwnd,
-        element_index,
-    )
+            check_visible,
+            transaction,
+        ),
+        None => transaction(&mut || Ok(())),
+    }
 }
 
 /// One foreground SendInput tap on a cached element, as
@@ -4539,6 +4552,9 @@ struct ElementTap {
     count: usize,
     button: String,
     modifiers: Vec<String>,
+    /// The foreground window before the tap, restored once it was dispatched.
+    prev_fg_addr: usize,
+    runtime: tokio::runtime::Handle,
 }
 
 impl super::foreground_focus::TapTarget for ElementTap {
@@ -4588,6 +4604,59 @@ impl super::foreground_focus::TapTarget for ElementTap {
             &modifiers,
         )
     }
+
+    fn restore_foreground(&mut self) {
+        self.runtime.spawn(restore_foreground_polling_best_effort(
+            self.prev_fg_addr,
+            self.pid,
+        ));
+    }
+}
+
+/// A foreground scroll on a cached element, as
+/// [`super::foreground_focus::foreground_element_scroll`] runs it.
+struct ElementScrollTarget {
+    admitted: Option<crate::uia::snapshot::RetainedElement>,
+    hwnd: u64,
+    element_index: usize,
+    direction: String,
+    amount: u32,
+    ticks: i32,
+    horizontal: bool,
+}
+
+impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
+    fn live_bounds(&mut self) -> super::foreground_focus::LiveBounds {
+        self.admitted
+            .as_ref()
+            .map(|element| element.live_bounds())
+            .unwrap_or(super::foreground_focus::LiveBounds::Unknown)
+    }
+
+    fn semantic_scroll(&mut self) -> bool {
+        self.admitted
+            .as_ref()
+            .filter(|retained| retained.is_uia())
+            .is_some_and(|retained| unsafe {
+                crate::uia::scroll::scroll_element(retained.as_ptr(), &self.direction, self.amount)
+                    .is_ok()
+            })
+    }
+
+    fn onscreen_point(&mut self, (cx, cy): (i32, i32)) -> Result<(i32, i32), ToolResult> {
+        resolve_onscreen_point_with_scroll(
+            &self.admitted,
+            self.hwnd,
+            self.element_index,
+            cx,
+            cy,
+            "scrolling",
+        )
+    }
+
+    fn wheel(&mut self, (x, y): (i32, i32)) -> anyhow::Result<()> {
+        crate::input::send_wheel_synthesized(x, y, self.ticks, self.horizontal)
+    }
 }
 
 /// Run one [`ElementTap`] on a blocking thread (UIA reads, then SendInput).
@@ -4598,23 +4667,6 @@ async fn run_foreground_tap(
     tokio::task::spawn_blocking(move || super::foreground_focus::foreground_tap(&mut tap, pick))
         .await
         .unwrap_or_else(|error| Err(anyhow::anyhow!("Task error: {error}")))
-}
-
-/// Before a foreground route for an element activates the window: read the
-/// element live and refuse it as a stale token when UIA reports it gone, so a
-/// control the app removed after the read costs no activation and no input.
-async fn dead_foreground_element_refusal(
-    state: &ToolState,
-    pid: i32,
-    admitted: &Option<crate::uia::snapshot::RetainedElement>,
-) -> Option<ToolResult> {
-    let element = admitted.clone()?;
-    let bounds = tokio::task::spawn_blocking(move || element.live_bounds())
-        .await
-        .unwrap_or(super::foreground_focus::LiveBounds::Unknown);
-    super::foreground_focus::require_live(bounds)
-        .err()
-        .map(|_| state.snapshots.dead_element_refusal(pid))
 }
 
 static TYPE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -4860,34 +4912,17 @@ impl Tool for TypeTextTool {
         // rejected (daemon not at UIAccess integrity), it returns an error
         // rather than a false success.
         if delivery == DeliveryMode::Foreground {
-            // Check the element before entering the atomic activation/focus/
+            // The element is read live before the atomic activation/focus/
             // input transaction: a control the app removed after the read is
-            // refused as stale, and one that is off-screen is refused, both
-            // before activation. The focus itself happens only after exact
-            // top-level foreground is confirmed.
+            // refused as stale, and one whose live centre is off-screen is
+            // refused, both before activation. The cached centre is not
+            // checked. The focus itself happens only after exact top-level
+            // foreground is confirmed.
             let focus_target = if let Some(idx) = elem_idx {
-                let (cx, cy) = match admitted.as_ref().map(|element| element.center) {
-                    Some(center) => center,
-                    None => {
-                        return ToolResult::error(format!(
+                if admitted.is_none() {
+                    return ToolResult::error(format!(
                         "Element {idx} not in cache for hwnd={hwnd}. Call get_window_state first."
-                    ))
-                    }
-                };
-                if let Some(refusal) =
-                    dead_foreground_element_refusal(&self.state, pid as i32, &admitted).await
-                {
-                    return refusal;
-                }
-                if let Err(result) = resolve_onscreen_point_with_scroll(
-                    &admitted,
-                    hwnd,
-                    idx as usize,
-                    cx,
-                    cy,
-                    "foreground typing",
-                ) {
-                    return result;
+                    ));
                 }
                 Some(idx as usize)
             } else {
@@ -4897,13 +4932,18 @@ impl Tool for TypeTextTool {
             let r = tokio::task::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
-                    let _admission = &admitted;
-                    crate::input::send_text_synthesized_after_focus(hwnd, &text_fg, || {
-                        if let Some(idx) = focus_target {
-                            focus_cached_element_for_foreground(&admitted, hwnd, idx)?;
-                        }
-                        Ok(())
-                    })
+                    run_foreground_keys(
+                        &admitted,
+                        hwnd,
+                        focus_target,
+                        true,
+                        "foreground typing",
+                        |focus| {
+                            crate::input::send_text_synthesized_after_focus(hwnd, &text_fg, || {
+                                focus()
+                            })
+                        },
+                    )
                 }
             })
             .await;
@@ -5613,27 +5653,25 @@ impl Tool for PressKeyTool {
         // Skipped when px-focus already fronted/clicked the target — the key then
         // goes via the plain background post path below.
         if !px_focus && delivery == DeliveryMode::Foreground {
-            let focus_target = elem_idx.map(|idx| idx as usize);
             // A key addressed to a control the app removed after the read is
             // refused as stale before the window is activated.
-            if focus_target.is_some() {
-                if let Some(refusal) =
-                    dead_foreground_element_refusal(&self.state, pid as i32, &admitted).await
-                {
-                    return refusal;
-                }
-            }
+            let focus_target = elem_idx.map(|idx| idx as usize);
             let send_result = tokio::task::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
-                    let _admission = &admitted;
                     let m: Vec<&str> = mods.iter().map(String::as_str).collect();
-                    crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
-                        if let Some(idx) = focus_target {
-                            focus_cached_element_for_foreground(&admitted, hwnd, idx)?;
-                        }
-                        Ok(())
-                    })
+                    run_foreground_keys(
+                        &admitted,
+                        hwnd,
+                        focus_target,
+                        false,
+                        "the focus click",
+                        |focus| {
+                            crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
+                                focus()
+                            })
+                        },
+                    )
                 }
             })
             .await;
@@ -6026,28 +6064,27 @@ impl Tool for HotkeyTool {
         // global modifier state, so Chromium never observes Ctrl+Shift+H as a
         // chord even though the renderer control is focused.
         let use_send_input = delivery == DeliveryMode::Foreground;
-        let focus_target = elem_idx;
         // A chord addressed to a control the app removed after the read is
         // refused as stale before the window is activated.
-        if use_send_input && focus_target.is_some() {
-            if let Some(refusal) =
-                dead_foreground_element_refusal(&self.state, pid as i32, &admitted).await
-            {
-                return refusal;
-            }
-        }
+        let focus_target = elem_idx;
         let result = tokio::task::spawn_blocking({
             let admitted = admitted.clone();
             move || {
                 let _admission = &admitted;
                 let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                 if use_send_input {
-                    crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
-                        if let Some(idx) = focus_target {
-                            focus_cached_element_for_foreground(&admitted, hwnd, idx)?;
-                        }
-                        Ok(())
-                    })
+                    run_foreground_keys(
+                        &admitted,
+                        hwnd,
+                        focus_target,
+                        false,
+                        "the focus click",
+                        |focus| {
+                            crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
+                                focus()
+                            })
+                        },
+                    )
                 } else {
                     crate::input::post_key(hwnd, &key, &m)
                 }
@@ -6401,6 +6438,71 @@ impl Tool for ScrollTool {
                 hwnd,
                 EventKind::MouseScroll,
             );
+        }
+        // Foreground scroll addressed by an element: see
+        // `foreground_focus::foreground_element_scroll`. The element is read
+        // live before its own UIA scroll; if that scroll fails, the wheel goes
+        // to the centre of the element's live rectangle (or the caller's x,y),
+        // never the window centre, and an element that can't be located live
+        // gets no wheel. Background element scrolls continue below unchanged.
+        if let Some(idx) = elem_idx.filter(|_| delivery == DeliveryMode::Foreground) {
+            let (horizontal, sign) = match direction.as_str() {
+                "up" => (false, 1),
+                "down" => (false, -1),
+                "right" => (true, 1),
+                "left" => (true, -1),
+                other => {
+                    return ToolResult::error(format!(
+                        "scroll: unknown direction \"{other}\" — expected up, down, left, right."
+                    ))
+                }
+            };
+            let per: i32 = if by == "page" { 3 } else { 1 };
+            let ticks = sign * (amount as i32) * per;
+            let px = args.get("x").and_then(|value| value.as_f64());
+            let py = args.get("y").and_then(|value| value.as_f64());
+            if px.is_some() != py.is_some() {
+                return ToolResult::error("scroll requires x and y together.");
+            }
+            let pixel = px
+                .zip(py)
+                .map(|(x, y)| bitmap_to_screen(hwnd, x as i32, y as i32));
+            let mut target = ElementScrollTarget {
+                admitted: admitted.clone(),
+                hwnd,
+                element_index: idx,
+                direction: direction.clone(),
+                amount,
+                ticks,
+                horizontal,
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                super::foreground_focus::foreground_element_scroll(&mut target, pixel)
+            })
+            .await;
+            return match result {
+                Ok(Ok(super::foreground_focus::ElementScroll::Semantic)) => {
+                    ToolResult::text(format!(
+                        "Scrolled {direction} {amount} ticks via UIA (delivery_mode:background)."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "path": "uia",
+                        "verified": false,
+                        "delivery_mode": "background"
+                    }))
+                }
+                Ok(Ok(super::foreground_focus::ElementScroll::Wheel((cx, cy)))) => {
+                    ToolResult::text(format!(
+                        "✅ Scrolled {direction} via SendInput wheel ({} tick(s)) at \
+                         screen ({cx},{cy}) (delivery_mode:foreground).",
+                        ticks.abs()
+                    ))
+                }
+                Ok(Err(e)) => super::foreground_focus::error_result(e, || {
+                    self.state.snapshots.dead_element_refusal(pid as i32)
+                }),
+                Err(e) => ToolResult::error(format!("Task error: {e}")),
+            };
         }
         if let Some(idx) = elem_idx {
             let prev_fg_addr = if delivery == DeliveryMode::Background {
@@ -6923,13 +7025,23 @@ impl Tool for DoubleClickTool {
                 }
             };
             let recorded_center = (cx, cy);
-            let (cx, cy) = match resolve_onscreen_point_with_scroll(
-                &admitted,
-                hwnd,
-                idx,
-                cx,
-                cy,
-                "double-clicking",
+            // Background checks the cached point here, as it always has. A
+            // foreground step checks the element's live position in its tap
+            // instead, so a control that moved is not refused for its old
+            // position and a dead one reaches the stale refusal.
+            let (cx, cy) = match super::foreground_focus::cached_point_preflight(
+                delivery == DeliveryMode::Foreground,
+                (cx, cy),
+                |(cx, cy)| {
+                    resolve_onscreen_point_with_scroll(
+                        &admitted,
+                        hwnd,
+                        idx,
+                        cx,
+                        cy,
+                        "double-clicking",
+                    )
+                },
             ) {
                 Ok(p) => p,
                 Err(result) => return result,
@@ -7015,13 +7127,14 @@ impl Tool for DoubleClickTool {
                     count: 2,
                     button: "left".to_owned(),
                     modifiers: Vec::new(),
-                };
-                let prev_fg_addr = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
+                    // Restored by the tap only once it was dispatched.
+                    prev_fg_addr: unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
+                    },
+                    runtime: tokio::runtime::Handle::current(),
                 };
                 let send_result =
                     run_foreground_tap(tap, super::foreground_focus::live_center).await;
-                tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
                     Ok((cx, cy)) => ToolResult::text(format!(
                         "✅ Sent double-click via SendInput on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
@@ -7294,13 +7407,23 @@ impl Tool for RightClickTool {
                 }
             };
             let recorded_center = (cx, cy);
-            let (cx, cy) = match resolve_onscreen_point_with_scroll(
-                &admitted,
-                hwnd,
-                idx,
-                cx,
-                cy,
-                "right-clicking",
+            // Background checks the cached point here, as it always has. A
+            // foreground step checks the element's live position in its tap
+            // instead, so a control that moved is not refused for its old
+            // position and a dead one reaches the stale refusal.
+            let (cx, cy) = match super::foreground_focus::cached_point_preflight(
+                delivery == DeliveryMode::Foreground,
+                (cx, cy),
+                |(cx, cy)| {
+                    resolve_onscreen_point_with_scroll(
+                        &admitted,
+                        hwnd,
+                        idx,
+                        cx,
+                        cy,
+                        "right-clicking",
+                    )
+                },
             ) {
                 Ok(p) => p,
                 Err(result) => return result,
@@ -7380,13 +7503,14 @@ impl Tool for RightClickTool {
                     count: 1,
                     button: "right".to_owned(),
                     modifiers: Vec::new(),
-                };
-                let prev_fg_addr = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
+                    // Restored by the tap only once it was dispatched.
+                    prev_fg_addr: unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
+                    },
+                    runtime: tokio::runtime::Handle::current(),
                 };
                 let send_result =
                     run_foreground_tap(tap, super::foreground_focus::live_center).await;
-                tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
                     Ok((cx, cy)) => ToolResult::text(format!(
                         "✅ Sent right-click via SendInput on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."

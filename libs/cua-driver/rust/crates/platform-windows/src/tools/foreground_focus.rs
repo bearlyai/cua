@@ -79,6 +79,54 @@ impl std::fmt::Display for FocusRefused {
 
 impl std::error::Error for FocusRefused {}
 
+/// A failure inside the foreground keyboard transaction, after the window was
+/// activated (Windows may also have needed the driver's no-op activation-assist
+/// key for that). No keys or text were sent, but the activation happened, so
+/// this is never the no-effects `stale_element_token` refusal.
+#[derive(Debug)]
+pub(crate) struct FailedAfterActivation {
+    /// `foreground_element_lost` when the element was gone after activation,
+    /// otherwise `foreground_unavailable`.
+    pub code: &'static str,
+    pub message: String,
+    pub hwnd: u64,
+    pub element_index: usize,
+    /// Whether the focus fallback click was sent before focus failed.
+    pub focus_click_sent: bool,
+}
+
+/// The element was gone after activation.
+pub(crate) const FOREGROUND_ELEMENT_LOST: &str = "foreground_element_lost";
+/// Focus could not be confirmed after activation.
+pub(crate) const FOREGROUND_UNAVAILABLE: &str = "foreground_unavailable";
+
+impl std::fmt::Display for FailedAfterActivation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for FailedAfterActivation {}
+
+impl FailedAfterActivation {
+    fn result(&self) -> ToolResult {
+        ToolResult::error(self.to_string()).with_structured(serde_json::json!({
+            "code": self.code,
+            "effect": "failed",
+            "activated": true,
+            "keystrokes_sent": false,
+            "focus_click_sent": self.focus_click_sent,
+            "window_id": self.hwnd,
+            "element_index": self.element_index,
+            "retryable": false,
+            "escalation": {
+                "recommended": "verify_state",
+                "reason": "The window was brought to the front and no keys or text were sent; read the window again before acting.",
+            },
+        }))
+    }
+}
+
 /// Before a foreground route activates the window: refuse an element UIA
 /// reports as no longer available. Any other read proceeds as before.
 pub(crate) fn require_live(bounds: LiveBounds) -> anyhow::Result<()> {
@@ -108,6 +156,10 @@ pub(crate) trait TapTarget {
     fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult>;
     /// Activate the window and send the input at a screen point.
     fn send(&mut self, point: (i32, i32)) -> anyhow::Result<()>;
+    /// Start restoring the earlier foreground window. Called once `send` was
+    /// attempted, whether it succeeded or failed part-way; never for a step
+    /// refused before dispatch, which changed nothing to restore.
+    fn restore_foreground(&mut self);
 }
 
 /// A foreground tap (click, double-click, right-click) on an element: read
@@ -120,8 +172,73 @@ pub(crate) fn foreground_tap(
 ) -> anyhow::Result<(i32, i32)> {
     let rect = live_target_rect(target.live_bounds())?;
     let point = target.onscreen_point(pick(rect)).map_err(FocusRefused)?;
-    target.send(point)?;
+    let sent = target.send(point);
+    target.restore_foreground();
+    sent?;
     Ok(point)
+}
+
+/// Where a cached-point preflight applies. A foreground step checks the live
+/// position instead (in [`foreground_tap`]), so it gets the cached point back
+/// unchecked, for overlay feedback only; a background step keeps the cached
+/// visibility preflight it always had.
+pub(crate) fn cached_point_preflight(
+    foreground: bool,
+    cached: (i32, i32),
+    check: impl FnOnce((i32, i32)) -> Result<(i32, i32), ToolResult>,
+) -> Result<(i32, i32), ToolResult> {
+    if foreground {
+        Ok(cached)
+    } else {
+        check(cached)
+    }
+}
+
+/// What a foreground scroll addressed by an element needs from Windows.
+pub(crate) trait ScrollTarget {
+    /// Read the element's rectangle live.
+    fn live_bounds(&mut self) -> LiveBounds;
+    /// The element's own UIA scroll; `true` when it scrolled.
+    fn semantic_scroll(&mut self) -> bool;
+    /// The on-screen check (and scroll into view) for the wheel point.
+    fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult>;
+    /// Send the wheel at a screen point.
+    fn wheel(&mut self, point: (i32, i32)) -> anyhow::Result<()>;
+}
+
+/// How a foreground element scroll was delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElementScroll {
+    /// The element's own UIA scroll.
+    Semantic,
+    /// The wheel, at this screen point.
+    Wheel((i32, i32)),
+}
+
+/// A foreground scroll addressed by an element. A control UIA reports as gone
+/// is refused as stale before its own scroll is tried. When that scroll fails,
+/// the wheel goes to the centre of the element's live rectangle after the
+/// on-screen check, or to the caller's `pixel` when one was given; an element
+/// that can't be located live is refused, never sent to the window centre.
+pub(crate) fn foreground_element_scroll(
+    target: &mut impl ScrollTarget,
+    pixel: Option<(i32, i32)>,
+) -> anyhow::Result<ElementScroll> {
+    require_live(target.live_bounds())?;
+    if target.semantic_scroll() {
+        return Ok(ElementScroll::Semantic);
+    }
+    let point = match pixel {
+        Some(point) => point,
+        None => {
+            let rect = live_target_rect(target.live_bounds())?;
+            target
+                .onscreen_point(live_center(rect))
+                .map_err(FocusRefused)?
+        }
+    };
+    target.wheel(point)?;
+    Ok(ElementScroll::Wheel(point))
 }
 
 /// The centre `pick` for [`foreground_tap`].
@@ -139,6 +256,9 @@ pub(crate) fn dropdown_half((_left, top, right, bottom): (i32, i32, i32, i32)) -
 pub(crate) fn error_result(error: anyhow::Error, stale: impl FnOnce() -> ToolResult) -> ToolResult {
     if error.is::<DeadElement>() {
         return stale();
+    }
+    if let Some(failed) = error.downcast_ref::<FailedAfterActivation>() {
+        return failed.result();
     }
     match error.downcast::<FocusRefused>() {
         Ok(FocusRefused(result)) => result,
@@ -176,12 +296,49 @@ pub(crate) fn focus_for_foreground(
         return Ok(());
     }
 
+    // Everything below runs after activation: failures say so, and none of
+    // them is the no-effects stale refusal.
+    let failed = |code, message: String, focus_click_sent| FailedAfterActivation {
+        code,
+        message,
+        hwnd,
+        element_index,
+        focus_click_sent,
+    };
+    let mut focus_click_sent = false;
     match target.live_bounds() {
-        LiveBounds::NotAvailable => return Err(DeadElement.into()),
+        LiveBounds::NotAvailable => {
+            return Err(failed(
+                FOREGROUND_ELEMENT_LOST,
+                format!(
+                    "HWND 0x{hwnd:x} was brought to the front, then UIA element \
+                     [{element_index}] was no longer available; no keys or text were sent. \
+                     Read the window again before acting."
+                ),
+                false,
+            )
+            .into())
+        }
         LiveBounds::Rect(rect) => {
             if let Some(center) = rect_center(rect) {
-                let point = target.onscreen_point(center).map_err(FocusRefused)?;
+                let point = match target.onscreen_point(center) {
+                    Ok(point) => point,
+                    Err(refusal) => {
+                        return Err(failed(
+                            FOREGROUND_UNAVAILABLE,
+                            format!(
+                                "HWND 0x{hwnd:x} was brought to the front, but UIA element \
+                                 [{element_index}] could not take focus and its focus click was \
+                                 refused ({}); no keys or text were sent",
+                                FocusRefused(refusal)
+                            ),
+                            false,
+                        )
+                        .into())
+                    }
+                };
                 target.click(point)?;
+                focus_click_sent = true;
                 if target.wait_for_focus(Duration::from_millis(500)) {
                     return Ok(());
                 }
@@ -195,10 +352,43 @@ pub(crate) fn focus_for_foreground(
         .err()
         .map(|error| format!("; UIA SetFocus failed: {error}"))
         .unwrap_or_default();
-    anyhow::bail!(
-        "foreground_unavailable: Windows did not confirm keyboard focus on exact UIA element \
-         [{element_index}] in HWND 0x{hwnd:x}{detail}; no keyboard input was sent"
+    Err(failed(
+        FOREGROUND_UNAVAILABLE,
+        format!(
+            "Windows did not confirm keyboard focus on exact UIA element [{element_index}] in \
+             HWND 0x{hwnd:x}{detail}; the window was brought to the front and no keyboard \
+             input was sent"
+        ),
+        focus_click_sent,
     )
+    .into())
+}
+
+/// The whole foreground keyboard route for an element: one live read before
+/// activation, then the keyboard `transaction` (activation, then `focus`, then
+/// the keys). A control UIA reports as gone is refused as stale before the
+/// transaction runs, so nothing is activated or sent. With `check_visible`
+/// (typing), the live centre must also pass the on-screen check before
+/// activation; an unreadable rectangle skips that check, never falling back to
+/// the point cached at read time. Failures inside the transaction are
+/// [`FailedAfterActivation`].
+pub(crate) fn foreground_element_keys(
+    target: &mut impl FocusTarget,
+    hwnd: u64,
+    element_index: usize,
+    check_visible: bool,
+    transaction: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match target.live_bounds() {
+        LiveBounds::NotAvailable => return Err(DeadElement.into()),
+        LiveBounds::Rect(rect) if check_visible => {
+            target
+                .onscreen_point(live_center(rect))
+                .map_err(FocusRefused)?;
+        }
+        LiveBounds::Rect(_) | LiveBounds::Unknown => {}
+    }
+    transaction(&mut || focus_for_foreground(target, hwnd, element_index))
 }
 
 #[cfg(test)]
@@ -213,6 +403,9 @@ mod tests {
         set_focus_ok: bool,
         focused_after_click: bool,
         live: LiveBounds,
+        /// What every live read after the first returns, when it changes.
+        live_later: Option<LiveBounds>,
+        live_reads: usize,
         clicked: Vec<(i32, i32)>,
         reads: Vec<&'static str>,
     }
@@ -223,6 +416,8 @@ mod tests {
                 set_focus_ok: false,
                 focused_after_click: true,
                 live,
+                live_later: None,
+                live_reads: 0,
                 clicked: Vec::new(),
                 reads: Vec::new(),
             }
@@ -245,7 +440,11 @@ mod tests {
 
         fn live_bounds(&mut self) -> LiveBounds {
             self.reads.push("live_bounds");
-            self.live
+            self.live_reads += 1;
+            match self.live_later {
+                Some(later) if self.live_reads > 1 => later,
+                _ => self.live,
+            }
         }
 
         fn onscreen_point(&mut self, center: (i32, i32)) -> Result<(i32, i32), ToolResult> {
@@ -256,6 +455,109 @@ mod tests {
         fn click(&mut self, point: (i32, i32)) -> anyhow::Result<()> {
             self.clicked.push(point);
             Ok(())
+        }
+    }
+
+    fn stale() -> ToolResult {
+        ToolResult::error("stale").with_structured(serde_json::json!({
+            "status": "refused",
+            "refusal": { "code": "stale_element_token" },
+        }))
+    }
+
+    /// The keyboard transaction as `keyboard.rs` runs it: activation, then the
+    /// focus callback, then the keys only if focus was established.
+    fn transaction<'a>(
+        events: &'a std::cell::RefCell<Vec<&'static str>>,
+    ) -> impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> + 'a {
+        move |focus| {
+            events.borrow_mut().push("activate");
+            focus()?;
+            events.borrow_mut().push("keys");
+            Ok(())
+        }
+    }
+
+    /// Activation, then a failed SetFocus, then the element gone: the reply
+    /// says the window was activated and no keys were sent. It is not the
+    /// no-effects stale refusal and not `status: "refused"`.
+    #[test]
+    fn an_element_lost_after_activation_is_an_honest_failure_not_stale() {
+        for first in [LiveBounds::Rect(CACHED_RECT), LiveBounds::Unknown] {
+            let mut element = FakeElement::new(first);
+            element.live_later = Some(LiveBounds::NotAvailable);
+            let events = std::cell::RefCell::new(Vec::new());
+            let error = foreground_element_keys(&mut element, 0x10, 3, false, transaction(&events))
+                .unwrap_err();
+            assert_eq!(events.into_inner(), vec!["activate"], "{first:?}");
+            assert!(element.clicked.is_empty(), "{first:?}: clicked");
+            let result = error_result(error, || panic!("{first:?}: mapped to the stale refusal"));
+            assert_eq!(result.is_error, Some(true));
+            let structured = result.structured_content.unwrap();
+            assert_eq!(structured["code"], FOREGROUND_ELEMENT_LOST, "{first:?}");
+            assert_eq!(structured["effect"], "failed");
+            assert_eq!(structured["activated"], true);
+            assert_eq!(structured["keystrokes_sent"], false);
+            assert_eq!(structured["retryable"], false);
+            assert!(structured.get("status").is_none(), "{structured}");
+        }
+    }
+
+    /// The element gone at the read before activation: stale refusal, and the
+    /// transaction (activation, focus, keys) never runs.
+    #[test]
+    fn a_dead_element_never_starts_the_keyboard_transaction() {
+        for check_visible in [false, true] {
+            let mut element = FakeElement::new(LiveBounds::NotAvailable);
+            let events = std::cell::RefCell::new(Vec::new());
+            let error =
+                foreground_element_keys(&mut element, 0x10, 3, check_visible, transaction(&events))
+                    .unwrap_err();
+            assert!(events.into_inner().is_empty());
+            let result = error_result(error, stale);
+            assert_eq!(
+                result.structured_content.unwrap()["refusal"]["code"],
+                "stale_element_token"
+            );
+        }
+    }
+
+    /// Typing checks visibility at the live centre before activation, never
+    /// at the cached one; keys don't check, and an unreadable rectangle skips
+    /// the check.
+    #[test]
+    fn typing_checks_visibility_at_the_live_centre_before_activation() {
+        struct Watch(FakeElement, Vec<(i32, i32)>);
+        impl FocusTarget for Watch {
+            fn set_focus(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn wait_for_focus(&mut self, _timeout: Duration) -> bool {
+                true
+            }
+            fn live_bounds(&mut self) -> LiveBounds {
+                self.0.live_bounds()
+            }
+            fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult> {
+                self.1.push(point);
+                Ok(point)
+            }
+            fn click(&mut self, point: (i32, i32)) -> anyhow::Result<()> {
+                self.0.click(point)
+            }
+        }
+        let moved = LiveBounds::Rect((300, 400, 360, 420));
+        for (live, check_visible, expected) in [
+            (moved, true, vec![(330, 410)]),
+            (moved, false, vec![]),
+            (LiveBounds::Unknown, true, vec![]),
+        ] {
+            let mut element = Watch(FakeElement::new(live), Vec::new());
+            let events = std::cell::RefCell::new(Vec::new());
+            foreground_element_keys(&mut element, 0x10, 3, check_visible, transaction(&events))
+                .unwrap();
+            assert_eq!(element.1, expected, "{live:?} {check_visible}");
+            assert_eq!(events.into_inner(), vec!["activate", "keys"]);
         }
     }
 
@@ -296,17 +598,10 @@ mod tests {
         let mut element = FakeElement::new(LiveBounds::NotAvailable);
         let error = focus_for_foreground(&mut element, 0x10, 3).unwrap_err();
         assert!(element.clicked.is_empty(), "clicked {:?}", element.clicked);
-        assert!(error.is::<DeadElement>(), "{error}");
-        let result = error_result(error, || {
-            ToolResult::error("stale").with_structured(serde_json::json!({
-                "status": "refused",
-                "refusal": { "code": "stale_element_token" },
-            }))
-        });
-        assert_eq!(
-            result.structured_content.unwrap()["refusal"]["code"],
-            "stale_element_token"
-        );
+        let failed = error
+            .downcast_ref::<FailedAfterActivation>()
+            .expect("{error}");
+        assert_eq!(failed.code, FOREGROUND_ELEMENT_LOST);
     }
 
     /// SetFocus fails and the element moved since the read: the fallback
@@ -363,12 +658,13 @@ mod tests {
         let mut element = Offscreen(FakeElement::new(LiveBounds::Rect(CACHED_RECT)));
         let error = focus_for_foreground(&mut element, 0x10, 3).unwrap_err();
         assert!(element.0.clicked.is_empty());
-        assert_eq!(error.to_string(), "not visible");
+        assert!(error.to_string().contains("not visible"), "{error}");
+        // After activation, so an honest failure, not the refusal envelope.
         let result = error_result(error, || unreachable!("not a dead element"));
-        assert_eq!(
-            result.structured_content.unwrap()["code"],
-            "element_not_visible"
-        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], FOREGROUND_UNAVAILABLE);
+        assert_eq!(structured["activated"], true);
+        assert!(structured.get("status").is_none());
     }
 
     /// A foreground click goes into the live rectangle; a control that is
@@ -392,6 +688,19 @@ mod tests {
     struct FakeTap {
         live: LiveBounds,
         sent: Vec<(i32, i32)>,
+        send_fails: bool,
+        restored: usize,
+    }
+
+    impl FakeTap {
+        fn new(live: LiveBounds) -> Self {
+            Self {
+                live,
+                sent: Vec::new(),
+                send_fails: false,
+                restored: 0,
+            }
+        }
     }
 
     impl TapTarget for FakeTap {
@@ -403,7 +712,13 @@ mod tests {
         }
         fn send(&mut self, point: (i32, i32)) -> anyhow::Result<()> {
             self.sent.push(point);
+            if self.send_fails {
+                anyhow::bail!("foreground_unavailable: activation failed part-way");
+            }
             Ok(())
+        }
+        fn restore_foreground(&mut self) {
+            self.restored += 1;
         }
     }
 
@@ -416,13 +731,11 @@ mod tests {
             LiveBounds::Unknown,
             LiveBounds::Rect((5, 5, 5, 9)),
         ] {
-            let mut tap = FakeTap {
-                live,
-                sent: Vec::new(),
-            };
+            let mut tap = FakeTap::new(live);
             let error = foreground_tap(&mut tap, live_center).unwrap_err();
             assert!(tap.sent.is_empty(), "{live:?}: sent {:?}", tap.sent);
             assert!(error.is::<DeadElement>(), "{live:?}: {error}");
+            assert_eq!(tap.restored, 0, "{live:?}: restore started for a refusal");
         }
     }
 
@@ -430,21 +743,137 @@ mod tests {
     /// to the centre of its live rectangle, not the cached centre.
     #[test]
     fn a_foreground_click_on_a_moved_element_taps_the_live_centre() {
-        let mut tap = FakeTap {
-            live: LiveBounds::Rect((300, 400, 360, 420)),
-            sent: Vec::new(),
-        };
+        let mut tap = FakeTap::new(LiveBounds::Rect((300, 400, 360, 420)));
         let point = foreground_tap(&mut tap, live_center).unwrap();
         assert_eq!(tap.sent, vec![(330, 410)]);
         assert_eq!(point, (330, 410));
         assert_ne!(point, rect_center(CACHED_RECT).unwrap());
         // The MSAA dropdown half is picked inside the live rectangle too.
-        let mut tap = FakeTap {
-            live: LiveBounds::Rect((300, 400, 360, 420)),
-            sent: Vec::new(),
-        };
+        let mut tap = FakeTap::new(LiveBounds::Rect((300, 400, 360, 420)));
         foreground_tap(&mut tap, dropdown_half).unwrap();
         assert_eq!(tap.sent, vec![(356, 410)]);
+    }
+
+    /// The restore of the earlier foreground window starts once dispatch was
+    /// attempted, including a send that failed part-way, and never for a
+    /// step refused before dispatch (dead, unreadable, or off-screen).
+    #[test]
+    fn the_foreground_restore_starts_only_after_dispatch() {
+        let mut tap = FakeTap::new(LiveBounds::Rect(CACHED_RECT));
+        foreground_tap(&mut tap, live_center).unwrap();
+        assert_eq!(tap.restored, 1);
+        let mut tap = FakeTap::new(LiveBounds::Rect(CACHED_RECT));
+        tap.send_fails = true;
+        foreground_tap(&mut tap, live_center).unwrap_err();
+        assert_eq!(
+            tap.restored, 1,
+            "a part-way failure still needs the restore"
+        );
+        struct Offscreen(FakeTap);
+        impl TapTarget for Offscreen {
+            fn live_bounds(&mut self) -> LiveBounds {
+                self.0.live_bounds()
+            }
+            fn onscreen_point(&mut self, _point: (i32, i32)) -> Result<(i32, i32), ToolResult> {
+                Err(ToolResult::error("not visible"))
+            }
+            fn send(&mut self, point: (i32, i32)) -> anyhow::Result<()> {
+                self.0.send(point)
+            }
+            fn restore_foreground(&mut self) {
+                self.0.restore_foreground()
+            }
+        }
+        let mut tap = Offscreen(FakeTap::new(LiveBounds::Rect(CACHED_RECT)));
+        foreground_tap(&mut tap, live_center).unwrap_err();
+        assert_eq!((tap.0.restored, tap.0.sent.len()), (0, 0));
+    }
+
+    /// Foreground double/right-click by element: the cached point is not
+    /// checked, so a control that moved with its window is not refused for
+    /// its old position and a dead one reaches the live (stale) check.
+    /// Background keeps the cached check.
+    #[test]
+    fn only_background_runs_the_cached_point_preflight() {
+        let refuse = |_: (i32, i32)| -> Result<(i32, i32), ToolResult> {
+            Err(ToolResult::error("element_not_visible"))
+        };
+        assert_eq!(
+            cached_point_preflight(true, (150, 120), refuse).unwrap(),
+            (150, 120)
+        );
+        assert!(cached_point_preflight(false, (150, 120), refuse).is_err());
+        // Composed with the tap: a moved element gets the live centre; a dead
+        // one is stale even though its cached point would have been refused.
+        let cached = cached_point_preflight(true, (150, 120), refuse).unwrap();
+        let mut tap = FakeTap::new(LiveBounds::Rect((300, 400, 360, 420)));
+        assert_eq!(foreground_tap(&mut tap, live_center).unwrap(), (330, 410));
+        assert_ne!(cached, (330, 410));
+        let mut tap = FakeTap::new(LiveBounds::NotAvailable);
+        assert!(foreground_tap(&mut tap, live_center)
+            .unwrap_err()
+            .is::<DeadElement>());
+    }
+
+    /// Records a foreground element scroll.
+    struct FakeScroll {
+        live: LiveBounds,
+        semantic_ok: bool,
+        events: Vec<String>,
+    }
+
+    impl ScrollTarget for FakeScroll {
+        fn live_bounds(&mut self) -> LiveBounds {
+            self.events.push("live".into());
+            self.live
+        }
+        fn semantic_scroll(&mut self) -> bool {
+            self.events.push("semantic".into());
+            self.semantic_ok
+        }
+        fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult> {
+            self.events.push("onscreen".into());
+            Ok(point)
+        }
+        fn wheel(&mut self, point: (i32, i32)) -> anyhow::Result<()> {
+            self.events.push(format!("wheel {},{}", point.0, point.1));
+            Ok(())
+        }
+    }
+
+    /// A dead element is refused before its own scroll; a live one whose own
+    /// scroll fails gets the wheel at its live centre, never the window
+    /// centre; one that can't be located live gets no wheel.
+    #[test]
+    fn a_foreground_element_scroll_wheels_only_at_the_live_element() {
+        let scroll = |live, semantic_ok, pixel| {
+            let mut target = FakeScroll {
+                live,
+                semantic_ok,
+                events: Vec::new(),
+            };
+            let outcome = foreground_element_scroll(&mut target, pixel);
+            (outcome, target.events)
+        };
+        let (outcome, events) = scroll(LiveBounds::NotAvailable, true, None);
+        assert!(outcome.unwrap_err().is::<DeadElement>());
+        assert_eq!(events, vec!["live"]);
+        let moved = LiveBounds::Rect((300, 400, 360, 420));
+        let (outcome, events) = scroll(moved, false, None);
+        assert_eq!(outcome.unwrap(), ElementScroll::Wheel((330, 410)));
+        assert_eq!(
+            events,
+            vec!["live", "semantic", "live", "onscreen", "wheel 330,410"]
+        );
+        let (outcome, _) = scroll(moved, true, None);
+        assert_eq!(outcome.unwrap(), ElementScroll::Semantic);
+        for unlocatable in [LiveBounds::Unknown, LiveBounds::Rect((5, 5, 5, 9))] {
+            let (outcome, events) = scroll(unlocatable, false, None);
+            assert!(outcome.unwrap_err().is::<DeadElement>(), "{unlocatable:?}");
+            assert!(!events.iter().any(|e| e.starts_with("wheel")), "{events:?}");
+        }
+        let (outcome, _) = scroll(moved, false, Some((7, 8)));
+        assert_eq!(outcome.unwrap(), ElementScroll::Wheel((7, 8)));
     }
 
     /// A SetFocus that succeeds needs no click and no live read.
