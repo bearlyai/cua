@@ -123,6 +123,30 @@ fn dispatch_with_ax_oracle(
     Ok(matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after)))
 }
 
+/// The order of one press_key dispatch. A foreground request checks its
+/// element live first and refuses a control the app removed after the read
+/// before anything is written or sent; its only focus write is the one inside
+/// the guarded HID transaction in `deliver`, after activation. A background
+/// request focuses the element first, as it always has.
+fn press_key_sequence<R>(
+    foreground: bool,
+    element: Option<usize>,
+    liveness: impl FnOnce(usize) -> super::element_liveness::Liveness,
+    prefocus: impl FnOnce(usize),
+    deliver: impl FnOnce() -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    if let Some(element) = element {
+        if foreground {
+            if liveness(element) == super::element_liveness::Liveness::Dead {
+                return Err(super::element_liveness::DeadElement.into());
+            }
+        } else {
+            prefocus(element);
+        }
+    }
+    deliver()
+}
+
 fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
     matches!((&before.value, &after.value), (Some(before), Some(after)) if before != after)
         || matches!((before.selected, after.selected), (Some(before), Some(after)) if before != after)
@@ -411,16 +435,6 @@ impl Tool for PressKeyTool {
             prior_front,
             "press_key.CGEvent",
             || async move {
-                // Pre-focus the element under suppression so its
-                // side-effects are captured by the snapshot + lease.
-                if let Some(guard) = pre_focus_guard.clone() {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::input::ax_actions::focus_element(guard.as_ptr())
-                    })
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                }
-
                 tokio::task::spawn_blocking(move || {
                     let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
@@ -430,45 +444,53 @@ impl Tool for PressKeyTool {
                     // silently discard them even while frontmost; the guarded HID route
                     // is accepted by both. Skipped when px-focus already handled the
                     // target-specific foreground transition.
-                    if fg && !px_focus {
-                        let wid = window_id.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "delivery_mode=foreground requires window_id for press_key"
-                            )
-                        })?;
-                        return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                            // A key addressed to a control the app has since
-                            // removed is refused before the window is fronted.
-                            super::element_liveness::require_live(
-                                || match pre_focus_ptr {
-                                    Some(ptr) => super::element_liveness::read_liveness(ptr),
-                                    None => super::element_liveness::Liveness::Alive,
-                                },
-                                || {
-                                    crate::input::skylight::with_foreground_hid_activation(
-                                        pid as libc::pid_t,
-                                        wid,
-                                        || {
-                                            // Activation can change the first responder, so
-                                            // repeat the best-effort AX focus write inside
-                                            // the guarded foreground interval immediately
-                                            // before the physical key transition.
-                                            if let Some(element_ptr) = pre_focus_ptr {
-                                                let _ = crate::input::ax_actions::focus_element(
-                                                    element_ptr,
-                                                );
-                                            }
-                                            crate::input::keyboard::press_key_bare_global(&key, &m)
-                                        },
-                                    )
-                                },
-                            )
-                        });
-                    }
-                    // background (default): auth-envelope post, no raise.
-                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        crate::input::keyboard::press_key(pid, &key, &m)
-                    })
+                    let foreground = fg && !px_focus;
+                    press_key_sequence(
+                        foreground,
+                        pre_focus_ptr,
+                        super::element_liveness::read_liveness,
+                        // Pre-focus the element under suppression so its
+                        // side-effects are captured by the snapshot + lease.
+                        |ptr| {
+                            let _ = crate::input::ax_actions::focus_element(ptr);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                        },
+                        || {
+                            if !foreground {
+                                // background (default): auth-envelope post, no raise.
+                                return dispatch_with_ax_oracle(
+                                    pid,
+                                    window_id,
+                                    pre_focus_ptr,
+                                    || crate::input::keyboard::press_key(pid, &key, &m),
+                                );
+                            }
+                            let wid = window_id.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "delivery_mode=foreground requires window_id for press_key"
+                                )
+                            })?;
+                            dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
+                                crate::input::skylight::with_foreground_hid_activation(
+                                    pid as libc::pid_t,
+                                    wid,
+                                    || {
+                                        // Activation can change the first responder, so
+                                        // write the AX focus inside the guarded foreground
+                                        // interval immediately before the physical key
+                                        // transition. This is the only focus write a
+                                        // foreground request makes.
+                                        if let Some(element_ptr) = pre_focus_ptr {
+                                            let _ = crate::input::ax_actions::focus_element(
+                                                element_ptr,
+                                            );
+                                        }
+                                        crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    },
+                                )
+                            })
+                        },
+                    )
                 })
                 .await
             },
@@ -518,6 +540,49 @@ impl Tool for PressKeyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sequence_events(
+        foreground: bool,
+        liveness: super::super::element_liveness::Liveness,
+    ) -> (Vec<&'static str>, anyhow::Result<()>) {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = press_key_sequence(
+            foreground,
+            Some(0x1234),
+            |_| {
+                events.borrow_mut().push("liveness");
+                liveness
+            },
+            |_| events.borrow_mut().push("prefocus"),
+            || {
+                events.borrow_mut().push("deliver");
+                Ok(())
+            },
+        );
+        (events.into_inner(), result)
+    }
+
+    /// Foreground: the liveness check comes first and no focus is written
+    /// before the guarded transaction; a dead control stops everything.
+    #[test]
+    fn a_foreground_key_writes_no_focus_before_its_liveness_check() {
+        use super::super::element_liveness::{is_dead_element, Liveness};
+        let (events, result) = sequence_events(true, Liveness::Alive);
+        assert_eq!(events, vec!["liveness", "deliver"]);
+        assert!(result.is_ok());
+        let (events, result) = sequence_events(true, Liveness::Dead);
+        assert_eq!(events, vec!["liveness"]);
+        assert!(is_dead_element(&result.unwrap_err()));
+    }
+
+    /// Background keeps its focus-first order and is not probed.
+    #[test]
+    fn a_background_key_still_focuses_first() {
+        use super::super::element_liveness::Liveness;
+        let (events, result) = sequence_events(false, Liveness::Dead);
+        assert_eq!(events, vec!["prefocus", "deliver"]);
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn delivery_outcome_mapper_distinguishes_confirmed_unverifiable_and_failed() {
