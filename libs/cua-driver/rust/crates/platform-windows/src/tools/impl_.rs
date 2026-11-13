@@ -4633,19 +4633,30 @@ impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
             .unwrap_or(super::foreground_focus::LiveBounds::Unknown)
     }
 
-    fn semantic_scroll(&mut self) -> super::foreground_focus::SemanticScroll {
+    fn semantic_scroll(
+        &mut self,
+    ) -> (
+        super::foreground_focus::SemanticScroll,
+        super::foreground_focus::ForegroundIsolation,
+    ) {
         let Some(retained) = self.admitted.as_ref().filter(|retained| retained.is_uia()) else {
-            return super::foreground_focus::SemanticScroll::NotDispatched;
+            return (
+                super::foreground_focus::SemanticScroll::NotDispatched,
+                super::foreground_focus::ForegroundIsolation::Kept,
+            );
         };
-        let steps = without_scroll_activation(self.hwnd, || unsafe {
+        let (steps, isolation) = without_scroll_activation(self.hwnd, || unsafe {
             crate::uia::scroll::scroll_element_steps(
                 retained.as_ptr(),
                 &self.direction,
                 self.amount,
             )
         });
-        super::foreground_focus::semantic_scroll_from(
-            steps.map_err(|stopped| (stopped.stop, stopped.error.to_string())),
+        (
+            super::foreground_focus::semantic_scroll_from(
+                steps.map_err(|stopped| (stopped.stop, stopped.error.to_string())),
+            ),
+            isolation,
         )
     }
 
@@ -4667,35 +4678,82 @@ impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
 
 /// Run a foreground element's own UIA scroll without letting it bring the
 /// window forward: a provider can activate its window from inside
-/// `ScrollPattern::Scroll`. The same protection as the background element
-/// scroll: `WS_EX_NOACTIVATE` on the target's root through the call and 50 ms
-/// after it, then, when the foreground moved into the target's root, the
-/// earlier window is put back. Applies to every outcome of the call. Runs on a
-/// blocking thread.
-fn without_scroll_activation<T>(hwnd: u64, scroll: impl FnOnce() -> T) -> T {
+/// `ScrollPattern::Scroll`. `WS_EX_NOACTIVATE` is set on the target's root
+/// through the call and 50 ms after it; it does not stop a provider that
+/// activates its window in code. Then, if the target's root came to the front,
+/// the earlier window is put back by
+/// [`super::foreground_focus::restore_after_element_scroll`]: at most twice,
+/// only while the target is still in front, and never when the earlier window
+/// is gone. Applies to every outcome of the call, and returns whether the
+/// target was left in front. Runs on a blocking thread.
+fn without_scroll_activation<T>(
+    hwnd: u64,
+    scroll: impl FnOnce() -> T,
+) -> (T, super::foreground_focus::ForegroundIsolation) {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetForegroundWindow, GetWindowThreadProcessId, GA_ROOT,
+    };
     let target = HWND(hwnd as *mut _);
     let previous = unsafe { GetForegroundWindow() };
+    let mut previous_pid = 0u32;
+    let previous_tid = if previous.0.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(previous, Some(&mut previous_pid)) }
+    };
+    let previous_root =
+        (!previous.0.is_null()).then(|| unsafe { GetAncestor(previous, GA_ROOT) }.0 as u64);
+    let target_root = unsafe { GetAncestor(target, GA_ROOT) }.0 as u64;
     let _noact = crate::input::NoActivateGuard::arm(target);
     let result = scroll();
     // Keep WS_EX_NOACTIVATE armed through any handler queued by the call.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let current = unsafe { GetForegroundWindow() };
-    let current_root = unsafe { GetAncestor(current, GA_ROOT) };
-    let target_root = unsafe { GetAncestor(target, GA_ROOT) };
-    if !previous.0.is_null()
-        && current != previous
-        && !target_root.0.is_null()
-        && current_root == target_root
-    {
-        unsafe {
-            crate::input::force_foreground_attached(previous);
-            std::thread::sleep(std::time::Duration::from_millis(12));
-            crate::input::force_foreground_attached(previous);
+    let mut os = WindowsForegroundRestore {
+        previous,
+        previous_pid,
+        previous_tid,
+    };
+    let isolation =
+        super::foreground_focus::restore_after_element_scroll(&mut os, previous_root, target_root);
+    (result, isolation)
+}
+
+/// The Windows calls behind
+/// [`super::foreground_focus::restore_after_element_scroll`].
+struct WindowsForegroundRestore {
+    previous: windows::Win32::Foundation::HWND,
+    previous_pid: u32,
+    previous_tid: u32,
+}
+
+impl super::foreground_focus::ForegroundRestore for WindowsForegroundRestore {
+    fn foreground_root(&mut self) -> u64 {
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+        let current = unsafe { GetForegroundWindow() };
+        if current.0.is_null() {
+            return 0;
         }
+        unsafe { GetAncestor(current, GA_ROOT) }.0 as u64
     }
-    result
+
+    fn previous_is_same_window(&mut self) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
+        if self.previous.0.is_null() || !unsafe { IsWindow(self.previous) }.as_bool() {
+            return false;
+        }
+        let mut pid = 0u32;
+        let tid = unsafe { GetWindowThreadProcessId(self.previous, Some(&mut pid)) };
+        tid != 0 && tid == self.previous_tid && pid == self.previous_pid
+    }
+
+    fn restore_previous(&mut self) -> bool {
+        unsafe { crate::input::force_foreground_attached(self.previous) }
+    }
+
+    fn pause(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 /// Run one [`ElementTap`] on a blocking thread (UIA reads, then SendInput).
@@ -6529,15 +6587,8 @@ impl Tool for ScrollTool {
             })
             .await;
             return match result {
-                Ok(Ok(super::foreground_focus::ElementScroll::Semantic)) => {
-                    ToolResult::text(format!(
-                        "Scrolled {direction} {amount} ticks via UIA (delivery_mode:background)."
-                    ))
-                    .with_structured(serde_json::json!({
-                        "path": "uia",
-                        "verified": false,
-                        "delivery_mode": "background"
-                    }))
+                Ok(Ok(super::foreground_focus::ElementScroll::Semantic(isolation))) => {
+                    super::foreground_focus::semantic_scroll_reply(&direction, amount, isolation)
                 }
                 Ok(Ok(super::foreground_focus::ElementScroll::Wheel((cx, cy)))) => {
                     ToolResult::text(format!(

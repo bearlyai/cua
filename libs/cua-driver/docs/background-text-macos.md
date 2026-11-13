@@ -378,10 +378,33 @@ Which foreground routes check, before they act:
   exempt the element from being located live first. The wheel doesn't bring
   the window forward, so a window on top of the element can still take it.
 - The element's own UIA scroll is one `ScrollPattern::Scroll` call per step.
-  It does not bring the window forward: the window's root is marked
-  no-activate during the calls and for 50 ms after them, and if the control
-  takes the foreground anyway, the window that was in front before is put
-  back. Its success reply says `delivery_mode: background`.
+  The window's root is marked no-activate (`WS_EX_NOACTIVATE`) during the
+  calls and for 50 ms after them. That doesn't stop a provider that
+  activates its window in code, so afterwards the foreground is checked. If
+  the target's root is in front and was not before the call, the window
+  that was in front before is put back, at most twice (12 ms apart), and
+  only while the target is still in front: the foreground is read again
+  before each attempt, so a window the person or another app brought
+  forward in the meantime is never covered. A window that was in front
+  before but has since closed, or whose handle now belongs to another
+  process or thread, is not activated.
+- When the target is not left in front, the success reply is unchanged:
+  `Scrolled {direction} {amount} ticks via UIA (delivery_mode:background).`
+  with `{"path": "uia", "verified": false, "delivery_mode": "background"}`.
+  When the earlier window could not be put back and the target is still in
+  front, the scroll is still a success, and the reply says so:
+  `Scrolled {direction} {amount} ticks via UIA; the window came to the front and the earlier window could not be put back (delivery_mode:foreground).`
+  with `{"path": "uia", "verified": false, "delivery_mode": "foreground", "activated": true, "foreground_restored": false}`.
+  `scroll_incomplete` and `scroll_uncertain` (below) carry the same
+  `delivery_mode`, and in that case `activated: true`,
+  `foreground_restored: false` and the same clause in their text.
+- The background element scroll (`delivery_mode: background` with an
+  element) is unchanged by this: after a successful scroll it still
+  restores the earlier window twice without reading the foreground again
+  between attempts and without reporting whether that worked; on an error
+  it discards the count of `Scroll` calls that went through, and can fall
+  back to the `WM_VSCROLL`/`WM_HSCROLL` message route after a part-way
+  scroll.
 - Before the first call, the pattern's horizontal and vertical scroll
   percent is read, each axis on its own. An axis whose getter fails or
   returns NaN or infinity is unreadable. If the requested axis reads `-1`
@@ -446,6 +469,7 @@ returns:
   "isError": true,
   "structuredContent": {
     "code": "scroll_incomplete", "effect": "partial", "path": "uia",
+    "delivery_mode": "background",
     "delivery": {"delivered_count": 1},
     "completed_steps": 1, "amount": 3, "wheel_sent": false,
     "window_id": 0, "element_index": 0, "retryable": false,
@@ -480,7 +504,10 @@ whether it moved, returns:
 ```
 
 It has no `delivery` count and no `completed_steps`: whether anything moved
-is unknown. Its effect is `unverifiable`, and it is never `status: "refused"`. The post-activation keyboard failures above stay
+is unknown. When the target was left in front, both replies say
+`"delivery_mode": "foreground", "activated": true, "foreground_restored": false`,
+and their text adds `; the window came to the front and the earlier window could not be put back`
+after `no wheel was sent`. Its effect is `unverifiable`, and it is never `status: "refused"`. The post-activation keyboard failures above stay
 `effect: "failed"`, because none of the requested keys or text was sent.
 
 Exceptions that never take the foreground and so have no foreground check:

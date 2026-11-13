@@ -343,6 +343,136 @@ pub(crate) fn run_scroll_steps(
     Ok(())
 }
 
+/// Whether a foreground element's own UIA scroll left the earlier window in
+/// front, as its reply's `delivery_mode` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForegroundIsolation {
+    /// The target's window is not in front because of the call (or it was
+    /// already in front before it): `delivery_mode: "background"`.
+    Kept,
+    /// The target's window came to the front during the call and the earlier
+    /// window could not be put back: `delivery_mode: "foreground"`, with
+    /// `activated: true` and `foreground_restored: false`.
+    LeftInFront,
+}
+
+impl ForegroundIsolation {
+    fn delivery_mode(self) -> &'static str {
+        match self {
+            ForegroundIsolation::Kept => "background",
+            ForegroundIsolation::LeftInFront => "foreground",
+        }
+    }
+
+    /// The clause a failure reply's text adds when the window was left in
+    /// front.
+    fn clause(self) -> &'static str {
+        match self {
+            ForegroundIsolation::Kept => "",
+            ForegroundIsolation::LeftInFront => {
+                "; the window came to the front and the earlier window could not be put back"
+            }
+        }
+    }
+
+    /// Add `delivery_mode` and, when left in front, `activated` and
+    /// `foreground_restored` to a reply's structured content.
+    fn annotate(self, structured: &mut serde_json::Value) {
+        structured["delivery_mode"] = self.delivery_mode().into();
+        if self == ForegroundIsolation::LeftInFront {
+            structured["activated"] = true.into();
+            structured["foreground_restored"] = false.into();
+        }
+    }
+}
+
+/// The Windows calls that put the earlier foreground window back after an
+/// element's own UIA scroll, supplied by `impl_`.
+pub(crate) trait ForegroundRestore {
+    /// The root of the window in front now (0 when there is none).
+    fn foreground_root(&mut self) -> u64;
+    /// Whether the window that was in front before the call is still the same
+    /// live window: still a window, owned by the same process and thread ids
+    /// read before the call.
+    fn previous_is_same_window(&mut self) -> bool;
+    /// Bring that window back to the front; `true` when it is then in front.
+    fn restore_previous(&mut self) -> bool;
+    /// Wait between a failed first restore and the second.
+    fn pause(&mut self, duration: Duration);
+}
+
+/// The wait between a failed first restore and the second.
+pub(crate) const RESTORE_RETRY_PAUSE: Duration = Duration::from_millis(12);
+
+/// After an element's own UIA scroll: put the earlier window back, at most
+/// twice and only while the target's root is still in front, then say whether
+/// the target was left in front.
+///
+/// `previous_root` is the root of the window in front before the call (`None`
+/// when there was none); `target_root` the target's root. When the target
+/// was already in front, nothing is done. Before each attempt the foreground
+/// is read again: anything other than the target in front (the person or
+/// another app brought a window forward) stops with nothing activated. An
+/// earlier window that is gone or was reused is never activated. The final
+/// read decides: the target still in front is [`ForegroundIsolation::LeftInFront`].
+pub(crate) fn restore_after_element_scroll(
+    os: &mut impl ForegroundRestore,
+    previous_root: Option<u64>,
+    target_root: u64,
+) -> ForegroundIsolation {
+    if target_root == 0 || previous_root == Some(target_root) {
+        return ForegroundIsolation::Kept;
+    }
+    if previous_root.is_some() {
+        for attempt in 0..2 {
+            if attempt > 0 {
+                os.pause(RESTORE_RETRY_PAUSE);
+            }
+            if os.foreground_root() != target_root {
+                return ForegroundIsolation::Kept;
+            }
+            if !os.previous_is_same_window() || os.restore_previous() {
+                break;
+            }
+        }
+    }
+    if os.foreground_root() == target_root {
+        ForegroundIsolation::LeftInFront
+    } else {
+        ForegroundIsolation::Kept
+    }
+}
+
+/// The success reply of a foreground element scroll done by the element's
+/// own UIA scroll.
+pub(crate) fn semantic_scroll_reply(
+    direction: &str,
+    amount: u32,
+    isolation: ForegroundIsolation,
+) -> ToolResult {
+    match isolation {
+        ForegroundIsolation::Kept => ToolResult::text(format!(
+            "Scrolled {direction} {amount} ticks via UIA (delivery_mode:background)."
+        ))
+        .with_structured(serde_json::json!({
+            "path": "uia",
+            "verified": false,
+            "delivery_mode": "background"
+        })),
+        ForegroundIsolation::LeftInFront => ToolResult::text(format!(
+            "Scrolled {direction} {amount} ticks via UIA; the window came to the front and the \
+             earlier window could not be put back (delivery_mode:foreground)."
+        ))
+        .with_structured(serde_json::json!({
+            "path": "uia",
+            "verified": false,
+            "delivery_mode": "foreground",
+            "activated": true,
+            "foreground_restored": false
+        })),
+    }
+}
+
 /// The element's own scroll stopped part-way: some steps count as applied
 /// (see [`SemanticScroll::Partial`]), so this is neither the no-effects stale
 /// refusal nor a reason to send the wheel on top of them. Its effect is `partial`, with the
@@ -354,6 +484,7 @@ pub(crate) struct ScrollIncomplete {
     pub completed: u32,
     pub amount: u32,
     pub error: String,
+    pub isolation: ForegroundIsolation,
 }
 
 /// The code of a [`ScrollIncomplete`].
@@ -364,9 +495,14 @@ impl std::fmt::Display for ScrollIncomplete {
         write!(
             f,
             "{SCROLL_INCOMPLETE}: UIA element [{}] in HWND 0x{:x} scrolled {} of {} step(s), \
-             then its UIA scroll failed ({}); no wheel was sent. Read the window again \
+             then its UIA scroll failed ({}); no wheel was sent{}. Read the window again \
              before acting.",
-            self.element_index, self.hwnd, self.completed, self.amount, self.error
+            self.element_index,
+            self.hwnd,
+            self.completed,
+            self.amount,
+            self.error,
+            self.isolation.clause()
         )
     }
 }
@@ -375,7 +511,7 @@ impl std::error::Error for ScrollIncomplete {}
 
 impl ScrollIncomplete {
     fn result(&self) -> ToolResult {
-        ToolResult::error(self.to_string()).with_structured(serde_json::json!({
+        let mut structured = serde_json::json!({
             "code": SCROLL_INCOMPLETE,
             "effect": "partial",
             "path": "uia",
@@ -390,7 +526,9 @@ impl ScrollIncomplete {
                 "recommended": "verify_state",
                 "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more.",
             },
-        }))
+        });
+        self.isolation.annotate(&mut structured);
+        ToolResult::error(self.to_string()).with_structured(structured)
     }
 }
 
@@ -403,6 +541,7 @@ pub(crate) struct ScrollUncertain {
     pub element_index: usize,
     pub amount: u32,
     pub error: String,
+    pub isolation: ForegroundIsolation,
 }
 
 /// The code of a [`ScrollUncertain`].
@@ -414,8 +553,11 @@ impl std::fmt::Display for ScrollUncertain {
             f,
             "{SCROLL_UNCERTAIN}: UIA element [{}] in HWND 0x{:x} returned an error from its \
              first UIA scroll call ({}) and its position does not show whether it moved; no \
-             wheel was sent. Read the window again before acting.",
-            self.element_index, self.hwnd, self.error
+             wheel was sent{}. Read the window again before acting.",
+            self.element_index,
+            self.hwnd,
+            self.error,
+            self.isolation.clause()
         )
     }
 }
@@ -424,7 +566,7 @@ impl std::error::Error for ScrollUncertain {}
 
 impl ScrollUncertain {
     fn result(&self) -> ToolResult {
-        ToolResult::error(self.to_string()).with_structured(serde_json::json!({
+        let mut structured = serde_json::json!({
             "code": SCROLL_UNCERTAIN,
             "effect": "unverifiable",
             "path": "uia",
@@ -438,7 +580,9 @@ impl ScrollUncertain {
                 "recommended": "verify_state",
                 "reason": "The element's UIA scroll returned an error and its position does not show whether it moved; no wheel was sent. Read the window again before scrolling more.",
             },
-        }))
+        });
+        self.isolation.annotate(&mut structured);
+        ToolResult::error(self.to_string()).with_structured(structured)
     }
 }
 
@@ -446,8 +590,9 @@ impl ScrollUncertain {
 pub(crate) trait ScrollTarget {
     /// Read the element's rectangle live.
     fn live_bounds(&mut self) -> LiveBounds;
-    /// The element's own UIA scroll.
-    fn semantic_scroll(&mut self) -> SemanticScroll;
+    /// The element's own UIA scroll, and whether it left the earlier window
+    /// in front.
+    fn semantic_scroll(&mut self) -> (SemanticScroll, ForegroundIsolation);
     /// The on-screen check (and scroll into view) for the wheel point.
     fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult>;
     /// Send the wheel at a screen point.
@@ -457,8 +602,9 @@ pub(crate) trait ScrollTarget {
 /// How a foreground element scroll was delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ElementScroll {
-    /// The element's own UIA scroll.
-    Semantic,
+    /// The element's own UIA scroll, and whether it left the earlier window
+    /// in front.
+    Semantic(ForegroundIsolation),
     /// The wheel, at this screen point.
     Wheel((i32, i32)),
 }
@@ -481,8 +627,9 @@ pub(crate) fn foreground_element_scroll(
     amount: u32,
 ) -> anyhow::Result<ElementScroll> {
     require_live(target.live_bounds())?;
-    match target.semantic_scroll() {
-        SemanticScroll::Done => return Ok(ElementScroll::Semantic),
+    let (semantic, isolation) = target.semantic_scroll();
+    match semantic {
+        SemanticScroll::Done => return Ok(ElementScroll::Semantic(isolation)),
         SemanticScroll::Partial { completed, error } => {
             return Err(ScrollIncomplete {
                 hwnd,
@@ -490,6 +637,7 @@ pub(crate) fn foreground_element_scroll(
                 completed,
                 amount,
                 error,
+                isolation,
             }
             .into())
         }
@@ -499,6 +647,7 @@ pub(crate) fn foreground_element_scroll(
                 element_index,
                 amount,
                 error,
+                isolation,
             }
             .into())
         }
@@ -1176,6 +1325,8 @@ mod tests {
         live_later: Option<LiveBounds>,
         live_reads: usize,
         semantic: SemanticScroll,
+        /// What the element's own scroll did to the foreground.
+        isolation: ForegroundIsolation,
         /// `Scroll` steps the element's own scroll applied.
         scrolled_steps: u32,
         events: Vec<String>,
@@ -1188,6 +1339,7 @@ mod tests {
                 live_later: None,
                 live_reads: 0,
                 semantic,
+                isolation: ForegroundIsolation::Kept,
                 scrolled_steps: 0,
                 events: Vec::new(),
             }
@@ -1210,14 +1362,14 @@ mod tests {
                 _ => self.live,
             }
         }
-        fn semantic_scroll(&mut self) -> SemanticScroll {
+        fn semantic_scroll(&mut self) -> (SemanticScroll, ForegroundIsolation) {
             self.events.push("semantic".into());
             self.scrolled_steps += match &self.semantic {
                 SemanticScroll::Done => 3,
                 SemanticScroll::NotDispatched | SemanticScroll::Uncertain { .. } => 0,
                 SemanticScroll::Partial { completed, .. } => *completed,
             };
-            self.semantic.clone()
+            (self.semantic.clone(), self.isolation)
         }
         fn onscreen_point(&mut self, point: (i32, i32)) -> Result<(i32, i32), ToolResult> {
             self.events.push("onscreen".into());
@@ -1253,7 +1405,10 @@ mod tests {
             vec!["live", "semantic", "live", "onscreen", "wheel 330,410"]
         );
         let mut target = FakeScroll::new(moved, Done);
-        assert_eq!(scroll(&mut target, None).unwrap(), ElementScroll::Semantic);
+        assert_eq!(
+            scroll(&mut target, None).unwrap(),
+            ElementScroll::Semantic(ForegroundIsolation::Kept)
+        );
         assert_eq!(target.wheels(), 0);
         for unlocatable in [LiveBounds::Unknown, LiveBounds::Rect((5, 5, 5, 9))] {
             let mut target = FakeScroll::new(unlocatable, NotDispatched);
@@ -1613,6 +1768,280 @@ mod tests {
             }
         );
         assert_eq!(pattern.events, vec!["read", "scroll", "scroll", "scroll"]);
+    }
+
+    const PREVIOUS_ROOT: u64 = 0xA;
+    const TARGET_ROOT: u64 = 0xB;
+    const OTHER_ROOT: u64 = 0xC;
+
+    /// Scripted foreground calls: the roots `foreground_root` returns in
+    /// order (the last repeats), whether the earlier window is still the same
+    /// window, and each restore's result. Records every call.
+    struct FakeForeground {
+        roots: Vec<u64>,
+        same_window: bool,
+        restores: Vec<bool>,
+        events: Vec<&'static str>,
+    }
+
+    impl FakeForeground {
+        fn new(roots: Vec<u64>, restores: Vec<bool>) -> Self {
+            Self {
+                roots,
+                same_window: true,
+                restores,
+                events: Vec::new(),
+            }
+        }
+
+        fn count(&self, event: &str) -> usize {
+            self.events.iter().filter(|e| **e == event).count()
+        }
+    }
+
+    impl ForegroundRestore for FakeForeground {
+        fn foreground_root(&mut self) -> u64 {
+            self.events.push("fg");
+            if self.roots.len() > 1 {
+                self.roots.remove(0)
+            } else {
+                self.roots[0]
+            }
+        }
+        fn previous_is_same_window(&mut self) -> bool {
+            self.events.push("same");
+            self.same_window
+        }
+        fn restore_previous(&mut self) -> bool {
+            self.events.push("restore");
+            self.restores.remove(0)
+        }
+        fn pause(&mut self, duration: Duration) {
+            assert_eq!(duration, RESTORE_RETRY_PAUSE);
+            self.events.push("pause");
+        }
+    }
+
+    fn restore(os: &mut FakeForeground) -> ForegroundIsolation {
+        restore_after_element_scroll(os, Some(PREVIOUS_ROOT), TARGET_ROOT)
+    }
+
+    /// The target never came to the front: nothing is restored.
+    #[test]
+    fn a_target_never_in_front_gets_no_restore() {
+        let mut os = FakeForeground::new(vec![PREVIOUS_ROOT], vec![]);
+        assert_eq!(restore(&mut os), ForegroundIsolation::Kept);
+        assert_eq!(os.events, vec!["fg"]);
+    }
+
+    /// The target came to the front and the first restore worked: exactly one
+    /// restore, and isolation is kept.
+    #[test]
+    fn a_successful_restore_is_not_repeated() {
+        let mut os = FakeForeground::new(vec![TARGET_ROOT, PREVIOUS_ROOT], vec![true]);
+        assert_eq!(restore(&mut os), ForegroundIsolation::Kept);
+        assert_eq!(os.events, vec!["fg", "same", "restore", "fg"]);
+    }
+
+    /// The first restore failed and the target is still in front: one retry,
+    /// after the pause.
+    #[test]
+    fn a_failed_restore_is_retried_once_while_the_target_is_in_front() {
+        let mut os = FakeForeground::new(
+            vec![TARGET_ROOT, TARGET_ROOT, PREVIOUS_ROOT],
+            vec![false, true],
+        );
+        assert_eq!(restore(&mut os), ForegroundIsolation::Kept);
+        assert_eq!(
+            os.events,
+            vec!["fg", "same", "restore", "pause", "fg", "same", "restore", "fg"]
+        );
+    }
+
+    /// The person brought a third window forward between the attempts: no
+    /// second restore over it, and isolation is kept.
+    #[test]
+    fn a_window_the_person_switched_to_is_never_restored_over() {
+        let mut os = FakeForeground::new(vec![TARGET_ROOT, OTHER_ROOT], vec![false]);
+        assert_eq!(restore(&mut os), ForegroundIsolation::Kept);
+        assert_eq!(os.count("restore"), 1);
+        assert_eq!(os.events, vec!["fg", "same", "restore", "pause", "fg"]);
+    }
+
+    /// Both restores failed: the target was left in front.
+    #[test]
+    fn two_failed_restores_leave_the_target_in_front() {
+        let mut os = FakeForeground::new(vec![TARGET_ROOT], vec![false, false]);
+        assert_eq!(restore(&mut os), ForegroundIsolation::LeftInFront);
+        assert_eq!(os.count("restore"), 2);
+        assert_eq!(os.count("pause"), 1);
+    }
+
+    /// The earlier window closed, or its handle now belongs to another
+    /// process or thread: nothing is activated, and the target was left in
+    /// front.
+    #[test]
+    fn a_gone_or_reused_earlier_window_is_never_activated() {
+        let mut os = FakeForeground::new(vec![TARGET_ROOT], vec![]);
+        os.same_window = false;
+        assert_eq!(restore(&mut os), ForegroundIsolation::LeftInFront);
+        assert_eq!(os.count("restore"), 0);
+        assert_eq!(os.events, vec!["fg", "same", "fg"]);
+    }
+
+    /// The target was already in front before the call: nothing to restore
+    /// and nothing read, and isolation is kept.
+    #[test]
+    fn a_target_already_in_front_before_the_call_gets_no_restore() {
+        let mut os = FakeForeground::new(vec![TARGET_ROOT], vec![]);
+        assert_eq!(
+            restore_after_element_scroll(&mut os, Some(TARGET_ROOT), TARGET_ROOT),
+            ForegroundIsolation::Kept
+        );
+        assert!(os.events.is_empty(), "{:?}", os.events);
+    }
+
+    /// No window was in front before the call: nothing to restore, and the
+    /// foreground after the call decides.
+    #[test]
+    fn with_no_earlier_window_the_end_state_decides() {
+        let mut os = FakeForeground::new(vec![TARGET_ROOT], vec![]);
+        assert_eq!(
+            restore_after_element_scroll(&mut os, None, TARGET_ROOT),
+            ForegroundIsolation::LeftInFront
+        );
+        assert_eq!(os.events, vec!["fg"]);
+        let mut os = FakeForeground::new(vec![OTHER_ROOT], vec![]);
+        assert_eq!(
+            restore_after_element_scroll(&mut os, None, TARGET_ROOT),
+            ForegroundIsolation::Kept
+        );
+    }
+
+    /// A scroll whose isolation was kept replies exactly as before.
+    #[test]
+    fn a_kept_semantic_scroll_reply_is_unchanged() {
+        let result = semantic_scroll_reply("down", 3, ForegroundIsolation::Kept);
+        assert_eq!(result.is_error, None);
+        assert_eq!(
+            format!("{:?}", result.content),
+            format!(
+                "{:?}",
+                ToolResult::text("Scrolled down 3 ticks via UIA (delivery_mode:background).")
+                    .content
+            )
+        );
+        assert_eq!(
+            result.structured_content.unwrap(),
+            serde_json::json!({"path": "uia", "verified": false, "delivery_mode": "background"})
+        );
+    }
+
+    /// A scroll that left the target in front is still a success, and says
+    /// so.
+    #[test]
+    fn a_semantic_scroll_left_in_front_says_foreground() {
+        let result = semantic_scroll_reply("down", 3, ForegroundIsolation::LeftInFront);
+        assert_eq!(result.is_error, None);
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains(
+                "Scrolled down 3 ticks via UIA; the window came to the front and the earlier \
+                 window could not be put back (delivery_mode:foreground)."
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            result.structured_content.unwrap(),
+            serde_json::json!({
+                "path": "uia", "verified": false, "delivery_mode": "foreground",
+                "activated": true, "foreground_restored": false
+            })
+        );
+        // The foreground element scroll carries the outcome to the reply.
+        let mut target = FakeScroll::new(LiveBounds::Rect(CACHED_RECT), SemanticScroll::Done);
+        target.isolation = ForegroundIsolation::LeftInFront;
+        assert_eq!(
+            scroll(&mut target, None).unwrap(),
+            ElementScroll::Semantic(ForegroundIsolation::LeftInFront)
+        );
+    }
+
+    /// `scroll_incomplete` and `scroll_uncertain` say which window was left in
+    /// front, and keep their counts.
+    #[test]
+    fn failed_scroll_replies_say_whether_the_target_was_left_in_front() {
+        let clause = "the window came to the front and the earlier window could not be put back";
+        for isolation in [ForegroundIsolation::Kept, ForegroundIsolation::LeftInFront] {
+            let left = isolation == ForegroundIsolation::LeftInFront;
+            for semantic in [
+                SemanticScroll::Partial {
+                    completed: 2,
+                    error: "UIA scroll failed: 0x80040201".into(),
+                },
+                SemanticScroll::Uncertain {
+                    error: "UIA scroll failed: 0x80040201".into(),
+                },
+            ] {
+                let mut target = FakeScroll::new(LiveBounds::Rect(CACHED_RECT), semantic.clone());
+                target.isolation = isolation;
+                let result = error_result(scroll(&mut target, None).unwrap_err(), || {
+                    panic!("mapped to the stale refusal")
+                });
+                assert_eq!(target.wheels(), 0);
+                let text = format!("{:?}", result.content);
+                assert_eq!(text.contains(clause), left, "{isolation:?}: {text}");
+                assert!(
+                    text.contains("Read the window again before acting."),
+                    "{text}"
+                );
+                let structured = result.structured_content.unwrap();
+                assert_eq!(
+                    structured["delivery_mode"],
+                    if left { "foreground" } else { "background" },
+                    "{structured}"
+                );
+                if left {
+                    assert_eq!(structured["activated"], true, "{structured}");
+                    assert_eq!(structured["foreground_restored"], false, "{structured}");
+                } else {
+                    assert!(structured.get("activated").is_none(), "{structured}");
+                    assert!(
+                        structured.get("foreground_restored").is_none(),
+                        "{structured}"
+                    );
+                }
+                assert_eq!(structured["retryable"], false);
+                match semantic {
+                    SemanticScroll::Partial { .. } => {
+                        assert_eq!(structured["code"], SCROLL_INCOMPLETE);
+                        assert_eq!(structured["completed_steps"], 2);
+                        assert_eq!(
+                            structured["delivery"],
+                            serde_json::json!({ "delivered_count": 2 })
+                        );
+                    }
+                    _ => {
+                        assert_eq!(structured["code"], SCROLL_UNCERTAIN);
+                        assert!(structured.get("delivery").is_none(), "{structured}");
+                        assert!(structured.get("completed_steps").is_none(), "{structured}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nothing sent: the isolation outcome is ignored and the wheel path
+    /// runs as before.
+    #[test]
+    fn a_scroll_that_sent_nothing_ignores_the_isolation_outcome() {
+        let mut target =
+            FakeScroll::new(LiveBounds::Rect(CACHED_RECT), SemanticScroll::NotDispatched);
+        target.isolation = ForegroundIsolation::LeftInFront;
+        assert_eq!(
+            scroll(&mut target, None).unwrap(),
+            ElementScroll::Wheel(rect_center(CACHED_RECT).unwrap())
+        );
     }
 
     /// A SetFocus that succeeds needs no click and no live read.
