@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory)][string]$Driver,
     [Parameter(Mandatory)][string]$Python,
     [Parameter(Mandatory)][string]$Output,
-    [switch]$SkipHighControl
+    [switch]$SkipHighControl,
+    [switch]$SkipLiveness
 )
 # Runs the background-input proof as a freshly created standard (non-administrator)
 # local user, so the regular driver and the fixtures run at medium integrity on the
@@ -19,6 +20,7 @@ whoami /all | Out-File -Encoding utf8 (Join-Path $Output 'launcher-whoami.txt')
 $pythonw = Join-Path (Split-Path $Python) 'pythonw.exe'
 if (!(Test-Path $pythonw)) { throw "pythonw.exe not found next to $Python" }
 $proof = Join-Path $PSScriptRoot 'windows-background.py'
+$liveness = Join-Path $PSScriptRoot 'windows-liveness.py'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -183,6 +185,26 @@ try {
     if (Test-Path (Join-Path $medium 'proof.log')) { Get-Content (Join-Path $medium 'proof.log') }
     if (Test-Path (Join-Path $medium 'proof-error.log')) { Get-Content (Join-Path $medium 'proof-error.log') }
     if ($code -ne 0) { $failure = "Medium proof exited $code" }
+
+    if (!$SkipLiveness) {
+        # Foreground liveness rows, same standard user, own folder, own daemon.
+        $live = Join-Path $Output 'liveness'
+        New-Item -ItemType Directory -Force $live | Out-Null
+        icacls $live /grant "*${sid}:(OI)(CI)M" | Out-Null
+        $command = "`"$pythonw`" -I `"$liveness`" --driver `"$Driver`" --output `"$live`""
+        $livePid = [uint32]0
+        $handle = [BearlyProofLauncher]::Start($user, $password, $command, $live, 0, [ref]$livePid)
+        Write-Host "Liveness proof pid: $livePid"
+        $finished = Wait-Proof { [BearlyProofLauncher]::WaitForSingleObject($handle, 0) -eq 0 } $live 1200
+        if (!$finished) { [void][BearlyProofLauncher]::TerminateProcess($handle, 124) }
+        $code = [BearlyProofLauncher]::ExitCode($handle)
+        [BearlyProofLauncher]::Close($handle)
+        Write-Host "Liveness proof exit: $code"
+        if (Test-Path (Join-Path $live 'proof.log')) { Get-Content (Join-Path $live 'proof.log') }
+        if (Test-Path (Join-Path $live 'proof-error.log')) { Get-Content (Join-Path $live 'proof-error.log') }
+        Get-ChildItem $live -Filter '*-errors.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName }
+        if ($code -ne 0 -and !$failure) { $failure = "Liveness proof exited $code" }
+    }
 } catch {
     $failure = "Medium launcher failed: $_"
 } finally {
