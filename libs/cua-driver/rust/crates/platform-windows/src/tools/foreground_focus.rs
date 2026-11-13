@@ -91,8 +91,30 @@ pub(crate) struct FailedAfterActivation {
     pub message: String,
     pub hwnd: u64,
     pub element_index: usize,
-    /// Whether the focus fallback click was sent before focus failed.
-    pub focus_click_sent: bool,
+    /// What became of the focus fallback click.
+    pub focus_click: FocusClick,
+}
+
+/// Whether the focus fallback click went out, as the reply's `focus_click`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusClick {
+    /// No click was attempted.
+    NotSent,
+    /// The click was sent.
+    Sent,
+    /// The click returned an error: part of its mouse input, or all of it,
+    /// may have gone out.
+    Uncertain,
+}
+
+impl FocusClick {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FocusClick::NotSent => "not_sent",
+            FocusClick::Sent => "sent",
+            FocusClick::Uncertain => "uncertain",
+        }
+    }
 }
 
 /// The element was gone after activation.
@@ -115,7 +137,7 @@ impl FailedAfterActivation {
             "effect": "failed",
             "activated": true,
             "keystrokes_sent": false,
-            "focus_click_sent": self.focus_click_sent,
+            "focus_click": self.focus_click.as_str(),
             "window_id": self.hwnd,
             "element_index": self.element_index,
             "retryable": false,
@@ -393,14 +415,14 @@ pub(crate) fn focus_for_foreground(
 
     // Everything below runs after activation: failures say so, and none of
     // them is the no-effects stale refusal.
-    let failed = |code, message: String, focus_click_sent| FailedAfterActivation {
+    let failed = |code, message: String, focus_click| FailedAfterActivation {
         code,
         message,
         hwnd,
         element_index,
-        focus_click_sent,
+        focus_click,
     };
-    let mut focus_click_sent = false;
+    let mut focus_click = FocusClick::NotSent;
     match target.live_bounds() {
         LiveBounds::NotAvailable => {
             return Err(failed(
@@ -410,7 +432,7 @@ pub(crate) fn focus_for_foreground(
                      [{element_index}] was no longer available; no keys or text were sent. \
                      Read the window again before acting."
                 ),
-                false,
+                FocusClick::NotSent,
             )
             .into())
         }
@@ -427,13 +449,26 @@ pub(crate) fn focus_for_foreground(
                                  refused ({}); no keys or text were sent",
                                 FocusRefused(refusal)
                             ),
-                            false,
+                            FocusClick::NotSent,
                         )
                         .into())
                     }
                 };
-                target.click(point)?;
-                focus_click_sent = true;
+                if let Err(error) = target.click(point) {
+                    // The click may have gone out in part or in full, and a
+                    // completed one may have moved the foreground.
+                    return Err(failed(
+                        FOREGROUND_UNAVAILABLE,
+                        format!(
+                            "HWND 0x{hwnd:x} was brought to the front, but UIA element \
+                             [{element_index}] could not take focus and its focus click \
+                             failed ({error}); no keys or text were sent"
+                        ),
+                        FocusClick::Uncertain,
+                    )
+                    .into());
+                }
+                focus_click = FocusClick::Sent;
                 if target.wait_for_focus(Duration::from_millis(500)) {
                     return Ok(());
                 }
@@ -454,7 +489,7 @@ pub(crate) fn focus_for_foreground(
              HWND 0x{hwnd:x}{detail}; the window was brought to the front and no keyboard \
              input was sent"
         ),
-        focus_click_sent,
+        focus_click,
     )
     .into())
 }
@@ -502,6 +537,8 @@ mod tests {
         live_later: Option<LiveBounds>,
         live_reads: usize,
         clicked: Vec<(i32, i32)>,
+        /// `click` records the click, then returns this error.
+        click_error: Option<&'static str>,
         reads: Vec<&'static str>,
     }
 
@@ -514,6 +551,7 @@ mod tests {
                 live_later: None,
                 live_reads: 0,
                 clicked: Vec::new(),
+                click_error: None,
                 reads: Vec::new(),
             }
         }
@@ -549,7 +587,10 @@ mod tests {
 
         fn click(&mut self, point: (i32, i32)) -> anyhow::Result<()> {
             self.clicked.push(point);
-            Ok(())
+            match self.click_error {
+                Some(error) => anyhow::bail!("{error}"),
+                None => Ok(()),
+            }
         }
     }
 
@@ -596,6 +637,59 @@ mod tests {
             assert_eq!(structured["retryable"], false);
             assert!(structured.get("status").is_none(), "{structured}");
         }
+    }
+
+    /// Activation, then a failed SetFocus, then a fallback click that went out
+    /// in part and returned an error: the honest post-activation failure, with
+    /// the click marked uncertain, and no keys sent.
+    #[test]
+    fn a_failed_focus_click_is_an_honest_failure_after_activation() {
+        let mut element = FakeElement::new(LiveBounds::Rect(CACHED_RECT));
+        element.click_error = Some("SendInput sent 1 of 2 mouse events");
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = foreground_element_keys(&mut element, 0x10, 3, false, transaction(&events))
+            .unwrap_err();
+        assert_eq!(events.into_inner(), vec!["activate"]);
+        assert_eq!(element.clicked, vec![rect_center(CACHED_RECT).unwrap()]);
+        let result = error_result(error, || panic!("mapped to the stale refusal"));
+        assert_eq!(result.is_error, Some(true));
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("SendInput sent 1 of 2"), "{text}");
+        assert!(text.contains("no keys or text were sent"), "{text}");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["code"], FOREGROUND_UNAVAILABLE, "{structured}");
+        assert_eq!(structured["effect"], "failed");
+        assert_eq!(structured["activated"], true);
+        assert_eq!(structured["keystrokes_sent"], false);
+        assert_eq!(structured["focus_click"], "uncertain");
+        assert_eq!(structured["retryable"], false);
+        assert_eq!(structured["escalation"]["recommended"], "verify_state");
+        assert!(structured.get("status").is_none(), "{structured}");
+    }
+
+    /// `focus_click` says whether the fallback click went out.
+    #[test]
+    fn the_post_activation_failure_says_whether_the_focus_click_went_out() {
+        let focus_click = |element: &mut FakeElement| {
+            let error = focus_for_foreground(element, 0x10, 3).unwrap_err();
+            error_result(error, || unreachable!())
+                .structured_content
+                .unwrap()["focus_click"]
+                .clone()
+        };
+        // Clicked, but focus never confirmed.
+        let mut element = FakeElement::new(LiveBounds::Rect(CACHED_RECT));
+        element.focused_after_click = false;
+        assert_eq!(focus_click(&mut element), "sent");
+        // No live point, so no click.
+        assert_eq!(
+            focus_click(&mut FakeElement::new(LiveBounds::Unknown)),
+            "not_sent"
+        );
+        assert_eq!(
+            focus_click(&mut FakeElement::new(LiveBounds::NotAvailable)),
+            "not_sent"
+        );
     }
 
     /// The element gone at the read before activation: stale refusal, and the
