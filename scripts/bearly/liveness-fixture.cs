@@ -315,6 +315,8 @@ namespace BearlyLiveness
         int writeErrors = 0;
         int dropped = 0;
         IntPtr awayTo = IntPtr.Zero;
+        Form spare;
+        long spareHwnd = 0;
 
         public static void Run(string folder, string name, int left, int top, int width, int height, int red, int green, int blue)
         {
@@ -462,6 +464,14 @@ namespace BearlyLiveness
             loseRemovedAt = -1;
             activations = 0;
             deactivations = 0;
+            if (spare != null)
+            {
+                spare.Close();
+                spare.Dispose();
+                spare = null;
+            }
+            spareHwnd = 0;
+            if (form.WindowState != FormWindowState.Normal) form.WindowState = FormWindowState.Normal;
             form.Bounds = home;
             lock (names) names[form.Handle] = "form";
 
@@ -606,6 +616,40 @@ namespace BearlyLiveness
                 }
                 return;
             }
+            if (op == "focus")
+            {
+                form.ActiveControl = controls[Rest(parts, 2)];
+                return;
+            }
+            if (op == "minimize") { form.WindowState = FormWindowState.Minimized; return; }
+            if (op == "spare-open")
+            {
+                // A second top-level window of this process, which a row can close.
+                spare = new Form();
+                spare.Text = name + " spare";
+                spare.StartPosition = FormStartPosition.Manual;
+                spare.Bounds = new Rectangle(home.X + 40, home.Y + 40, 300, 160);
+                TextBox box = new TextBox();
+                box.AccessibleName = "Spare edit";
+                box.Text = "spare text";
+                box.SetBounds(10, 10, 200, 24);
+                spare.Controls.Add(box);
+                spare.Show();
+                spareHwnd = spare.Handle.ToInt64();
+                lock (names)
+                {
+                    names[spare.Handle] = "spare form";
+                    names[box.Handle] = "Spare edit";
+                }
+                return;
+            }
+            if (op == "spare-close")
+            {
+                spare.Close();
+                spare.Dispose();
+                spare = null;
+                return;
+            }
             if (op == "listtop")
             {
                 ((ListBox)controls[Rest(parts, 3)]).TopIndex = int.Parse(parts[2]);
@@ -694,6 +738,9 @@ namespace BearlyLiveness
                 sb.Append(",\"active\":").Append(B(Form.ActiveForm == form));
                 sb.Append(",\"focus\":").Append(J(focus));
                 sb.Append(",\"lose_armed\":").Append(B(armLose));
+                sb.Append(",\"spare_hwnd\":").Append(spareHwnd);
+                sb.Append(",\"spare_open\":").Append(B(spare != null));
+                sb.Append(",\"window_state\":").Append(J(form.WindowState.ToString()));
                 sb.Append(",\"lose_removed_at\":").Append(loseRemovedAt);
                 sb.Append(",\"bounds\":[").Append(form.Left).Append(',').Append(form.Top).Append(',').Append(form.Width).Append(',').Append(form.Height).Append(']');
                 sb.Append(",\"write_errors\":").Append(writeErrors);

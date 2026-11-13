@@ -357,7 +357,7 @@ def timeline(rec, start_q):
 
 
 def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), arm=(), aside=False,
-            tail=1.0, post=None, token=None, keep=False, mode='foreground'):
+            tail=1.0, post=None, token=None, keep=False, mode='foreground', window_only=False, window=None, setup=()):
     rec = {'id': rid, 'group': group, 'desc': desc, 'tool': tool, 'label': label, 'aside': aside,
            'mutate': [list(m) for m in mutate], 'arm': [list(a) for a in arm]}
     try:
@@ -366,11 +366,17 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
             command('Sentinel', 'reset')
         if aside:
             command('Sentinel', 'bounds', *SENTINEL_ASIDE)
+        for step in setup:
+            command('Target', *step)
         rec['sentinel_in_front_before'] = front(sentinel['hwnd'])
         time.sleep(0.25)
         for step in arm:
             command('Target', *step)
-        if token is None:
+        if window_only:
+            # No control named: only pid, window_id and delivery_mode.
+            found, view = read_tokens()
+            rec['snapshot_ok'] = not view.get('isError') and not view.get('transport_error')
+        elif token is None:
             found, view = read_tokens()
             if label not in found:
                 rec['harness_error'] = f'{label!r} not in the snapshot'
@@ -386,7 +392,10 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
         if mutate:
             time.sleep(0.3)
         values = dict(extra(rec) if callable(extra) else (extra or {}))
-        values.update(pid=target['pid'], element_token=token, delivery_mode=mode)
+        if window_only:
+            values.update(pid=target['pid'], window_id=window() if window else target['hwnd'], delivery_mode=mode)
+        else:
+            values.update(pid=target['pid'], element_token=token, delivery_mode=mode)
         rec['args'] = values
         fg_before, cursor_before = foreground(), cursor()
         target_before, sentinel_before = state('Target'), state('Sentinel')
@@ -939,7 +948,61 @@ try:
         run_row(rid, 'custom provider', f'custom ScrollPattern {mode}, scroll {direction} 3' + (', target uncovered' if aside else ''),
                 'scroll', 'Custom scroller', {'direction': direction, 'amount': 3}, custom(kind, completed, axis),
                 arm=[('scroller', mode)], aside=aside, tail=3.0)
-    # 11. Stretch: the fallback focus click returns an error (it completed with another window in front).
+    # 11. Keys addressed to the window, no control named.
+
+    def window_key(vk, text_change):
+        """vk once to the target's focused field (Filled edit), nothing to the sentinel."""
+        def evaluate(rec, notes):
+            ok = succeeded(rec, notes)
+            got = counts(rec, 'Target', 'Filled edit')
+            downs = [e for e in rec['received']['Target']['events'] if e[2] in ('keydown', 'syskeydown') and e[3] == vk]
+            ok &= check(len(downs) == 1 and all(e[1] == 'Filled edit' for e in downs), f'key 0x{vk:x} downs {downs}', notes)
+            for other, per in rec['received']['Target']['counts'].items():
+                if other != 'Filled edit' and (per.get('keydown') or per.get('char') or per.get('syskeydown')):
+                    ok &= check(False, f'Target/{other} received keys {per}', notes)
+            ok &= check(totals(rec, 'Sentinel')['keys'] == 0 and totals(rec, 'Sentinel')['text'] == 0,
+                        f'sentinel received keys/text {rec["received"]["Sentinel"]["counts"]}', notes)
+            before, after = control_state(rec, 'before', 'Filled edit'), control_state(rec, 'after', 'Filled edit')
+            ok &= text_change(before, after, notes)
+            notes.append(f'Filled edit {before["text"]!r} sel {before["selection"]} -> {after["text"]!r} sel {after["selection"]}; events {got}; '
+                         f'activated={rec["target_activated"]} fg_after={rec["foreground_after"]} samples {rec["foreground_samples"]}')
+            return verdict(ok)
+        return evaluate
+
+    def inserted_q(before, after, notes):
+        index = one_insertion(before['text'], after['text'], 'q')
+        return check(index == before['caret'], f'not one q at caret {before["caret"]}: {before["text"]!r} -> {after["text"]!r}', notes)
+
+    def selected_all(before, after, notes):
+        ok = check(after['text'] == before['text'], f'text changed: {after["text"]!r}', notes)
+        ok &= check(after['selection'] == len(after['text']), f'selection {after["selection"]} of {len(after["text"])}', notes)
+        return ok
+    focus_field = [('focus', 'Filled edit')]
+    run_row('window-press_key', 'window keys', 'press_key q, no token, target behind the sentinel', 'press_key', None,
+            {'key': 'q'}, window_key(0x51, inserted_q), arm=focus_field, window_only=True, tail=3.0)
+    run_row('window-hotkey', 'window keys', 'hotkey ctrl+a, no token, target behind the sentinel', 'hotkey', None,
+            {'keys': ['ctrl', 'a']}, window_key(0x41, selected_all), arm=focus_field, window_only=True, tail=3.0)
+
+    def closed_refused(rec, notes):
+        ok = check(rec['reply'].get('isError') is True, f'not an error: {observed(rec)} {rec["reply"].get("text", "")[:300]}', notes)
+        ok &= nothing_happened(rec, notes)
+        notes.append(f'reply: {rec["reply"].get("text", "")[:300]}; structured {sc(rec)}')
+        return verdict(ok)
+    spare_hwnd = lambda: state('Target')['spare_hwnd']
+    for tool, extra in (('press_key', {'key': 'q'}), ('hotkey', {'keys': ['ctrl', 'a']})):
+        run_row(f'window-closed-{tool}', 'window keys', f'{tool}, no token, its window closed before the call', tool, None, extra,
+                closed_refused, setup=[('spare-open',)], arm=focus_field, mutate=[('spare-close',)], window_only=True, window=spare_hwnd, tail=2.0)
+
+    def minimized(rec, notes):
+        notes.append(f'reply: {rec["reply"].get("text", "")[:300]}; structured {sc(rec)}; target {rec["received"]["Target"]["counts"]}; '
+                     f'sentinel {rec["received"]["Sentinel"]["counts"]}; window state {rec["target_before"]["window_state"]} -> '
+                     f'{rec["target_after"]["window_state"]}; Filled edit {control_state(rec, "after", "Filled edit")["text"]!r}; '
+                     f'activated={rec["target_activated"]} fg_after={rec["foreground_after"]} samples {rec["foreground_samples"]}')
+        return 'INFO'
+    for tool, extra in (('press_key', {'key': 'q'}), ('hotkey', {'keys': ['ctrl', 'a']})):
+        run_row(f'window-minimized-{tool}', 'window keys', f'{tool}, no token, target minimized', tool, None, extra,
+                minimized, arm=focus_field + [('minimize',)], window_only=True, tail=3.0)
+    # 12. Stretch: the fallback focus click returns an error (it completed with another window in front).
     for tool in ('type_text', 'press_key', 'hotkey'):
         run_row(f'focus-click-uncertain-{tool}', 'focus click error', f'{tool}: focus click completes with another window in front',
                 tool, 'Click away edit', ARGS[tool], expect_after_activation('foreground_unavailable', 'uncertain', clicked='Click away edit'))
