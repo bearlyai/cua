@@ -334,6 +334,23 @@ Token validation retains `invalid_element_token`, `stale_element_token`, and
 
 A stale-token response additionally carries `current_snapshots: [{snapshot_id,
 window_id}]`; consumers should refresh the window snapshot.
+`stale_element_token` also covers a control that no longer exists at foreground
+dispatch: the token's snapshot is still current, but a live read just before a
+foreground step addressed by the token finds the element gone. The envelope is
+the same, with the message `element_token is stale; call get_window_state again
+to refresh; the element could not be found live in the app, so nothing was
+activated or sent; current snapshots for pid …`. Nothing was activated, clicked
+or sent.
+
+- On macOS the live read is the element's role. Only `-25202` (invalid element)
+  counts as gone; any other error lets the step run as before.
+- On Windows the live read is the element's current rectangle (UIA, or MSAA
+  `accLocation`). `UIA_E_ELEMENTNOTAVAILABLE` counts as gone. A foreground step
+  that sends input at the element's position (a click or tap) uses the centre
+  of that live rectangle, never the one cached at read time, so it is also
+  refused this way when the rectangle cannot be read or is empty. Foreground
+  keys and text first ask UIA to focus the element; only their fallback focus
+  click needs the live rectangle.
 Malformed arguments may return only `content` and `isError:true`, with no code.
 
 `SCREEN_SHARING_REQUIRES_FOREGROUND_HID` is another pre-dispatch refusal; its
