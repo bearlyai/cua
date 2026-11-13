@@ -42,6 +42,13 @@ dwm = ctypes.WinDLL('dwmapi')
 user.GetForegroundWindow.restype = wintypes.HWND
 user.SetForegroundWindow.argtypes = [wintypes.HWND]
 user.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user.WindowFromPoint.argtypes = [wintypes.POINT]
+user.WindowFromPoint.restype = wintypes.HWND
+user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user.GetAncestor.restype = wintypes.HWND
 dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 kernel.GetCurrentProcess.restype = wintypes.HANDLE
 kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -57,6 +64,8 @@ LEVELS = {0x1000: 'Low', 0x2000: 'Medium', 0x2100: 'Medium Plus', 0x3000: 'High'
 # Keys the driver sends itself around activation: VK_NONAME (activation assist)
 # and 0xE8 (its input-drain marker). Counted apart from requested keys.
 ASSIST_KEYS = {0xFC, 0xE8}
+# Fixture notes that are not input: activation, focus and provider calls.
+NOTES = {'activated', 'deactivated', 'gotfocus', 'scrollcall-ui', 'scrollcall-other'}
 TARGET_HOME = (160, 140, 520, 420)
 SENTINEL_HOME = (100, 100, 700, 520)
 SENTINEL_ASIDE = (760, 560, 260, 160)
@@ -243,8 +252,34 @@ def front(hwnd):
     return bool(wait_for(lambda: foreground() == hwnd, 2))
 
 
+unknown_windows = {}
+
+
+def describe(hwnd):
+    pid = wintypes.DWORD()
+    user.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    cls, title = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+    user.GetClassNameW(wintypes.HWND(hwnd), cls, 256)
+    user.GetWindowTextW(wintypes.HWND(hwnd), title, 256)
+    owner = {target['pid']: 'target fixture', sentinel['pid']: 'sentinel fixture', daemon.pid: 'driver daemon', os.getpid(): 'proof'}.get(pid.value, 'other process')
+    return {'hwnd': hex(hwnd), 'pid': pid.value, 'owner': owner, 'class': cls.value, 'title': title.value}
+
+
 def who(hwnd):
-    return {target['hwnd']: 'target', sentinel['hwnd']: 'sentinel', 0: 'none'}.get(hwnd, hex(hwnd))
+    known = {target['hwnd']: 'target', sentinel['hwnd']: 'sentinel', 0: 'none'}.get(hwnd)
+    if known:
+        return known
+    if hwnd not in unknown_windows:
+        unknown_windows[hwnd] = describe(hwnd)
+    return hex(hwnd)
+
+
+def under(point):
+    if point is None:
+        return None
+    child = int(user.WindowFromPoint(wintypes.POINT(*point)) or 0)
+    top = int(user.GetAncestor(wintypes.HWND(child), 2) or 0) if child else 0
+    return {'child': describe(child) if child else None, 'top_level': who(top)}
 
 
 def one_insertion(before, after, text):
@@ -264,7 +299,8 @@ def summarise(events):
             kind = 'assist_' + kind
         counts.setdefault(control, {}).setdefault(kind, 0)
         counts[control][kind] += 1
-    totals = {'clicks': 0, 'double_clicks': 0, 'keys': 0, 'text': 0, 'wheel': 0, 'assist_keys': 0, 'all': len(events)}
+    totals = {'clicks': 0, 'double_clicks': 0, 'keys': 0, 'text': 0, 'wheel': 0, 'assist_keys': 0,
+              'all': sum(1 for e in events if e[2] not in NOTES)}
     for per in counts.values():
         for kind, count in per.items():
             if kind in ('ldown', 'rdown', 'mdown'):
@@ -283,7 +319,7 @@ def summarise(events):
 
 
 def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), arm=(), aside=False,
-            tail=1.0, post=None, token=None, keep=False):
+            tail=1.0, post=None, token=None, keep=False, mode='foreground'):
     rec = {'id': rid, 'group': group, 'desc': desc, 'tool': tool, 'label': label, 'aside': aside,
            'mutate': [list(m) for m in mutate], 'arm': [list(a) for a in arm]}
     try:
@@ -312,7 +348,7 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
         if mutate:
             time.sleep(0.3)
         values = dict(extra(rec) if callable(extra) else (extra or {}))
-        values.update(pid=target['pid'], element_token=token, delivery_mode='foreground')
+        values.update(pid=target['pid'], element_token=token, delivery_mode=mode)
         rec['args'] = values
         fg_before, cursor_before = foreground(), cursor()
         target_before, sentinel_before = state('Target'), state('Sentinel')
@@ -326,12 +362,15 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
                 current = foreground()
                 if current != last:
                     samples.append([round((time.monotonic() - start) * 1000), current])
+                    if current and current not in (target['hwnd'], sentinel['hwnd']) and current not in unknown_windows:
+                        unknown_windows[current] = describe(current)
                     last = current
         observer = threading.Thread(target=observe)
         observer.start()
         try:
             rec['reply'] = raw(tool, values)
             rec['reply_ms'] = round((time.monotonic() - start) * 1000)
+            rec['window_under_reported_point'] = under(reported_point(rec))
             if post:
                 post(rec)
             time.sleep(tail)
@@ -343,6 +382,7 @@ def run_row(rid, group, desc, tool, label, extra=None, expect=None, mutate=(), a
         rec['foreground_before'] = who(fg_before)
         rec['foreground_after'] = who(foreground())
         rec['foreground_samples'] = [[ms, who(hwnd)] for ms, hwnd in samples]
+        rec['unknown_foreground_windows'] = [unknown_windows[hwnd] for _, hwnd in samples if hwnd in unknown_windows]
         rec['target_activated'] = any(name == 'target' for _, name in rec['foreground_samples'])
         rec['cursor_before'], rec['cursor_after'] = cursor_before, cursor()
         rec['daemon_alive'] = daemon.poll() is None
@@ -435,7 +475,7 @@ def is_stale(rec, notes):
 def nothing_happened(rec, notes, ignore=()):
     ok = True
     for name in ('Target', 'Sentinel'):
-        events = [e for e in rec['received'][name]['events'] if (e[2], e[3]) not in ignore]
+        events = [e for e in rec['received'][name]['events'] if (e[2], e[3]) not in ignore and e[2] not in NOTES]
         ok &= check(not events, f'{name} received input: {rec["received"][name]["counts"]}', notes)
     ok &= check(not rec['target_activated'], f'target was activated: {rec["foreground_samples"]}', notes)
     ok &= check(rec['foreground_after'] == 'sentinel', f'sentinel not in front after: {rec["foreground_after"]}', notes)
@@ -689,7 +729,7 @@ try:
         # The launcher's Alt tap that fronts the target is the harness's own input.
         ignore = {('syskeydown', 0x12), ('syskeyup', 0x12), ('keydown', 0x12), ('keyup', 0x12)}
         for name in ('Target', 'Sentinel'):
-            events = [e for e in rec['received'][name]['events'] if (e[2], e[3]) not in ignore]
+            events = [e for e in rec['received'][name]['events'] if (e[2], e[3]) not in ignore and e[2] not in NOTES]
             ok &= check(not events, f'{name} received input: {rec["received"][name]["counts"]}', notes)
         samples = rec['foreground_samples']
         reached = next((i for i, (_, name) in enumerate(samples) if name == 'target'), None)
@@ -705,13 +745,18 @@ try:
 
     def uia_scroll(rec, notes):
         ok = succeeded(rec, notes)
-        ok &= check(sc(rec).get('path') == 'uia', f'path {sc(rec).get("path")!r}', notes)
+        ok &= check(sc(rec).get('route') == 'accessibility' and 'via UIA' in (rec['reply'].get('text') or ''),
+                    f'not the UIA route: {sc(rec)}', notes)
         before, after = control_state(rec, 'before', 'Fixture list'), control_state(rec, 'after', 'Fixture list')
         ok &= check(after['top'] > before['top'], f'list top {before["top"]} -> {after["top"]}', notes)
         ok &= check(totals(rec, 'Target')['wheel'] + totals(rec, 'Sentinel')['wheel'] == 0, 'a wheel event was received', notes)
-        notes.append(f'list top {before["top"]} -> {after["top"]}')
+        notes.append(f'list top {before["top"]} -> {after["top"]}; activated={rec["target_activated"]} fg_after={rec["foreground_after"]} '
+                     f'reply delivery={sc(rec).get("delivery")}')
         return verdict(ok)
     run_row('scroll-uia', 'scroll', 'scroll a list with ScrollPattern: UIA, no wheel', 'scroll', 'Fixture list', ARGS['scroll'], uia_scroll, aside=True)
+    run_row('scroll-uia-covered', 'scroll', 'same, target covered', 'scroll', 'Fixture list', ARGS['scroll'], uia_scroll)
+    run_row('scroll-uia-background', 'scroll', 'contrast: background UIA scroll of the same list', 'scroll', 'Fixture list', ARGS['scroll'],
+            uia_scroll, mode='background')
     pad = run_row('scroll-wheel-live-centre', 'scroll', 'scroll a control with no ScrollPattern: wheel at its live centre', 'scroll', 'Wheel pad',
                   ARGS['scroll'], expect_wheel_at('Wheel pad'), aside=True)
 
@@ -769,10 +814,12 @@ try:
             after = control_state(rec, 'after', 'Custom scroller') or {}
             moved = (after.get(axis, before[axis]) or 0) - (before[axis] or 0)
             text = rec['reply'].get('text') or ''
-            notes.append(f'{axis} {before[axis]} -> {after.get(axis)} calls {after.get("calls")} exists={bool(after)}; reply: {text[:200]}')
+            calls = [e for e in rec['received']['Target']['events'] if e[2].startswith('scrollcall')]
+            notes.append(f'{axis} {before[axis]} -> {after.get(axis)} calls {after.get("calls")} exists={bool(after)}; provider calls {calls}; '
+                         f'under wheel point {rec.get("window_under_reported_point")}; reply: {text[:200]}')
             ok = check('status' not in structured and 'refusal' not in structured, 'reply is a refusal', notes)
             if mode == 'ok':
-                ok &= succeeded(rec, notes) and check(structured.get('path') == 'uia' and moved == 3, 'uia scroll did not complete', notes)
+                ok &= succeeded(rec, notes) and check(structured.get('route') == 'accessibility' and moved == 3, 'uia scroll did not complete', notes)
                 ok &= check(totals(rec, 'Sentinel')['wheel'] + totals(rec, 'Target')['wheel'] == 0, 'wheel sent', notes)
             elif wheel:
                 ok &= check('SendInput wheel' in text, 'no wheel fallback', notes)
@@ -799,6 +846,9 @@ try:
     for mode, direction, completed, axis, wheel in stretch:
         run_row(f'custom-{mode}-{direction}', 'custom provider', f'custom ScrollPattern {mode}, scroll {direction} 3', 'scroll',
                 'Custom scroller', {'direction': direction, 'amount': 3}, custom(mode, completed, axis, wheel), arm=[('scroller', mode)])
+    for mode in ('fail-first', 'move-then-fail'):
+        run_row(f'custom-{mode}-down-uncovered', 'custom provider', f'custom ScrollPattern {mode}, scroll down 3, target uncovered', 'scroll',
+                'Custom scroller', {'direction': 'down', 'amount': 3}, custom(mode, 0, 'vpos', True), arm=[('scroller', mode)], aside=True)
     # 11. Stretch: the fallback focus click returns an error (it completed with another window in front).
     for tool in ('type_text', 'press_key', 'hotkey'):
         run_row(f'focus-click-uncertain-{tool}', 'focus click error', f'{tool}: focus click completes with another window in front',
@@ -817,6 +867,7 @@ finally:
                 child.wait()
     for handle in logs:
         handle.close()
+    facts['unknown_windows'] = {hex(k): v for k, v in unknown_windows.items()}
     (out / 'results.json').write_text(json.dumps({'facts': facts, 'rows': rows}, indent=2), encoding='utf-8')
     lines = ['| Row | Expected | Observed | Verdict | Notes |', '|---|---|---|---|---|']
     for rec in rows:

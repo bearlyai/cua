@@ -125,6 +125,8 @@ namespace BearlyLiveness
         public bool Gone = false;
         public string LastError = "";
         public Action OnGone;
+        public Action<string, long> OnCall;
+        public int UiThread;
         ScrollerProvider provider;
 
         public CustomScroller()
@@ -166,6 +168,7 @@ namespace BearlyLiveness
             {
                 lock (this)
                 {
+                    if (OnCall != null) OnCall(System.Threading.Thread.CurrentThread.ManagedThreadId == UiThread ? "scrollcall-ui" : "scrollcall-other", Calls + 1);
                     if (Gone) throw new ElementNotAvailableException();
                     Calls++;
                     int dv = Delta(vertical);
@@ -322,6 +325,7 @@ namespace BearlyLiveness
             form.Activated += delegate
             {
                 activations++;
+                Note("form", "activated", 0);
                 if (armLose && controls.ContainsKey("Lose edit"))
                 {
                     armLose = false;
@@ -329,7 +333,7 @@ namespace BearlyLiveness
                     loseRemovedAt = Elapsed();
                 }
             };
-            form.Deactivate += delegate { deactivations++; };
+            form.Deactivate += delegate { deactivations++; Note("form", "deactivated", 0); };
             form.Shown += delegate
             {
                 Rebuild();
@@ -352,16 +356,28 @@ namespace BearlyLiveness
         public void Record(IntPtr hwnd, string kind, long value)
         {
             string target;
-            if (!names.TryGetValue(hwnd, out target))
+            lock (names)
             {
-                target = "hwnd:" + hwnd.ToInt64().ToString("x");
+                if (!names.TryGetValue(hwnd, out target))
+                {
+                    target = "hwnd:" + hwnd.ToInt64().ToString("x");
+                }
             }
-            if (events.Count >= 3000)
+            Note(target, kind, value);
+        }
+
+        // Also called from UI Automation provider threads.
+        public void Note(string target, string kind, long value)
+        {
+            lock (events)
             {
-                dropped++;
-                return;
+                if (events.Count >= 3000)
+                {
+                    dropped++;
+                    return;
+                }
+                events.Add("[" + Elapsed() + "," + J(target) + "," + J(kind) + "," + value + "]");
             }
-            events.Add("[" + Elapsed() + "," + J(target) + "," + J(kind) + "," + value + "]");
         }
 
         T Add<T>(T control, string label, int x, int y, int w, int h) where T : Control
@@ -371,7 +387,9 @@ namespace BearlyLiveness
             control.SetBounds(x, y, w, h);
             form.Controls.Add(control);
             controls[label] = control;
-            names[control.Handle] = label;
+            lock (names) names[control.Handle] = label;
+            string focusKey = label;
+            control.GotFocus += delegate { Note(focusKey, "gotfocus", 0); };
             Button button = control as Button;
             if (button != null)
             {
@@ -409,17 +427,17 @@ namespace BearlyLiveness
             form.Controls.Clear();
             foreach (Control control in old) control.Dispose();
             controls.Clear();
-            names.Clear();
+            lock (names) names.Clear();
             clicks.Clear();
             removed.Clear();
-            events.Clear();
+            lock (events) events.Clear();
             dropped = 0;
             armLose = false;
             loseRemovedAt = -1;
             activations = 0;
             deactivations = 0;
             form.Bounds = home;
-            names[form.Handle] = "form";
+            lock (names) names[form.Handle] = "form";
 
             Button sink = Add(new Button(), "Focus sink", 260, 330, 120, 28);
             sink.Text = "Focus sink";
@@ -439,6 +457,8 @@ namespace BearlyLiveness
             CustomScroller scroller = new CustomScroller();
             Add(scroller, "Custom scroller", 260, 130, 230, 60);
             scroller.OnGone = delegate { if (controls.ContainsKey("Custom scroller")) Remove("Custom scroller"); };
+            scroller.UiThread = System.Threading.Thread.CurrentThread.ManagedThreadId;
+            scroller.OnCall = delegate(string kind, long call) { Note("Custom scroller", kind, call); };
             List("Fixture list", "Item", 260, 200, 230, 120);
 
             foreach (KeyValuePair<string, Control> pair in controls)
@@ -666,7 +686,9 @@ namespace BearlyLiveness
                     first = false;
                     sb.Append(J(pair.Key)).Append(':').Append(ControlState(pair.Key, pair.Value));
                 }
-                sb.Append("},\"events\":[").Append(string.Join(",", events.ToArray())).Append("]}");
+                string joined;
+                lock (events) joined = string.Join(",", events.ToArray());
+                sb.Append("},\"events\":[").Append(joined).Append("]}");
                 string temp = Path.Combine(folder, name + ".json.tmp");
                 File.WriteAllText(temp, sb.ToString());
                 // MOVEFILE_REPLACE_EXISTING; fails harmlessly while a reader holds the file.
