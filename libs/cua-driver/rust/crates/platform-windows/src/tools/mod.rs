@@ -13,6 +13,9 @@ pub(crate) mod page;
 pub(crate) mod page_bookmark;
 // Pure title parsing for `page_bookmark`; ungated so its tests run on any host.
 pub(crate) mod page_title_marker;
+// Pure foreground-focus decisions for element-addressed keys and text; ungated
+// so their tests run on any host.
+pub(crate) mod foreground_focus;
 
 #[cfg(not(target_os = "windows"))]
 mod stubs;

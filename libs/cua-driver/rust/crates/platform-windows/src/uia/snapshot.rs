@@ -33,6 +33,40 @@ impl RetainedElement {
         result.map_err(|e| anyhow::anyhow!("UIA SetFocus failed: {e}"))
     }
 
+    /// The element's rectangle read live, not the one cached at read time:
+    /// UIA `CurrentBoundingRectangle`, or MSAA `accLocation` for an MSAA
+    /// element. MSAA has no element-not-available error, so any MSAA failure
+    /// reads as unknown.
+    pub(crate) fn live_bounds(&self) -> crate::tools::foreground_focus::LiveBounds {
+        use crate::tools::foreground_focus::{live_bounds_from, LiveBounds};
+        if self.ptr == 0 {
+            return LiveBounds::Unknown;
+        }
+        match self.kind {
+            SnapshotKind::Uia => {
+                let element = unsafe { IUIAutomationElement::from_raw(self.ptr as *mut _) };
+                let read = unsafe { element.CurrentBoundingRectangle() }
+                    .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
+                    .map_err(|error| error.code().0 as u32);
+                std::mem::forget(element);
+                live_bounds_from(read)
+            }
+            SnapshotKind::Msaa => {
+                let acc = unsafe { IAccessible::from_raw(self.ptr as *mut _) };
+                let (mut left, mut top, mut width, mut height) = (0i32, 0i32, 0i32, 0i32);
+                let self_child = windows::core::VARIANT::from(0i32); // CHILDID_SELF
+                let read = unsafe {
+                    acc.accLocation(&mut left, &mut top, &mut width, &mut height, &self_child)
+                };
+                std::mem::forget(acc);
+                match read {
+                    Ok(()) => LiveBounds::Rect((left, top, left + width, top + height)),
+                    Err(_) => LiveBounds::Unknown,
+                }
+            }
+        }
+    }
+
     pub fn element_has_keyboard_focus(&self) -> Option<bool> {
         if !self.is_uia() {
             return None;

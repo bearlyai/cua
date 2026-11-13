@@ -3626,34 +3626,57 @@ impl Tool for ClickTool {
                 };
                 let mods_owned = modifiers.clone();
                 let activate = delivery == DeliveryMode::Foreground;
-                let send_result = tokio::task::spawn_blocking({
-                    let admitted = admitted.clone();
-                    move || {
-                        let _admission = &admitted;
-                        let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                        if activate {
-                            crate::input::send_click_synthesized_active_mods(
-                                hwnd, tx, ty, count, &btn_fg, &mod_refs,
-                            )
-                        } else {
+                let send_result = if activate {
+                    // Foreground: the same half of the element's live MSAA
+                    // location, never the cached one; an element whose live
+                    // location can't be read is refused as stale, unclicked.
+                    let tap = ElementTap {
+                        admitted: admitted.clone(),
+                        hwnd,
+                        pid,
+                        element_index: idx,
+                        action_verb: "a foreground click",
+                        recenter_first: false,
+                        onscreen_check: false,
+                        recorded: (tx, ty),
+                        count,
+                        button: btn_fg,
+                        modifiers: mods_owned,
+                    };
+                    let pick = if want_expand {
+                        super::foreground_focus::dropdown_half
+                    } else {
+                        super::foreground_focus::live_center
+                    };
+                    run_foreground_tap(tap, pick).await
+                } else {
+                    tokio::task::spawn_blocking({
+                        let admitted = admitted.clone();
+                        move || {
+                            let _admission = &admitted;
+                            let mod_refs: Vec<&str> =
+                                mods_owned.iter().map(String::as_str).collect();
                             crate::input::send_click_synthesized_mods(
                                 hwnd, tx, ty, count, &btn_fg, &mod_refs,
                             )
+                            .map(|()| (tx, ty))
                         }
-                    }
-                })
-                .await;
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task error: {e}")))
+                };
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 let half = if want_expand { "dropdown" } else { "press" };
                 return match send_result {
-                    Ok(Ok(())) => ToolResult::text(format!(
+                    Ok((tx, ty)) => ToolResult::text(format!(
                         "✅ Performed SendInput click on MSAA [{idx}] {half} half at ({tx},{ty})."
                     ))
                     .with_structured(
                         json!({ "path": "msaa", "verified": false, "effect": "unverifiable" }),
                     ),
-                    Ok(Err(e)) => ToolResult::error(e.to_string()),
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Err(e) => super::foreground_focus::error_result(e, || {
+                        self.state.snapshots.dead_element_refusal(pid as i32)
+                    }),
                 };
             }
 
@@ -3753,68 +3776,45 @@ impl Tool for ClickTool {
             // rejected) and might fail on elements that don't support
             // InvokePattern anyway.
             if delivery == DeliveryMode::Foreground {
-                // Foreground delivery is a real SendInput tap at (cx,cy); if the
-                // element is off-screen, scroll it into view and re-resolve so the
-                // tap doesn't land on the taskbar, else keep the clean failure.
-                // Modified selection needs one stronger preflight: some WPF
-                // ScrollViewers report a clipped item as on-screen because its
-                // stale rectangle is still inside the outer HWND. Ask the item
-                // to scroll itself into view before trusting that rectangle.
-                let recorded_center = (cx, cy);
-                let (cx, cy) = if !modifiers.is_empty() {
-                    admitted
-                        .clone()
-                        .and_then(|retained| {
-                            retained.is_uia().then(|| unsafe {
-                                crate::uia::scroll::scroll_into_view_and_recenter(
-                                    hwnd,
-                                    retained.as_ptr(),
-                                )
-                            })
-                        })
-                        .flatten()
-                        .unwrap_or((cx, cy))
-                } else {
-                    (cx, cy)
-                };
-                let (cx, cy) = match resolve_onscreen_point_with_scroll(
-                    &admitted,
+                // Foreground delivery is a real SendInput tap at the centre of
+                // the element's live rectangle, never the centre cached at read
+                // time: a control the app removed or moved after the read would
+                // otherwise let the tap land on whatever is there now. A control
+                // that can't be found live is refused as stale before anything
+                // is activated. If the element is off-screen, scroll it into
+                // view and re-resolve so the tap doesn't land on the taskbar,
+                // else keep the clean failure. Modified selection needs one
+                // stronger preflight: some WPF ScrollViewers report a clipped
+                // item as on-screen because its stale rectangle is still inside
+                // the outer HWND. Ask the item to scroll itself into view before
+                // trusting that rectangle.
+                let tap = ElementTap {
+                    admitted: admitted.clone(),
                     hwnd,
-                    idx,
-                    cx,
-                    cy,
-                    "a foreground click",
-                ) {
-                    Ok(p) => p,
-                    Err(result) => return result,
+                    pid,
+                    element_index: idx,
+                    action_verb: "a foreground click",
+                    recenter_first: !modifiers.is_empty(),
+                    onscreen_check: true,
+                    recorded: (cx, cy),
+                    count,
+                    button: btn.clone(),
+                    modifiers: modifiers.clone(),
                 };
-                if (cx, cy) != recorded_center {
-                    crate::recording_hooks::capture_dispatch_click_target(hwnd, pid, cx, cy);
-                }
-                let btn_fg = btn.clone();
-                let mods_owned = modifiers.clone();
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking({
-                    let admitted = admitted.clone();
-                    move || {
-                        let _admission = &admitted;
-                        let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                        crate::input::send_click_synthesized_active_mods(
-                            hwnd, cx, cy, count, &btn_fg, &mod_refs,
-                        )
-                    }
-                })
-                .await;
+                let send_result =
+                    run_foreground_tap(tap, super::foreground_focus::live_center).await;
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
-                    Ok(Ok(())) => ToolResult::text(format!(
+                    Ok((cx, cy)) => ToolResult::text(format!(
                         "✅ Performed SendInput click on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
                     ))
                     .with_structured(json!({ "path": "pixel", "verified": false, "effect": "unverifiable" })),
-                    Ok(Err(e)) => ToolResult::error(e.to_string()),
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Err(e) => super::foreground_focus::error_result(e, || {
+                        self.state.snapshots.dead_element_refusal(pid as i32)
+                    }),
                 };
             }
             // UIA and posted-message routes can report success without a
@@ -4446,48 +4446,175 @@ fn wait_for_cached_element_keyboard_focus(
     }
 }
 
+/// The cached element as the foreground focus step sees it: UIA `SetFocus`,
+/// keyboard-focus read-back, its live rectangle, the shared on-screen check,
+/// and a real click. The decisions are in [`super::foreground_focus`].
+struct CachedElementFocus<'a> {
+    admitted: &'a Option<crate::uia::snapshot::RetainedElement>,
+    hwnd: u64,
+    element_index: usize,
+}
+
+impl super::foreground_focus::FocusTarget for CachedElementFocus<'_> {
+    fn set_focus(&mut self) -> anyhow::Result<()> {
+        // `fg_bypass` is a background-only shield: for Chromium it disables the
+        // top-level HWND while UIA runs so the provider cannot self-activate. A
+        // disabled foreground window immediately loses foreground on Windows,
+        // which would make the enclosing verify-before-SendInput transaction
+        // fail closed. The foreground route has already activated the exact
+        // HWND, so focus the cached element directly and verify it.
+        self.admitted
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing admitted element"))
+            .and_then(|element| element.focus_element())
+    }
+
+    fn wait_for_focus(&mut self, timeout: std::time::Duration) -> bool {
+        wait_for_cached_element_keyboard_focus(self.admitted, timeout)
+    }
+
+    fn live_bounds(&mut self) -> super::foreground_focus::LiveBounds {
+        // Keyboard focus can only be confirmed on a UIA element, so an MSAA
+        // element gets no fallback click: it could only disturb the window.
+        self.admitted
+            .as_ref()
+            .filter(|element| element.is_uia())
+            .map(|element| element.live_bounds())
+            .unwrap_or(super::foreground_focus::LiveBounds::Unknown)
+    }
+
+    fn onscreen_point(&mut self, (cx, cy): (i32, i32)) -> Result<(i32, i32), ToolResult> {
+        resolve_onscreen_point_with_scroll(
+            self.admitted,
+            self.hwnd,
+            self.element_index,
+            cx,
+            cy,
+            "the focus click",
+        )
+    }
+
+    fn click(&mut self, (x, y): (i32, i32)) -> anyhow::Result<()> {
+        crate::input::send_click_synthesized_active_mods(self.hwnd, x, y, 1, "left", &[])
+    }
+}
+
 /// Establish exact UIA child focus after the owning top-level HWND is already
-/// confirmed foreground. Chromium providers sometimes reject UIA `SetFocus`;
-/// in that case a real click at the accessibility-derived center is the
-/// bounded fallback. Both routes require `CurrentHasKeyboardFocus` read-back
-/// before any keyboard input is allowed to leave the driver.
+/// confirmed foreground; see [`super::foreground_focus::focus_for_foreground`].
+/// A failed `SetFocus` falls back to a click at the element's live centre,
+/// never the centre cached at read time, and an element UIA reports as gone
+/// gets no click at all.
 fn focus_cached_element_for_foreground(
     admitted: &Option<crate::uia::snapshot::RetainedElement>,
     hwnd: u64,
     element_index: usize,
-    click_point: Option<(i32, i32)>,
 ) -> anyhow::Result<()> {
-    // `fg_bypass` is a background-only shield: for Chromium it disables the
-    // top-level HWND while UIA runs so the provider cannot self-activate. A
-    // disabled foreground window immediately loses foreground on Windows,
-    // which would make the enclosing verify-before-SendInput transaction
-    // fail closed. The foreground route has already activated the exact HWND,
-    // so focus the cached element directly and verify it below.
-    let set_focus = admitted
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("missing admitted element"))
-        .and_then(|element| element.focus_element());
-    if set_focus.is_ok()
-        && wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(350))
-    {
-        return Ok(());
-    }
-
-    if let Some((x, y)) = click_point {
-        crate::input::send_click_synthesized_active_mods(hwnd, x, y, 1, "left", &[])?;
-        if wait_for_cached_element_keyboard_focus(admitted, std::time::Duration::from_millis(500)) {
-            return Ok(());
-        }
-    }
-
-    let detail = set_focus
-        .err()
-        .map(|error| format!("; UIA SetFocus failed: {error}"))
-        .unwrap_or_default();
-    anyhow::bail!(
-        "foreground_unavailable: Windows did not confirm keyboard focus on exact UIA element \
-         [{element_index}] in HWND 0x{hwnd:x}{detail}; no keyboard input was sent"
+    super::foreground_focus::focus_for_foreground(
+        &mut CachedElementFocus {
+            admitted,
+            hwnd,
+            element_index,
+        },
+        hwnd,
+        element_index,
     )
+}
+
+/// One foreground SendInput tap on a cached element, as
+/// [`super::foreground_focus::foreground_tap`] runs it: the live rectangle,
+/// the same on-screen check the cached point used to get, then an activating
+/// SendInput click. `recorded` is the point the recording hook already saw.
+struct ElementTap {
+    admitted: Option<crate::uia::snapshot::RetainedElement>,
+    hwnd: u64,
+    pid: u32,
+    element_index: usize,
+    action_verb: &'static str,
+    /// UIA scroll-into-view and re-centre before trusting the rectangle
+    /// (modified selection in WPF ScrollViewers).
+    recenter_first: bool,
+    /// MSAA routes never had an on-screen check; keep them as they were.
+    onscreen_check: bool,
+    recorded: (i32, i32),
+    count: usize,
+    button: String,
+    modifiers: Vec<String>,
+}
+
+impl super::foreground_focus::TapTarget for ElementTap {
+    fn live_bounds(&mut self) -> super::foreground_focus::LiveBounds {
+        self.admitted
+            .as_ref()
+            .map(|element| element.live_bounds())
+            .unwrap_or(super::foreground_focus::LiveBounds::Unknown)
+    }
+
+    fn onscreen_point(&mut self, (cx, cy): (i32, i32)) -> Result<(i32, i32), ToolResult> {
+        let (cx, cy) = if self.recenter_first {
+            self.admitted
+                .as_ref()
+                .filter(|retained| retained.is_uia())
+                .and_then(|retained| unsafe {
+                    crate::uia::scroll::scroll_into_view_and_recenter(self.hwnd, retained.as_ptr())
+                })
+                .unwrap_or((cx, cy))
+        } else {
+            (cx, cy)
+        };
+        if !self.onscreen_check {
+            return Ok((cx, cy));
+        }
+        resolve_onscreen_point_with_scroll(
+            &self.admitted,
+            self.hwnd,
+            self.element_index,
+            cx,
+            cy,
+            self.action_verb,
+        )
+    }
+
+    fn send(&mut self, (x, y): (i32, i32)) -> anyhow::Result<()> {
+        if (x, y) != self.recorded {
+            crate::recording_hooks::capture_dispatch_click_target(self.hwnd, self.pid, x, y);
+        }
+        let modifiers: Vec<&str> = self.modifiers.iter().map(String::as_str).collect();
+        crate::input::send_click_synthesized_active_mods(
+            self.hwnd,
+            x,
+            y,
+            self.count,
+            &self.button,
+            &modifiers,
+        )
+    }
+}
+
+/// Run one [`ElementTap`] on a blocking thread (UIA reads, then SendInput).
+async fn run_foreground_tap(
+    mut tap: ElementTap,
+    pick: fn((i32, i32, i32, i32)) -> (i32, i32),
+) -> anyhow::Result<(i32, i32)> {
+    tokio::task::spawn_blocking(move || super::foreground_focus::foreground_tap(&mut tap, pick))
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("Task error: {error}")))
+}
+
+/// Before a foreground route for an element activates the window: read the
+/// element live and refuse it as a stale token when UIA reports it gone, so a
+/// control the app removed after the read costs no activation and no input.
+async fn dead_foreground_element_refusal(
+    state: &ToolState,
+    pid: i32,
+    admitted: &Option<crate::uia::snapshot::RetainedElement>,
+) -> Option<ToolResult> {
+    let element = admitted.clone()?;
+    let bounds = tokio::task::spawn_blocking(move || element.live_bounds())
+        .await
+        .unwrap_or(super::foreground_focus::LiveBounds::Unknown);
+    super::foreground_focus::require_live(bounds)
+        .err()
+        .map(|_| state.snapshots.dead_element_refusal(pid))
 }
 
 static TYPE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -4733,9 +4860,11 @@ impl Tool for TypeTextTool {
         // rejected (daemon not at UIAccess integrity), it returns an error
         // rather than a false success.
         if delivery == DeliveryMode::Foreground {
-            // Resolve the optional click fallback before entering the atomic
-            // activation/focus/input transaction. The focus itself happens
-            // only after exact top-level foreground is confirmed.
+            // Check the element before entering the atomic activation/focus/
+            // input transaction: a control the app removed after the read is
+            // refused as stale, and one that is off-screen is refused, both
+            // before activation. The focus itself happens only after exact
+            // top-level foreground is confirmed.
             let focus_target = if let Some(idx) = elem_idx {
                 let (cx, cy) = match admitted.as_ref().map(|element| element.center) {
                     Some(center) => center,
@@ -4745,7 +4874,12 @@ impl Tool for TypeTextTool {
                     ))
                     }
                 };
-                let (cx, cy) = match resolve_onscreen_point_with_scroll(
+                if let Some(refusal) =
+                    dead_foreground_element_refusal(&self.state, pid as i32, &admitted).await
+                {
+                    return refusal;
+                }
+                if let Err(result) = resolve_onscreen_point_with_scroll(
                     &admitted,
                     hwnd,
                     idx as usize,
@@ -4753,10 +4887,9 @@ impl Tool for TypeTextTool {
                     cy,
                     "foreground typing",
                 ) {
-                    Ok(point) => point,
-                    Err(result) => return result,
-                };
-                Some((idx as usize, (cx, cy)))
+                    return result;
+                }
+                Some(idx as usize)
             } else {
                 None
             };
@@ -4766,8 +4899,8 @@ impl Tool for TypeTextTool {
                 move || {
                     let _admission = &admitted;
                     crate::input::send_text_synthesized_after_focus(hwnd, &text_fg, || {
-                        if let Some((idx, point)) = focus_target {
-                            focus_cached_element_for_foreground(&admitted, hwnd, idx, Some(point))?;
+                        if let Some(idx) = focus_target {
+                            focus_cached_element_for_foreground(&admitted, hwnd, idx)?;
                         }
                         Ok(())
                     })
@@ -4786,7 +4919,9 @@ impl Tool for TypeTextTool {
                     // foreground IS the escalated rung (mirrors macOS PATH_KEY_EVENTS_FG).
                     "effect": "unverifiable",
                 })),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
+                Ok(Err(e)) => super::foreground_focus::error_result(e, || {
+                    self.state.snapshots.dead_element_refusal(pid as i32)
+                }),
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -5478,18 +5613,24 @@ impl Tool for PressKeyTool {
         // Skipped when px-focus already fronted/clicked the target — the key then
         // goes via the plain background post path below.
         if !px_focus && delivery == DeliveryMode::Foreground {
-            let focus_target = elem_idx.map(|idx| {
-                let point = admitted.as_ref().map(|element| element.center);
-                (idx as usize, point)
-            });
+            let focus_target = elem_idx.map(|idx| idx as usize);
+            // A key addressed to a control the app removed after the read is
+            // refused as stale before the window is activated.
+            if focus_target.is_some() {
+                if let Some(refusal) =
+                    dead_foreground_element_refusal(&self.state, pid as i32, &admitted).await
+                {
+                    return refusal;
+                }
+            }
             let send_result = tokio::task::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
                     let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                     crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
-                        if let Some((idx, point)) = focus_target {
-                            focus_cached_element_for_foreground(&admitted, hwnd, idx, point)?;
+                        if let Some(idx) = focus_target {
+                            focus_cached_element_for_foreground(&admitted, hwnd, idx)?;
                         }
                         Ok(())
                     })
@@ -5500,7 +5641,9 @@ impl Tool for PressKeyTool {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "✅ Sent {key_display} via SendInput on pid {raw_pid} (delivery_mode:foreground)."
                 )),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
+                Ok(Err(e)) => super::foreground_focus::error_result(e, || {
+                    self.state.snapshots.dead_element_refusal(pid as i32)
+                }),
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -5883,10 +6026,16 @@ impl Tool for HotkeyTool {
         // global modifier state, so Chromium never observes Ctrl+Shift+H as a
         // chord even though the renderer control is focused.
         let use_send_input = delivery == DeliveryMode::Foreground;
-        let focus_target = elem_idx.map(|idx| {
-            let point = admitted.as_ref().map(|element| element.center);
-            (idx, point)
-        });
+        let focus_target = elem_idx;
+        // A chord addressed to a control the app removed after the read is
+        // refused as stale before the window is activated.
+        if use_send_input && focus_target.is_some() {
+            if let Some(refusal) =
+                dead_foreground_element_refusal(&self.state, pid as i32, &admitted).await
+            {
+                return refusal;
+            }
+        }
         let result = tokio::task::spawn_blocking({
             let admitted = admitted.clone();
             move || {
@@ -5894,8 +6043,8 @@ impl Tool for HotkeyTool {
                 let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                 if use_send_input {
                     crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
-                        if let Some((idx, point)) = focus_target {
-                            focus_cached_element_for_foreground(&admitted, hwnd, idx, point)?;
+                        if let Some(idx) = focus_target {
+                            focus_cached_element_for_foreground(&admitted, hwnd, idx)?;
                         }
                         Ok(())
                     })
@@ -5915,7 +6064,9 @@ impl Tool for HotkeyTool {
                 "✅ Pressed {key_display} on pid {raw_pid} via {path} \
                  (Win32 target)."
             )),
-            Ok(Err(e)) => ToolResult::error(e.to_string()),
+            Ok(Err(e)) => super::foreground_focus::error_result(e, || {
+                self.state.snapshots.dead_element_refusal(pid as i32)
+            }),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
@@ -6847,33 +6998,37 @@ impl Tool for DoubleClickTool {
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
                 };
             }
-            // delivery_mode:"foreground" — route through SendInput at the cached coords.
+            // delivery_mode:"foreground" — route through SendInput at the live centre.
             if delivery == DeliveryMode::Foreground {
+                // The tap goes to the centre of the element's live rectangle,
+                // after the same on-screen check; a control the app removed
+                // after the read is refused as stale before anything is sent.
+                let tap = ElementTap {
+                    admitted: admitted.clone(),
+                    hwnd,
+                    pid,
+                    element_index: idx,
+                    action_verb: "double-clicking",
+                    recenter_first: false,
+                    onscreen_check: true,
+                    recorded: (cx, cy),
+                    count: 2,
+                    button: "left".to_owned(),
+                    modifiers: Vec::new(),
+                };
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking({
-                    let admitted = admitted.clone();
-                    move || {
-                        let _admission = &admitted;
-                        crate::input::send_click_synthesized_active_mods(
-                            hwnd,
-                            cx,
-                            cy,
-                            2,
-                            "left",
-                            &[],
-                        )
-                    }
-                })
-                .await;
+                let send_result =
+                    run_foreground_tap(tap, super::foreground_focus::live_center).await;
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
-                    Ok(Ok(())) => ToolResult::text(format!(
+                    Ok((cx, cy)) => ToolResult::text(format!(
                         "✅ Sent double-click via SendInput on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
                     )),
-                    Ok(Err(e)) => ToolResult::error(e.to_string()),
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Err(e) => super::foreground_focus::error_result(e, || {
+                        self.state.snapshots.dead_element_refusal(pid as i32)
+                    }),
                 };
             }
             // Chromium/Electron silently drops PostMessage clicks (#1984) — route via SendInput.
@@ -7210,31 +7365,35 @@ impl Tool for RightClickTool {
                 };
             }
             if delivery == DeliveryMode::Foreground {
+                // The tap goes to the centre of the element's live rectangle,
+                // after the same on-screen check; a control the app removed
+                // after the read is refused as stale before anything is sent.
+                let tap = ElementTap {
+                    admitted: admitted.clone(),
+                    hwnd,
+                    pid,
+                    element_index: idx,
+                    action_verb: "right-clicking",
+                    recenter_first: false,
+                    onscreen_check: true,
+                    recorded: (cx, cy),
+                    count: 1,
+                    button: "right".to_owned(),
+                    modifiers: Vec::new(),
+                };
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking({
-                    let admitted = admitted.clone();
-                    move || {
-                        let _admission = &admitted;
-                        crate::input::send_click_synthesized_active_mods(
-                            hwnd,
-                            cx,
-                            cy,
-                            1,
-                            "right",
-                            &[],
-                        )
-                    }
-                })
-                .await;
+                let send_result =
+                    run_foreground_tap(tap, super::foreground_focus::live_center).await;
                 tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
                 return match send_result {
-                    Ok(Ok(())) => ToolResult::text(format!(
+                    Ok((cx, cy)) => ToolResult::text(format!(
                         "✅ Sent right-click via SendInput on [{idx}] at screen ({cx},{cy}) (delivery_mode:foreground)."
                     )),
-                    Ok(Err(e)) => ToolResult::error(e.to_string()),
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Err(e) => super::foreground_focus::error_result(e, || {
+                        self.state.snapshots.dead_element_refusal(pid as i32)
+                    }),
                 };
             }
             // Chromium/Electron silently drops PostMessage clicks (#1984) — route via SendInput.
