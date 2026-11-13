@@ -1870,48 +1870,76 @@ mod tests {
         assert!(partial.escalation.is_none());
     }
 
-    /// A Windows foreground element scroll that stopped part-way reports its
-    /// completed steps as `delivery.delivered_count`; the record keeps them.
+    /// The `scroll_incomplete` reply of a Windows element scroll that stopped
+    /// part-way, as the driver returns it for a `delivery_mode` outcome.
+    fn part_way_element_scroll_reply(delivery_mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "amount": 3,
+            "code": "scroll_incomplete",
+            "completed_steps": 1,
+            "delivery": {"delivered_count": 1},
+            "delivery_mode": delivery_mode,
+            "effect": "partial",
+            "element_index": 215,
+            "escalation": {
+                "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more.",
+                "recommended": "verify_state"
+            },
+            "path": "uia",
+            "retryable": false,
+            "wheel_sent": false,
+            "window_id": 393232
+        })
+    }
+
+    fn element_scroll_args(delivery_mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "direction": "down",
+            "amount": 3,
+            "pid": 7064,
+            "element_token": "s0000002d:215",
+            "delivery_mode": delivery_mode
+        })
+    }
+
+    /// A Windows element scroll that stopped part-way reports its completed
+    /// steps as `delivery.delivered_count`, and the route it actually took as
+    /// `delivery_mode`; the record keeps both, whatever the request asked for.
     #[test]
     fn a_part_way_element_scroll_records_its_delivered_count() {
+        for requested in ["background", "foreground"] {
+            let record = ActionExecutionRecord::from_legacy(
+                "scroll",
+                &element_scroll_args(requested),
+                &part_way_element_scroll_reply("background"),
+            )
+            .expect("a part-way scroll should normalize");
+            assert_eq!(record.effect, ActionEffect::Partial, "{requested}");
+            assert_eq!(record.delivered_count, Some(1), "{requested}");
+            assert_eq!(
+                record.actual_delivery,
+                Some(ActualDelivery::Background),
+                "requested {requested}"
+            );
+            let public = record.public_result().expect("partial should project");
+            assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
+            assert_eq!(
+                public
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.delivered_count),
+                Some(1)
+            );
+        }
+        // The element's window was left in front: the reply says foreground.
         let record = ActionExecutionRecord::from_legacy(
             "scroll",
-            &serde_json::json!({
-                "direction": "down",
-                "amount": 3,
-                "pid": 7064,
-                "element_token": "s0000002d:215",
-                "delivery_mode": "foreground"
-            }),
-            &serde_json::json!({
-                "amount": 3,
-                "code": "scroll_incomplete",
-                "completed_steps": 1,
-                "delivery": {"delivered_count": 1},
-                "effect": "partial",
-                "element_index": 215,
-                "escalation": {
-                    "reason": "The element scrolled part of the way before its UIA scroll failed, and no wheel was sent; read the window again before scrolling more.",
-                    "recommended": "verify_state"
-                },
-                "path": "uia",
-                "retryable": false,
-                "wheel_sent": false,
-                "window_id": 393232
-            }),
+            &element_scroll_args("foreground"),
+            &part_way_element_scroll_reply("foreground"),
         )
         .expect("a part-way scroll should normalize");
-        assert_eq!(record.effect, ActionEffect::Partial);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Foreground));
         assert_eq!(record.delivered_count, Some(1));
-        let public = record.public_result().expect("partial should project");
-        assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
-        assert_eq!(
-            public
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.delivered_count),
-            Some(1)
-        );
     }
 
     #[test]
