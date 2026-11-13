@@ -4637,13 +4637,13 @@ impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
         let Some(retained) = self.admitted.as_ref().filter(|retained| retained.is_uia()) else {
             return super::foreground_focus::SemanticScroll::NotDispatched;
         };
-        let steps = unsafe {
+        let steps = without_scroll_activation(self.hwnd, || unsafe {
             crate::uia::scroll::scroll_element_steps(
                 retained.as_ptr(),
                 &self.direction,
                 self.amount,
             )
-        };
+        });
         super::foreground_focus::semantic_scroll_from(
             steps.map_err(|stopped| (stopped.completed, stopped.error.to_string())),
         )
@@ -4663,6 +4663,39 @@ impl super::foreground_focus::ScrollTarget for ElementScrollTarget {
     fn wheel(&mut self, (x, y): (i32, i32)) -> anyhow::Result<()> {
         crate::input::send_wheel_synthesized(x, y, self.ticks, self.horizontal)
     }
+}
+
+/// Run a foreground element's own UIA scroll without letting it bring the
+/// window forward: a provider can activate its window from inside
+/// `ScrollPattern::Scroll`. The same protection as the background element
+/// scroll: `WS_EX_NOACTIVATE` on the target's root through the call and 50 ms
+/// after it, then, when the foreground moved into the target's root, the
+/// earlier window is put back. Applies to every outcome of the call. Runs on a
+/// blocking thread.
+fn without_scroll_activation<T>(hwnd: u64, scroll: impl FnOnce() -> T) -> T {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+    let target = HWND(hwnd as *mut _);
+    let previous = unsafe { GetForegroundWindow() };
+    let _noact = crate::input::NoActivateGuard::arm(target);
+    let result = scroll();
+    // Keep WS_EX_NOACTIVATE armed through any handler queued by the call.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let current = unsafe { GetForegroundWindow() };
+    let current_root = unsafe { GetAncestor(current, GA_ROOT) };
+    let target_root = unsafe { GetAncestor(target, GA_ROOT) };
+    if !previous.0.is_null()
+        && current != previous
+        && !target_root.0.is_null()
+        && current_root == target_root
+    {
+        unsafe {
+            crate::input::force_foreground_attached(previous);
+            std::thread::sleep(std::time::Duration::from_millis(12));
+            crate::input::force_foreground_attached(previous);
+        }
+    }
+    result
 }
 
 /// Run one [`ElementTap`] on a blocking thread (UIA reads, then SendInput).

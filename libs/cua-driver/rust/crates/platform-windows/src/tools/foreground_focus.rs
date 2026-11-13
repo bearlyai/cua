@@ -224,10 +224,9 @@ pub(crate) enum SemanticScroll {
     Done,
     /// Nothing scrolled: the route was unavailable before any `Scroll` call
     /// (not a UIA element, no `ScrollPattern`, failed cast, unknown direction),
-    /// or the first call failed. A first-call error counts as not dispatched
-    /// because the call is synchronous and its error HRESULT is the provider
-    /// rejecting it; a real Windows run has to confirm that providers apply
-    /// nothing when they return one.
+    /// or the first call failed and the pattern's scroll position shows no
+    /// move (see [`steps_after_first_call_error`]). When the position can't be
+    /// read, a first-call error is still taken as not applied.
     NotDispatched,
     /// `completed` steps (at least one) scrolled, then a later one failed.
     Partial { completed: u32, error: String },
@@ -240,6 +239,22 @@ pub(crate) fn semantic_scroll_from(result: Result<(), (u32, String)>) -> Semanti
         Ok(()) => SemanticScroll::Done,
         Err((0, _)) => SemanticScroll::NotDispatched,
         Err((completed, error)) => SemanticScroll::Partial { completed, error },
+    }
+}
+
+/// Steps to count for a first `Scroll` call that returned an error:
+/// 1 when both readings exist and differ on either axis, else 0.
+///
+/// A reading is the pattern's `(horizontal, vertical)` scroll percent, `None`
+/// when either getter failed or returned NaN. `-1.0` is UIA's "no scroll on
+/// this axis" and compares like any other value.
+pub(crate) fn steps_after_first_call_error(
+    before: Option<(f64, f64)>,
+    after: Option<(f64, f64)>,
+) -> u32 {
+    match (before, after) {
+        (Some(before), Some(after)) if before.0 != after.0 || before.1 != after.1 => 1,
+        _ => 0,
     }
 }
 
@@ -1193,6 +1208,54 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A first `Scroll` call that errored after the position moved counts as
+    /// one step, on either axis.
+    #[test]
+    fn a_first_scroll_error_after_a_vertical_move_counts_one_step() {
+        assert_eq!(
+            steps_after_first_call_error(Some((-1.0, 40.0)), Some((-1.0, 55.0))),
+            1
+        );
+    }
+
+    #[test]
+    fn a_first_scroll_error_after_a_horizontal_move_counts_one_step() {
+        assert_eq!(
+            steps_after_first_call_error(Some((10.0, -1.0)), Some((25.0, -1.0))),
+            1
+        );
+    }
+
+    /// An unchanged position is no step, including `-1` ("no scroll on this
+    /// axis") on one axis.
+    #[test]
+    fn a_first_scroll_error_with_the_position_unchanged_counts_no_step() {
+        assert_eq!(
+            steps_after_first_call_error(Some((0.0, 40.0)), Some((0.0, 40.0))),
+            0
+        );
+    }
+
+    #[test]
+    fn a_first_scroll_error_with_an_unscrollable_axis_unchanged_counts_no_step() {
+        assert_eq!(
+            steps_after_first_call_error(Some((-1.0, 40.0)), Some((-1.0, 40.0))),
+            0
+        );
+    }
+
+    /// Without both readings the move can't be shown, so the error is taken
+    /// as not applied.
+    #[test]
+    fn a_first_scroll_error_without_a_reading_before_counts_no_step() {
+        assert_eq!(steps_after_first_call_error(None, Some((-1.0, 55.0))), 0);
+    }
+
+    #[test]
+    fn a_first_scroll_error_without_a_reading_after_counts_no_step() {
+        assert_eq!(steps_after_first_call_error(Some((-1.0, 40.0)), None), 0);
     }
 
     /// A SetFocus that succeeds needs no click and no live read.

@@ -140,7 +140,9 @@ pub struct ScrollStepsError {
     /// `ScrollPattern::Scroll` calls that returned success before the error.
     /// Zero when the route was unavailable before the first call (null or
     /// non-scrollable element, failed cast, unknown direction) or the first
-    /// call itself failed.
+    /// call itself failed, unless the pattern's scroll position, read before
+    /// and after that call, shows it moved: then one. When the position can't
+    /// be read, a failed first call is still taken as not applied.
     pub completed: u32,
     pub error: anyhow::Error,
 }
@@ -148,7 +150,11 @@ pub struct ScrollStepsError {
 /// [`scroll_element`], reporting how many of its `amount.max(1)` separate
 /// `ScrollPattern::Scroll` calls succeeded before an error. Each call is a
 /// synchronous request the provider either applies or rejects with an error
-/// HRESULT, so a failed call is taken as not applied.
+/// HRESULT, so a failed call is taken as not applied, with one check: when
+/// the first call fails, the pattern's horizontal and vertical scroll percent
+/// read before it and after the error decide, and a position that moved
+/// counts that call as one step. When the position can't be read, the failed
+/// first call is still taken as not applied.
 ///
 /// # Safety
 /// `element_ptr` must be a live `IUIAutomationElement` that the caller keeps
@@ -189,16 +195,30 @@ pub unsafe fn scroll_element_steps(
         }
     };
     let horizontal = matches!(direction, "left" | "right");
+    // `(horizontal, vertical)` scroll percent; `None` when either can't be read.
+    let position = || -> Option<(f64, f64)> {
+        let h = scroll.CurrentHorizontalScrollPercent().ok()?;
+        let v = scroll.CurrentVerticalScrollPercent().ok()?;
+        (!h.is_nan() && !v.is_nan()).then_some((h, v))
+    };
+    let before = position();
     for completed in 0..amount.max(1) {
         let result = if horizontal {
             scroll.Scroll(vertical, ScrollAmount_NoAmount)
         } else {
             scroll.Scroll(ScrollAmount_NoAmount, vertical)
         };
-        result.map_err(|e| ScrollStepsError {
-            completed,
-            error: anyhow::anyhow!("UIA scroll failed: {e}"),
-        })?;
+        if let Err(e) = result {
+            let completed = if completed == 0 {
+                crate::tools::foreground_focus::steps_after_first_call_error(before, position())
+            } else {
+                completed
+            };
+            return Err(ScrollStepsError {
+                completed,
+                error: anyhow::anyhow!("UIA scroll failed: {e}"),
+            });
+        }
     }
     Ok(())
 }
