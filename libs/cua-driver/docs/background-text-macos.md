@@ -335,22 +335,73 @@ Token validation retains `invalid_element_token`, `stale_element_token`, and
 A stale-token response additionally carries `current_snapshots: [{snapshot_id,
 window_id}]`; consumers should refresh the window snapshot.
 `stale_element_token` also covers a control that no longer exists at foreground
-dispatch: the token's snapshot is still current, but a live read just before a
+dispatch: the token's snapshot is still current, but a live read made before a
 foreground step addressed by the token finds the element gone. The envelope is
 the same, with the message `element_token is stale; call get_window_state again
 to refresh; the element could not be found live in the app, so nothing was
-activated or sent; current snapshots for pid …`. Nothing was activated, clicked
-or sent.
+activated or sent; current snapshots for pid …`. This refusal is only returned
+by checks made before anything was activated, focused, clicked or sent.
 
-- On macOS the live read is the element's role. Only `-25202` (invalid element)
-  counts as gone; any other error lets the step run as before.
-- On Windows the live read is the element's current rectangle (UIA, or MSAA
-  `accLocation`). `UIA_E_ELEMENTNOTAVAILABLE` counts as gone. A foreground step
-  that sends input at the element's position (a click or tap) uses the centre
-  of that live rectangle, never the one cached at read time, so it is also
-  refused this way when the rectangle cannot be read or is empty. Foreground
-  keys and text first ask UIA to focus the element; only their fallback focus
-  click needs the live rectangle.
+Which foreground routes check, before they act:
+
+- macOS: `click` (the pointer, HID and assist dispatches and the middle-button
+  arm), `press_key` (before any focus write; the only focus write on a
+  foreground request is the one inside the activated key transaction),
+  `hotkey` (before the web-content hit-test, the focus click and the chord),
+  `type_text` (both foreground routes), `scroll` (before the text-area scroll,
+  the wheel and the key fallback) and `double_click` by element (before
+  `AXOpen` or its click). The live read is the element's role. Only `-25202`
+  (invalid element) counts as gone; any other error lets the step run as
+  before.
+- Windows: typing, `press_key` and `hotkey` read the element's current
+  rectangle before the window is activated. Clicks, double-clicks and
+  right-clicks by element, and the wheel fallback of `scroll` by element, send
+  their input at the centre of the live rectangle (UIA, or MSAA `accLocation`)
+  after the on-screen check, never at the point cached at read time; the
+  cached point is no longer checked on foreground requests, only on background
+  ones. `UIA_E_ELEMENTNOTAVAILABLE` counts as gone. A click or wheel is also
+  refused this way when the live rectangle can't be read or is empty. A
+  refused click doesn't start the restore of the earlier foreground window.
+- **Changed:** a foreground Windows `scroll` by element whose own UIA scroll
+  fails now sends the wheel at the element's live centre (or the caller's x,y),
+  not at the window centre. The wheel doesn't bring the window forward, so a
+  window on top of the element can still take it.
+
+The check is a probe, not atomic with the action. A control that the app
+removes after the check but before the input lands is not caught. Ordinary
+errors from the later steps are reported as before.
+
+On Windows, a control that disappears after the keyboard transaction has
+already activated the window gets an honest failure, never the no-effects
+stale refusal (activation may also have used the driver's no-op
+activation-assist key):
+
+```json
+{
+  "content": [{"type": "text", "text": "foreground_element_lost: HWND 0x… was brought to the front, then UIA element [N] was no longer available; no keys or text were sent. Read the window again before acting."}],
+  "isError": true,
+  "structuredContent": {
+    "code": "foreground_element_lost", "effect": "failed", "activated": true,
+    "keystrokes_sent": false, "focus_click_sent": false,
+    "window_id": 0, "element_index": 0, "retryable": false,
+    "escalation": {"recommended": "verify_state", "reason": "The window was brought to the front and no keys or text were sent; read the window again before acting."}
+  }
+}
+```
+
+The other failures inside that transaction (focus not confirmed, or the
+fallback focus click refused as off-screen) now have the same shape with
+`code: "foreground_unavailable"`; `focus_click_sent` says whether the fallback
+click was sent. None is `status: "refused"`.
+
+MSAA elements get no focus-fallback click on Windows keys and text: keyboard
+focus can't be confirmed on them, so a click could only disturb the window.
+
+Exceptions that never take the foreground and so have no foreground check:
+`right_click` by element on macOS (`AXShowMenu`, or a click posted to the
+process) and `click` with `action: "expand"` on Windows (UIA
+`ExpandCollapsePattern`). Background routes are unchanged; some of them still
+send input at the point cached at read time.
 Malformed arguments may return only `content` and `isError:true`, with no code.
 
 `SCREEN_SHARING_REQUIRES_FOREGROUND_HID` is another pre-dispatch refusal; its
