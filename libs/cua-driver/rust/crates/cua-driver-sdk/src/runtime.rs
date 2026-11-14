@@ -768,6 +768,50 @@ mod tests {
         assert!(violations.is_empty(), "{violations:#?}");
     }
 
+    /// Calls the Bearly desktop app and dashboard send, one row per call shape.
+    const BEARLY_HOST_CALLS: &str =
+        include_str!("../../../../compat-fixtures/bearly-host-calls.json");
+
+    #[test]
+    fn every_bearly_host_call_names_a_registered_tool_and_no_unknown_argument() {
+        let platform = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "linux"
+        };
+        let fixture: serde_json::Value = serde_json::from_str(BEARLY_HOST_CALLS).unwrap();
+        let registry = build_registry(&RuntimeOptions::embedded(false));
+        let mut checked = 0;
+        let mut refused = Vec::new();
+        for row in fixture["calls"].as_array().unwrap() {
+            let listed = row["platforms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == platform);
+            if !listed {
+                continue;
+            }
+            checked += 1;
+            let tool = row["tool"].as_str().unwrap();
+            let caller = row["caller"].as_str().unwrap();
+            match registry.get_def(tool) {
+                None => refused.push(format!("{tool} ({caller}): not registered")),
+                Some(def) => {
+                    if let Some(name) = def.unknown_argument(&row["args"]) {
+                        refused.push(format!("{tool} ({caller}): unknown argument {name}"));
+                    }
+                }
+            }
+        }
+        if platform != "linux" {
+            assert!(checked > 0, "no fixture rows list {platform}");
+        }
+        assert!(refused.is_empty(), "{refused:#?}");
+    }
+
     #[test]
     fn canonical_inventory_advertises_unavailable_perception_tool() {
         let inventory = tool_inventory(RuntimeOptions::embedded(false));

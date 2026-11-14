@@ -1,0 +1,552 @@
+{
+  "description": "Tool calls the Bearly desktop app and dashboard send to the driver: each row is a tool name and an arguments object carrying every key that caller can send. Values are representative. Every row must name a registered tool and contain no argument the tool's advertised schema would refuse as unknown on each listed platform.",
+  "cli": [
+    {
+      "args": [
+        "serve",
+        "--embedded",
+        "--host-bundle-id",
+        "com.bearly.app",
+        "--socket",
+        "<socket>"
+      ],
+      "env": [
+        "CUA_DRIVER_EMBEDDED=1",
+        "CUA_DRIVER_HOST_BUNDLE_ID=com.bearly.app"
+      ]
+    },
+    {
+      "args": [
+        "status",
+        "--socket",
+        "<socket>"
+      ]
+    },
+    {
+      "args": [
+        "list-tools"
+      ]
+    },
+    {
+      "args": [
+        "call",
+        "<tool>",
+        "<json>",
+        "--socket",
+        "<socket>"
+      ]
+    },
+    {
+      "args": [
+        "--version"
+      ]
+    }
+  ],
+  "calls": [
+    {
+      "tool": "check_permissions",
+      "caller": "desktop app: permission check before computer use",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly",
+        "prompt": false
+      }
+    },
+    {
+      "tool": "set_config",
+      "caller": "desktop app: capture configuration before a call that names a capture scope",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "max_image_dimension": 1280
+      }
+    },
+    {
+      "tool": "start_session",
+      "caller": "dashboard: start or revive a run's session",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01"
+      }
+    },
+    {
+      "tool": "end_session",
+      "caller": "dashboard and desktop app: end a run's session",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01"
+      }
+    },
+    {
+      "tool": "health_report",
+      "caller": "dashboard: window tools version probe",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly",
+        "include": [
+          "binary_version"
+        ]
+      }
+    },
+    {
+      "tool": "list_windows",
+      "caller": "dashboard: list windows",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01"
+      }
+    },
+    {
+      "tool": "get_desktop_state",
+      "caller": "use_computer: desktop screenshot",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01"
+      }
+    },
+    {
+      "tool": "get_window_state",
+      "caller": "use_computer: inspect a window's elements",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "include_screenshot": false,
+        "max_elements": 500,
+        "max_depth": 30
+      }
+    },
+    {
+      "tool": "get_window_state",
+      "caller": "use_computer: window screenshot scale",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "max_elements": 1
+      }
+    },
+    {
+      "tool": "get_window_state",
+      "caller": "window tools: look at a window",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "include_screenshot": true,
+        "max_elements": 500
+      }
+    },
+    {
+      "tool": "move_cursor",
+      "caller": "use_computer: move the pointer",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "x": 640,
+        "y": 400
+      }
+    },
+    {
+      "tool": "click",
+      "caller": "use_computer: click a desktop point",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "x": 640,
+        "y": 400,
+        "button": "left",
+        "count": 1,
+        "modifier": [],
+        "scope": "desktop"
+      }
+    },
+    {
+      "tool": "click",
+      "caller": "use_computer: click an inspected element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "button": "left",
+        "scope": "window"
+      }
+    },
+    {
+      "tool": "click",
+      "caller": "window tools: click an element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "button": "left",
+        "count": 1,
+        "modifier": [],
+        "delivery_mode": "background"
+      }
+    },
+    {
+      "tool": "click",
+      "caller": "window tools: click a point in the latest look",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "x": 120,
+        "y": 80,
+        "capture_id": "cap",
+        "button": "left",
+        "count": 1,
+        "modifier": [],
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "double_click",
+      "caller": "window tools: double-click an element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "delivery_mode": "background"
+      }
+    },
+    {
+      "tool": "type_text",
+      "caller": "use_computer: type into an inspected element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "text": "hello"
+      }
+    },
+    {
+      "tool": "type_text",
+      "caller": "use_computer: type into the front window",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "text": "hello",
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "type_text",
+      "caller": "window tools: type into an element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "text": "hello",
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "type_text",
+      "caller": "window tools: type into an element in the background on macOS",
+      "platforms": [
+        "macos"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "text": "hello",
+        "insert_at": "caret",
+        "delivery_mode": "background"
+      }
+    },
+    {
+      "tool": "set_value",
+      "caller": "use_computer and window tools: set an element's value",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "value": "hello"
+      }
+    },
+    {
+      "tool": "click",
+      "caller": "window tools: toggle a checkbox",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "delivery_mode": "background"
+      }
+    },
+    {
+      "tool": "press_key",
+      "caller": "use_computer: press a key",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "key": "return",
+        "modifiers": [],
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "press_key",
+      "caller": "window tools: press a key on an element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "key": "return",
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "hotkey",
+      "caller": "use_computer: press a shortcut",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "keys": [
+          "ctrl",
+          "a"
+        ],
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "hotkey",
+      "caller": "window tools: press a shortcut on an element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "keys": [
+          "ctrl",
+          "a"
+        ],
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "scroll",
+      "caller": "use_computer: scroll at a point",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "x": 120,
+        "y": 80,
+        "direction": "down",
+        "amount": 3,
+        "by": "line",
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "scroll",
+      "caller": "window tools: scroll an element",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "element_token": "tok",
+        "direction": "down",
+        "amount": 3,
+        "by": "line",
+        "delivery_mode": "background"
+      }
+    },
+    {
+      "tool": "drag",
+      "caller": "use_computer: drag",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "from_x": 10,
+        "from_y": 10,
+        "to_x": 200,
+        "to_y": 120,
+        "button": "left",
+        "modifier": [],
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "drag",
+      "caller": "window tools: drag",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "from_x": 10,
+        "from_y": 10,
+        "to_x": 200,
+        "to_y": 120,
+        "duration_ms": 500,
+        "steps": 20,
+        "delivery_mode": "foreground"
+      }
+    },
+    {
+      "tool": "invoke_menu",
+      "caller": "window tools: choose a menu item",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001,
+        "path": [
+          "File",
+          "New"
+        ]
+      }
+    },
+    {
+      "tool": "bring_to_front",
+      "caller": "window tools: bring a window forward",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "pid": 4242,
+        "window_id": 1001
+      }
+    },
+    {
+      "tool": "launch_app",
+      "caller": "window tools: open an app on macOS",
+      "platforms": [
+        "macos"
+      ],
+      "args": {
+        "session": "bearly-chat-01",
+        "name": "TextEdit"
+      }
+    }
+  ]
+}

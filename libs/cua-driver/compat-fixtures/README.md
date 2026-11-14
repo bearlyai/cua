@@ -46,3 +46,20 @@ RFC 2549 independently accepts one additive CLI change: `cua-driver mcp
 Linux, signed app service on macOS), while `--socket` continues to select an
 explicit service. The semantic compatibility test permits that additive flag
 without rewriting the frozen `cli.json` baseline.
+
+## Bearly host calls
+
+`bearly-host-calls.json` lists the driver calls the Bearly desktop app and
+dashboard make: the CLI invocations, and one row per tool-call shape with a
+representative arguments object carrying every key that caller can send,
+plus the platforms it is sent on. Released desktop apps cannot change, so a
+driver must keep accepting every row.
+
+- `cua-driver-sdk`'s `every_bearly_host_call_names_a_registered_tool_and_no_unknown_argument`
+  checks every row listed for the platform it is compiled on: the tool is
+  registered and the dispatch argument check finds no unknown argument.
+- `platform-windows`'s `every_bearly_host_permission_check_is_accepted_on_windows`
+  checks the `check_permissions` rows against the Windows definition on every
+  host.
+
+Add a row when a host starts sending a new tool or argument.

@@ -52,4 +52,32 @@ mod tests {
             Some("promt".to_owned())
         );
     }
+
+    /// The Bearly desktop app's and dashboard's `check_permissions` calls,
+    /// checked against the Windows definition on every host.
+    #[test]
+    fn every_bearly_host_permission_check_is_accepted_on_windows() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../compat-fixtures/bearly-host-calls.json"
+        ))
+        .unwrap();
+        let def = check_permissions_def();
+        let rows: Vec<_> = fixture["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["tool"] == "check_permissions")
+            .filter(|row| {
+                row["platforms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == "windows")
+            })
+            .collect();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert_eq!(def.unknown_argument(&row["args"]), None, "{row}");
+        }
+    }
 }
