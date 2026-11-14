@@ -13,6 +13,8 @@ pub(crate) mod page;
 pub(crate) mod page_bookmark;
 // The `check_permissions` definition; ungated so its tests run on any host.
 pub(crate) mod check_permissions_def;
+// How `hotkey` splits its keys; ungated so its tests run on any host.
+pub(crate) mod hotkey_keys;
 // Pure title parsing for `page_bookmark`; ungated so its tests run on any host.
 pub(crate) mod page_title_marker;
 // Pure foreground-focus decisions for element-addressed keys and text; ungated

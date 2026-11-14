@@ -342,7 +342,9 @@ pub fn post_key(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
     // the target thread exposes one.
     let target = focused_descendant(hwnd_win).unwrap_or(hwnd_win);
     let vk = key_name_to_vk(key)?;
-    let has_alt = modifiers.iter().any(|m| *m == "alt" || *m == "menu");
+    let has_alt = modifiers
+        .iter()
+        .any(|m| *m == "alt" || *m == "menu" || *m == "option");
 
     let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) };
     let repeat_lp = |scan: u32, extended: bool, key_up: bool| {
@@ -915,6 +917,19 @@ fn key_name_to_vk(key: &str) -> Result<VIRTUAL_KEY> {
         }
     };
     Ok(vk)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod modifier_name_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+
+    #[test]
+    fn option_and_alt_both_hold_the_alt_key() {
+        assert_eq!(modifier_vk("option"), Some(VK_MENU));
+        assert_eq!(modifier_vk("alt"), Some(VK_MENU));
+        assert_eq!(modifier_vk("Option"), Some(VK_MENU));
+    }
 }
 
 #[cfg(test)]

@@ -373,7 +373,9 @@
         "pid": 4242,
         "window_id": 1001,
         "key": "return",
-        "modifiers": [],
+        "modifiers": [
+          "option"
+        ],
         "delivery_mode": "foreground"
       }
     },
@@ -405,8 +407,8 @@
         "pid": 4242,
         "window_id": 1001,
         "keys": [
-          "ctrl",
-          "a"
+          "option",
+          "F4"
         ],
         "delivery_mode": "foreground"
       }

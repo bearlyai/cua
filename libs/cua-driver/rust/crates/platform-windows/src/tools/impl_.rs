@@ -5816,13 +5816,6 @@ impl Tool for PressKeyTool {
 
 // ── hotkey ────────────────────────────────────────────────────────────────────
 
-fn is_modifier(k: &str) -> bool {
-    matches!(
-        k.to_lowercase().as_str(),
-        "ctrl" | "control" | "shift" | "alt" | "win" | "windows" | "cmd" | "command"
-    )
-}
-
 pub struct HotkeyTool {
     state: Arc<ToolState>,
 }
@@ -5897,19 +5890,7 @@ impl Tool for HotkeyTool {
                 return ToolResult::error("hotkey.keys must contain at least two keys.")
                     .with_structured(json!({ "code": "invalid_arguments" }));
             }
-            let mods: Vec<String> = input
-                .keys
-                .iter()
-                .filter(|key| is_modifier(key))
-                .cloned()
-                .collect();
-            let Some(key) = input
-                .keys
-                .iter()
-                .rev()
-                .find(|key| !is_modifier(key))
-                .cloned()
-            else {
+            let Some((key, mods)) = super::hotkey_keys::split_hotkey_keys(&input.keys) else {
                 return ToolResult::error("keys must include at least one non-modifier key.");
             };
             let full_keys = input.keys;
@@ -5949,12 +5930,10 @@ impl Tool for HotkeyTool {
             if keys.len() != raw.len() || keys.is_empty() {
                 return ToolResult::error("keys must be a non-empty array of strings.");
             }
-            let modifiers: Vec<String> = keys.iter().filter(|k| is_modifier(k)).cloned().collect();
-            let non_mods: Vec<String> = keys.iter().filter(|k| !is_modifier(k)).cloned().collect();
-            if non_mods.is_empty() {
+            let Some((key, modifiers)) = super::hotkey_keys::split_hotkey_keys(&keys) else {
                 return ToolResult::error("keys must include at least one non-modifier key.");
-            }
-            (non_mods.last().unwrap().clone(), modifiers, keys)
+            };
+            (key, modifiers, keys)
         } else if let Some(k) = args.get("key").and_then(|v| v.as_str()) {
             let m: Vec<String> = args
                 .get("modifiers")

@@ -785,6 +785,7 @@ fn canonical_accelerator_token(value: &str) -> String {
     let compact = value.trim().to_ascii_lowercase().replace([' ', '-'], "");
     match compact.as_str() {
         "control" => "ctrl".to_owned(),
+        "option" => "alt".to_owned(),
         "windows" | "window" | "meta" | "cmd" | "command" => "win".to_owned(),
         "return" => "enter".to_owned(),
         "esc" => "escape".to_owned(),
@@ -1072,6 +1073,18 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
     use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn an_option_shortcut_matches_its_alt_accelerator() {
+        assert_eq!(
+            canonical_accelerator("option+F4"),
+            canonical_accelerator("Alt+F4")
+        );
+        assert_eq!(
+            canonical_accelerator("option+F4").as_deref(),
+            Some("alt+f4")
+        );
+    }
 
     #[test]
     fn point_invoke_preserves_worker_outcomes() {
