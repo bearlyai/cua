@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory)][string]$Python,
     [Parameter(Mandatory)][string]$Output,
     [switch]$SkipHighControl,
-    [switch]$SkipLiveness
+    [switch]$SkipLiveness,
+    [switch]$SkipHostCalls
 )
 # Runs the background-input proof as a freshly created standard (non-administrator)
 # local user, so the regular driver and the fixtures run at medium integrity on the
@@ -21,6 +22,8 @@ $pythonw = Join-Path (Split-Path $Python) 'pythonw.exe'
 if (!(Test-Path $pythonw)) { throw "pythonw.exe not found next to $Python" }
 $proof = Join-Path $PSScriptRoot 'windows-background.py'
 $liveness = Join-Path $PSScriptRoot 'windows-liveness.py'
+$hostCalls = Join-Path $PSScriptRoot 'windows-host-calls.py'
+$hostCallsFixture = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\libs\cua-driver\compat-fixtures\bearly-host-calls.json'))
 
 Add-Type -TypeDefinition @'
 using System;
@@ -185,6 +188,32 @@ try {
     if (Test-Path (Join-Path $medium 'proof.log')) { Get-Content (Join-Path $medium 'proof.log') }
     if (Test-Path (Join-Path $medium 'proof-error.log')) { Get-Content (Join-Path $medium 'proof-error.log') }
     if ($code -ne 0) { $failure = "Medium proof exited $code" }
+
+    if (!$SkipHostCalls) {
+        # The desktop app's own driver calls, same standard user, own folder, own daemon.
+        $calls = Join-Path $Output 'host-calls'
+        New-Item -ItemType Directory -Force $calls | Out-Null
+        Copy-Item $hostCallsFixture (Join-Path $calls 'bearly-host-calls.json')
+        icacls $calls /grant "*${sid}:(OI)(CI)M" | Out-Null
+        $command = "`"$pythonw`" -I `"$hostCalls`" --driver `"$Driver`" --output `"$calls`" --fixture `"$(Join-Path $calls 'bearly-host-calls.json')`""
+        $callsPid = [uint32]0
+        $handle = [BearlyProofLauncher]::Start($user, $password, $command, $calls, 0, [ref]$callsPid)
+        Write-Host "Host calls proof pid: $callsPid"
+        $finished = Wait-Proof { [BearlyProofLauncher]::WaitForSingleObject($handle, 0) -eq 0 } $calls 300
+        if (!$finished) { [void][BearlyProofLauncher]::TerminateProcess($handle, 124) }
+        $code = [BearlyProofLauncher]::ExitCode($handle)
+        [BearlyProofLauncher]::Close($handle)
+        Write-Host "Host calls proof exit: $code"
+        if (Test-Path (Join-Path $calls 'summary.md')) {
+            Get-Content (Join-Path $calls 'summary.md')
+            if ($env:GITHUB_STEP_SUMMARY) {
+                Add-Content $env:GITHUB_STEP_SUMMARY "## Desktop app host calls (exit $code)`n"
+                Get-Content (Join-Path $calls 'summary.md') | Add-Content $env:GITHUB_STEP_SUMMARY
+            }
+        }
+        if (Test-Path (Join-Path $calls 'proof-error.log')) { Get-Content (Join-Path $calls 'proof-error.log') }
+        if ($code -ne 0 -and !$failure) { $failure = "Host calls proof exited $code" }
+    }
 
     if (!$SkipLiveness) {
         # Foreground liveness rows, same standard user, own folder, own daemon.

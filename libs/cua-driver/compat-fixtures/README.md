@@ -61,5 +61,9 @@ driver must keep accepting every row.
 - `platform-windows`'s `every_bearly_host_permission_check_is_accepted_on_windows`
   checks the `check_permissions` rows against the Windows definition on every
   host.
+- `scripts/bearly/windows-host-calls.py` replays the desktop app's sequence
+  against a built driver (on Windows through `scripts/bearly/windows-medium.ps1`
+  in the Windows evidence workflow) and checks every row against the running
+  daemon's advertised schemas.
 
 Add a row when a host starts sending a new tool or argument.
