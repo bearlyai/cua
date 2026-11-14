@@ -1911,6 +1911,15 @@
    "input_schema": {
     "additionalProperties": false,
     "properties": {
+     "probe_direct_capture": {
+      "description": "Accepted so one host call works on every platform. Windows has no permission prompt, so it changes nothing.",
+      "type": "boolean"
+     },
+     "prompt": {
+      "default": false,
+      "description": "Accepted so one host call works on every platform. Windows has no permission prompt, so it changes nothing.",
+      "type": "boolean"
+     },
      "session": {
       "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
       "type": "string"

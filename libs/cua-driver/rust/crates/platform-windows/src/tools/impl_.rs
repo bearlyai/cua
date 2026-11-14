@@ -8719,15 +8719,7 @@ static PERMS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 #[async_trait]
 impl Tool for CheckPermissionsTool {
     fn def(&self) -> &ToolDef {
-        PERMS_DEF.get_or_init(|| ToolDef {
-            name: "check_permissions".into(),
-            description: "Check required permissions for cua-driver-rs on Windows.".into(),
-            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
-            read_only: true,
-            destructive: false,
-            idempotent: true,
-            open_world: false,
-        })
+        PERMS_DEF.get_or_init(super::check_permissions_def::check_permissions_def)
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         // `elevated` reports the daemon's actual token integrity level, NOT the

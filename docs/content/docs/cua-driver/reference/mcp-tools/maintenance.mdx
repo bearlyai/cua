@@ -181,10 +181,24 @@ Returns: `accessibility` + `screen_recording` (booleans from the TCC preflight A
 
 Check required permissions for cua-driver-rs on Linux.
 
+**Linux parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="check_permissions--linux--probe_direct_capture"></span>`probe_direct_capture` | `boolean` |  | Accepted so one host call works on every platform. Linux has no permission prompt, so it changes nothing. |
+| <span id="check_permissions--linux--prompt"></span>`prompt` | `boolean` | `false` | Accepted so one host call works on every platform. Linux has no permission prompt, so it changes nothing. |
+
 </Tab>
 <Tab value="Windows">
 
 Check required permissions for cua-driver-rs on Windows.
+
+**Windows parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="check_permissions--windows--probe_direct_capture"></span>`probe_direct_capture` | `boolean` |  | Accepted so one host call works on every platform. Windows has no permission prompt, so it changes nothing. |
+| <span id="check_permissions--windows--prompt"></span>`prompt` | `boolean` | `false` | Accepted so one host call works on every platform. Windows has no permission prompt, so it changes nothing. |
 
 </Tab>
 </Tabs>

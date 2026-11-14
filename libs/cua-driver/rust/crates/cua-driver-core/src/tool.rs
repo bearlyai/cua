@@ -156,6 +156,13 @@ impl ToolDef {
         }
     }
 
+    /// The first argument that `tools/call` would refuse as unknown under
+    /// this definition's advertised schema, or `None` when every key is
+    /// admitted. This is the same check the dispatch boundary applies.
+    pub fn unknown_argument(&self, args: &Value) -> Option<String> {
+        unknown_argument(self, args)
+    }
+
     pub fn to_list_entry(&self) -> Value {
         // `capabilities` is always emitted (even when empty) so consumers
         // can rely on the key existing. Additive only — old consumers

@@ -10,6 +10,9 @@ mod impl_;
 #[cfg(target_os = "linux")]
 pub(crate) mod page;
 
+// The `check_permissions` definition; ungated so its tests run on any host.
+pub(crate) mod check_permissions_def;
+
 #[cfg(not(target_os = "linux"))]
 mod stubs;
 

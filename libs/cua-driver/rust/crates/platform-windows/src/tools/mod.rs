@@ -11,6 +11,8 @@ mod impl_;
 pub(crate) mod page;
 #[cfg(target_os = "windows")]
 pub(crate) mod page_bookmark;
+// The `check_permissions` definition; ungated so its tests run on any host.
+pub(crate) mod check_permissions_def;
 // Pure title parsing for `page_bookmark`; ungated so its tests run on any host.
 pub(crate) mod page_title_marker;
 // Pure foreground-focus decisions for element-addressed keys and text; ungated
