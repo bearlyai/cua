@@ -10,8 +10,8 @@ the running daemon's advertised input schemas.
 
 A row fails when the process exits non-zero, when a reply's code is
 `invalid_arguments`, or when the desktop app's own parsing would treat the
-reply as a failure. Checks the dashboard makes on top of that are reported as
-WARN. Rows are written to results.json and summary.md, and printed to
+reply as a failure, or when the dashboard's parsing of `list_windows`,
+`get_desktop_state` or `health_report` would reject it. Rows are written to results.json and summary.md, and printed to
 proof.log.
 """
 import argparse
@@ -163,30 +163,35 @@ def set_config_check(parsed, result):
 
 def windows_check(parsed, result):
     # The dashboard reads `windows` as an array of records with bounds, app_name, title, pid, window_id,
-    # is_on_screen and z_index.
+    # is_on_screen and z_index; a reply without one usable record gives it no window to work in.
     windows = parsed.get('windows') if isinstance(parsed, dict) else None
     if not isinstance(windows, list):
-        return 'WARN', ['dashboard: list_windows reply has no windows array']
-    usable = [w for w in windows if isinstance(w, dict) and all(k in w for k in ('app_name', 'title', 'pid', 'window_id', 'is_on_screen', 'z_index', 'bounds'))]
+        return 'FAIL', ['dashboard: list_windows reply has no windows array']
+    usable = [w for w in windows if isinstance(w, dict) and isinstance(w.get('bounds'), dict)
+              and all(k in w for k in ('app_name', 'title', 'pid', 'window_id', 'is_on_screen', 'z_index'))]
+    if windows and not usable:
+        return 'FAIL', [f'dashboard: none of {len(windows)} windows has every field the dashboard reads']
     return 'PASS', [f'{len(windows)} windows, {len(usable)} with every field the dashboard reads']
 
 
 def desktop_check(parsed, result):
-    # The use_computer agent's parseObservation plus screen size.
+    # The use_computer agent's parseObservation plus screen size: it throws on any of these.
     if not isinstance(parsed, dict):
-        return 'WARN', ['dashboard: get_desktop_state reply is not a JSON object']
+        return 'FAIL', ['dashboard: get_desktop_state reply is not a JSON object']
     missing = [k for k in ('screenshot_width', 'screenshot_height', 'screenshot_mime_type', 'screenshot_png_b64', 'screen_width', 'screen_height') if k not in parsed]
     if missing:
-        return 'WARN', [f'dashboard: get_desktop_state reply lacks {missing}']
-    if parsed.get('screenshot_mime_type') != 'image/png':
-        return 'WARN', [f"dashboard: screenshot_mime_type {parsed.get('screenshot_mime_type')!r}, the agent reads only image/png"]
+        return 'FAIL', [f'dashboard: get_desktop_state reply lacks {missing}']
+    if parsed.get('screenshot_mime_type') != 'image/png' or not parsed.get('screenshot_png_b64') \
+            or not all(isinstance(parsed[k], (int, float)) and parsed[k] > 0 for k in ('screenshot_width', 'screenshot_height')):
+        return 'FAIL', [f"dashboard: invalid screenshot (mime {parsed.get('screenshot_mime_type')!r}, "
+                        f"{parsed.get('screenshot_width')}x{parsed.get('screenshot_height')}, image {'present' if parsed.get('screenshot_png_b64') else 'empty'})"]
     return 'PASS', [f"screenshot {parsed['screenshot_width']}x{parsed['screenshot_height']}, screen {parsed['screen_width']}x{parsed['screen_height']}"]
 
 
 def health_check(parsed, result):
-    # probeComputerWindowTools reads `driver_version` as a string.
+    # probeComputerWindowTools reads `driver_version` as a string; without it the window tools are off.
     if not isinstance(parsed, dict) or not isinstance(parsed.get('driver_version'), str):
-        return 'WARN', ['dashboard: health_report reply has no driver_version string']
+        return 'FAIL', ['dashboard: health_report reply has no driver_version string']
     return 'PASS', [f"driver_version {parsed['driver_version']}"]
 
 
